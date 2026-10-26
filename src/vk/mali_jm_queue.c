@@ -1018,18 +1018,55 @@ prepare_command_buffers(struct mali_device *dev, struct vk_queue_submit *submit)
 /* ---------------------------------------------------------------------- */
 /* MALISX2_STATS                                                           */
 
+/* An environment variable, or on Android the system property standing in
+ * for it, as a string; NULL when neither is set. prop is the property's
+ * storage. */
+static const char *
+knob(const char *env, const char *android_prop, char *prop)
+{
+   const char *s = getenv(env);
+#ifdef __ANDROID__
+   if ((!s || !*s) && __system_property_get(android_prop, prop) > 0)
+      s = prop;
+#endif
+   return s && *s ? s : NULL;
+}
+
+#ifdef __ANDROID__
+#define KNOB_STORAGE PROP_VALUE_MAX
+#else
+#define KNOB_STORAGE 1
+#endif
+
 /* MALISX2_STATS=<seconds> (Android: debug.malisx2.stats), in ns; 0: off. */
 static uint64_t
 stats_interval(void)
 {
-   const char *s = getenv("MALISX2_STATS");
-#ifdef __ANDROID__
-   char prop[PROP_VALUE_MAX] = "";
-   if ((!s || !*s) && __system_property_get("debug.malisx2.stats", prop) > 0)
-      s = prop;
-#endif
-   const double sec = s && *s ? strtod(s, NULL) : 0.0;
+   char prop[KNOB_STORAGE];
+   const char *s = knob("MALISX2_STATS", "debug.malisx2.stats", prop);
+   const double sec = s ? strtod(s, NULL) : 0.0;
    return sec > 0.0 ? (uint64_t)(sec * 1e9) : 0;
+}
+
+/* An integer knob in [min, max], def when unset or out of range (said in
+ * the log). */
+static uint32_t
+knob_uint(const char *env, const char *android_prop, uint32_t min, uint32_t max, uint32_t def)
+{
+   char prop[KNOB_STORAGE];
+   const char *s = knob(env, android_prop, prop);
+   if (!s)
+      return def;
+   char *end;
+   const unsigned long v = strtoul(s, &end, 10);
+   if (*end || v < min || v > max) {
+      mesa_logw("malisx2: %s=%s is not a number from %u to %u; %u is used", env, s, min, max,
+                def);
+      return def;
+   }
+   if (v != def)
+      mesa_logi("malisx2: %s=%lu (default %u)", env, v, def);
+   return (uint32_t)v;
 }
 
 static void
@@ -1254,6 +1291,10 @@ MALI_PER_ARCH(device_init)(struct mali_device *dev)
    jd->frag_cache_flush = (dev->kbase->props.js_features[0] >> 3) & 1;
    mali_kbase_jm_atom_ids_init(&jd->ids);
    jd->free_ids = mali_kbase_jm_atom_ids_free_count(&jd->ids);
+   jd->batch_passes = knob_uint("MALISX2_JM_BATCH_PASSES", "debug.malisx2.jm_batch_passes", 1,
+                                MALI_JM_BATCH_PASSES_LIMIT, MALI_JM_BATCH_MAX_PASSES);
+   jd->heap.slots = knob_uint("MALISX2_JM_HEAP_SLOTS", "debug.malisx2.jm_heap_slots", 1,
+                              MALI_JM_HEAP_SLOTS_MAX, MALI_JM_HEAP_SLOTS);
    mali_jm_heap_init(jd);
    jd->stats_interval_ns = stats_interval();
 

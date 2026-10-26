@@ -45,12 +45,15 @@ mali_jm_heap_init(struct mali_jm_device *jd)
 {
    simple_mtx_init(&jd->heap.lock, mtx_plain);
    jd->heap.next = 0;
+   if (!jd->heap.slots)
+      jd->heap.slots = MALI_JM_HEAP_SLOTS;
+   assert(jd->heap.slots <= MALI_JM_HEAP_SLOTS_MAX);
 }
 
 void
 mali_jm_heap_finish(struct mali_jm_device *jd)
 {
-   for (unsigned i = 0; i < MALI_JM_HEAP_SLOTS; i++) {
+   for (unsigned i = 0; i < jd->heap.slots; i++) {
       if (jd->heap.bo[i].size)
          mali_kbase_free(jd->kb, &jd->heap.bo[i]);
    }
@@ -96,7 +99,7 @@ mali_jm_heap_take(struct mali_cmd_buffer *cmd, struct mali_jm_batch *b)
    const uint32_t slot = h->next;
    bool ok = h->bo[slot].size || slot_alloc(jd, &h->bo[slot]);
    if (ok)
-      h->next = (slot + 1) % MALI_JM_HEAP_SLOTS;
+      h->next = (slot + 1) % h->slots;
    const uint64_t base = h->bo[slot].gpu_va;
    const uint64_t size = h->bo[slot].size;
    simple_mtx_unlock(&h->lock);

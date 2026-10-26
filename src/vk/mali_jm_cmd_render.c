@@ -100,7 +100,7 @@ MALI_PER_ARCH(cmd_render_begin)(struct mali_cmd_buffer *cmd, const struct mali_r
     * batch, so a full batch closes before the pass starts. */
    if (cmd->jm.open) {
       const struct mali_jm_batch *b = &cmd->jm.cur;
-      if (b->passes >= MALI_JM_BATCH_MAX_PASSES || b->vtc.jobs >= MALI_JM_BATCH_MAX_JOBS ||
+      if (b->passes >= cmd->dev->jm->batch_passes || b->vtc.jobs >= MALI_JM_BATCH_MAX_JOBS ||
           b->est_heap_bytes >= MALI_JM_HEAP_SLOT_SIZE / 2)
          mali_jm_cmd_batch_close(cmd);
    }

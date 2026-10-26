@@ -155,6 +155,24 @@ struct mali_jm_batch {
 #define MALI_JM_BATCH_MAX_PASSES 16
 
 /*
+ * Tuning knobs for experiments with how much of a frame one batch takes,
+ * read once at device creation (mali_jm_queue.c device_init):
+ * MALISX2_JM_BATCH_PASSES (1 to 64, default MALI_JM_BATCH_MAX_PASSES) and
+ * MALISX2_JM_HEAP_SLOTS (1 to MALI_JM_HEAP_SLOTS_MAX, default
+ * MALI_JM_HEAP_SLOTS); on Android debug.malisx2.jm_batch_passes and
+ * debug.malisx2.jm_heap_slots. A batch is one vtc atom and its fragment
+ * atoms depend on the whole of it, so a pass's fragment work waits for the
+ * tiling of every pass of its batch, and only the next batch's tiling can
+ * run beside it; fewer passes per batch let more of a frame overlap, at
+ * the cost of more atoms (watch MALISX2_STATS for waits for a free atom
+ * number). A batch takes a heap slot, and the next batch on the same slot
+ * waits for its fragment work; more slots let more batches be in flight,
+ * at 2 MiB of memory each from the first use (growing by 2 MiB) and 256 MiB
+ * of address space.
+ */
+#define MALI_JM_BATCH_PASSES_LIMIT 64
+
+/*
  * Inside a render pass the batch cannot close, so one pass's tiling would
  * be one serial chain of any length: past about 65,530 jobs the 16-bit job
  * index runs out (the command buffer fails), and long before that one atom
@@ -877,7 +895,8 @@ struct mali_jm_atom_info {
 struct mali_jm_heap {
    simple_mtx_t lock;
    uint32_t next;           /* the slot the next batch takes */
-   struct mali_kbase_bo bo[MALI_JM_HEAP_SLOTS];
+   uint32_t slots;          /* slots in the ring (MALISX2_JM_HEAP_SLOTS) */
+   struct mali_kbase_bo bo[MALI_JM_HEAP_SLOTS_MAX];
 };
 
 #define MALI_JM_EVENTS_PER_READ 32
@@ -894,6 +913,8 @@ struct mali_jm_device {
     * event has not been read names that atom. */
    struct mali_kbase_jm_atom_ids ids;
    unsigned free_ids;
+   /* Passes per batch (MALISX2_JM_BATCH_PASSES, MALI_JM_BATCH_MAX_PASSES). */
+   uint32_t batch_passes;
    uint64_t next_serial;
    struct mali_jm_atom_info atoms[256];
    unsigned in_flight;
