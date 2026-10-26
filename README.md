@@ -1,82 +1,125 @@
-# malisx2
+# malisx2 для RG52 Mini (dArkOS)
 
-A Vulkan driver for Arm Mali GPUs that talks to Arm's **kbase** kernel
-driver, the one Android phones and handhelds ship. It is written for one
-application, the [ARMSX2](https://github.com/ARMSX2/ARMSX2) PlayStation 2
-emulator, which loads it in place of the system driver. It implements what
-ARMSX2 and the Android Vulkan loader use; every other entry point logs and
-fails.
+> Это форк [bmdhacks/malisx2](https://github.com/bmdhacks/malisx2). Исходный
+> README апстрима (на английском) сохранён как
+> [README.upstream.md](README.upstream.md): в нём сборка под Android и ROCKNIX,
+> требования к инструментам и общее описание драйвера.
 
-Target: Mali-G615 (Mesa architecture v11, command-stream frontend), on the
-Anbernic RG 477V. Shaders are compiled with Mesa's kraid compiler; the
-driver is built on Mesa's shared Vulkan runtime.
+malisx2 — Vulkan-драйвер для GPU Arm Mali, который работает поверх штатного
+драйвера ядра Arm (kbase). Шейдеры компилирует Mesa: на Bifrost — её
+бэкенд для Bifrost, на Valhall и новее — kraid. Работу с GPU (job manager
+или CSF, дескрипторы, WSI) драйвер ведёт сам, на общем Vulkan runtime Mesa.
 
-## Building
+В апстриме драйвер пишется под одно приложение, PS2-эмулятор ARMSX2, и в
+первую очередь под Mali-G615. **Этот форк дорабатывает его под эмуляторы на
+Anbernic RG52 Mini в прошивке [dArkOS](https://github.com/mamaich/dArkOS_rg52mini)**:
+не только под ARMSX2, но и под остальные эмуляторы образа, которые рисуют
+через Vulkan.
 
-The driver builds against Mesa sources checked out at `mesa/`: branch
-`malisx2` of [bmdhacks/armsx2-turnip](https://github.com/bmdhacks/armsx2-turnip)
-at the commit `meson.build` pins (`mesa_commit`). Only the sources are used;
-this repository's `mesa-glue/` builds the parts the driver needs.
+## Цели
+
+Главное — **скорость** и **отсутствие падений**:
+
+- никаких потерь устройства (device lost) и зависаний GPU в играх: драйвер
+  должен выдерживать то, что делают настоящие эмуляторы, в том числе то, на
+  что апстрим не рассчитан;
+- скорость отрисовки — не хуже штатного драйвера Arm (libmali) там, где это
+  достижимо;
+- сохранить главное преимущество malisx2 — быструю компиляцию пайплайнов
+  (на Mali-G52 в 6 раз быстрее libmali, первый запуск игр почти без
+  подтормаживаний).
+
+## Устройство
+
+| | |
+|---|---|
+| SoC | Rockchip RK3562 |
+| GPU | Mali-G52, одно шейдерное ядро; Bifrost, архитектура Mesa v7; job manager (не CSF) |
+| ОЗУ | 2 ГБ |
+| драйвер ядра | kbase g25p0, интерфейс JM UK 11.47 (драйвер договаривается на 11.36) |
+
+Особенности железа и драйвера ядра, найденные по ходу работы, — в
+[docs/hardware.md](docs/hardware.md).
+
+## Где malisx2 используется в dArkOS
+
+В dArkOS malisx2 — второй драйвер рядом со штатным libmali. Он выбирается
+для каждой программы и для каждой системы EmulationStation (EMULATOR
+SETTINGS → система → VULKAN DRIVER); по умолчанию стоит libmali. Выбор есть у
+систем, эмуляторы которых рисуют через Vulkan:
+
+| система | эмулятор |
+|---|---|
+| PS2 | ARMSX2 |
+| GameCube | Dolphin |
+| 3DS | Azahar (ядро RetroArch) |
+| PSP | PPSSPP (отдельный и в RetroArch) |
+| PS1 | DuckStation, SwanStation |
+| Dreamcast, Naomi, Atomiswave | Flycast |
+| порты | разные |
+
+Как устроен выбор драйвера и как malisx2 собирается в образе, описано в
+[docs/darkos.md](docs/darkos.md).
+
+## Документация
+
+- [docs/README.md](docs/README.md) — оглавление;
+- [docs/building.md](docs/building.md) — сборка: отладочная, как в образе (LTO
+  + PGO), снятие профиля PGO;
+- [docs/changes.md](docs/changes.md) — что сделано по сравнению с апстримом;
+- [docs/plans.md](docs/plans.md) — планы;
+- [docs/decisions.md](docs/decisions.md) — принятые решения, отложенное и
+  отброшенное;
+- [docs/hardware.md](docs/hardware.md) — особенности Mali-G52, RK3562 и kbase;
+- [docs/emulators.md](docs/emulators.md) — что делают эмуляторы и что из
+  этого следует для драйвера;
+- [docs/debugging.md](docs/debugging.md) — отладка и замеры;
+- [docs/darkos.md](docs/darkos.md) — malisx2 в образе dArkOS.
+
+## Сборка
+
+Нужны исходники Mesa в каталоге `mesa/`: ветка `malisx2` форка
+[bmdhacks/armsx2-turnip](https://github.com/bmdhacks/armsx2-turnip) на
+коммите, который закреплён в `meson.build` (`mesa_commit`):
 
     git init mesa
     git -C mesa fetch --depth 1 https://github.com/bmdhacks/armsx2-turnip.git <mesa_commit>
     git -C mesa checkout FETCH_HEAD
 
-Host (Linux):
+Для dArkOS (Debian trixie, arm64) драйвер собирается кросс-компиляцией
+clang и lld 19 с sysroot arm64:
 
-    meson setup build
+    meson setup build -Dbuildtype=release --cross-file=<aarch64.ini> --native-file=<native.ini>
     ninja -C build
 
-Needs meson >= 1.7, ninja, a C/C++ compiler, rustc >= 1.85, bindgen >= 0.71.1
-(not 0.72.0, 0.73.0 or 0.73.1) and Python 3 with mako and PyYAML.
-`meson setup` downloads eight small Rust crates (`subprojects/`).
+Результат: `build/src/libvulkan_malisx2.so`. Это быстрая сборка для отладки;
+образ dArkOS собирается с **LTO и PGO**, и у этого есть нюансы (meson не
+старше 1.12, профиль PGO привязан к пути дерева `/home/ark/malisx2`, флаги
+`-fprofile-use` нужны и при линковке, снятие профиля на устройстве). Всё
+это, пример кросс-файла и требования к инструментам — в
+[docs/building.md](docs/building.md).
 
-Android (arm64, API level 29) is a cross build with the NDK r28c at
-`~/Android/Sdk/ndk/28.2.13676358` (see `cross/android-aarch64.ini`):
+## Отладка
 
-    meson setup build-android --cross-file cross/android-aarch64.ini
-    ninja -C build-android
-    llvm-strip -o libvulkan_malisx2.so build-android/src/libvulkan_malisx2.so
+Включается переменными окружения (на Android — свойствами
+`debug.malisx2.*`), подробно в [docs/debugging.md](docs/debugging.md):
 
-The result is a Vulkan HAL module (`HMI`) with 16 KiB-aligned segments,
-needing only `libc`, `libm`, `libdl` and `liblog`. ARMSX2 loads it as an
-adrenotools driver pack: the library plus a `meta.json` in a zip.
+| переменная | что делает |
+|---|---|
+| `MALISX2_MEASURE` | время GPU по проходам и отрисовкам, захват отправленных заданий, шейдеры |
 
-ROCKNIX (arm64 Linux, RK3566/RK3568 devices running ROCKNIX's
-`mali_kbase`) is a cross build against the toolchain of a ROCKNIX build
-tree, with the build machine's clang and lld. Name the tree's toolchain
-directory in a machine file of your own and pass it first (see
-`cross/rocknix-aarch64.ini`):
+## Правила
 
-    # ~/rocknix-toolchain.ini
-    [constants]
-    toolchain = '/path/to/distribution/build.ROCKNIX-RK3566.aarch64/toolchain'
-
-    meson setup build-rocknix \
-        --cross-file ~/rocknix-toolchain.ini --cross-file cross/rocknix-aarch64.ini \
-        --native-file ~/rocknix-toolchain.ini --native-file cross/rocknix-native.ini
-    ninja -C build-rocknix
-
-With libclang 22, bindgen 0.71.x generates broken bindings; use 0.72.1.
-
-On Linux the driver presents `VK_KHR_display` swapchains itself, through
-Mesa's WSI code built into the library. Wayland swapchains come from Arm's
-[vulkan-wsi-layer](https://gitlab.freedesktop.org/mesa/vulkan-wsi-layer)
-(MIT licensed), a separate implicit Vulkan layer that the system installs,
-as ROCKNIX does. The layer allocates linear dma-bufs from a dma-buf heap and
-imports them into the driver (`VK_EXT_image_drm_format_modifier` with
-`DRM_FORMAT_MOD_LINEAR`, `VK_EXT_external_memory_dma_buf`); none of its code
-is part of this repository or linked into the library.
-
-## Measurement
-
-`MALISX2_MEASURE=timing` (or `draws`, `csf`, `both`, `shaders`; on Android
-the property `debug.malisx2.measure`) makes the driver write GPU timestamps
-per render pass, dispatch and draw, captures of the submitted command
-streams, or the shaders it compiles.
-
-## Rules
-
-- Nothing decompiled goes in: no decompiled code, no Arm binaries.
-- License: MIT (`LICENSE`). Mesa is not part of this repository and keeps
-  its own licenses.
+- **Декомпиляция.** Чужой код — в частности драйверы и библиотеки Rockchip
+  и Arm — можно декомпилировать, чтобы понять логику его работы. Полученный
+  код не переиспользуется и в репозиторий не попадает: логику мы
+  реализуем сами, с доработкой под наше устройство и наши задачи. Бинарников
+  Arm и вендоров в репозитории нет.
+- В репозитории — исходники драйвера, файлы сборки и документация форка
+  (`README.md`, `docs/`). Рабочие заметки, отчёты о замерах, тесты и
+  инструменты хранятся вне его.
+- Всё внутри исходников — комментарии, сообщения в лог и прочие строки — на
+  английском, в стиле апстрима (подробные комментарии); сообщения коммитов
+  тоже на английском, вида `v7: ...`. Документация форка — на русском.
+- Лицензия — MIT (`LICENSE`). Mesa не входит в репозиторий и остаётся под
+  своими лицензиями.
