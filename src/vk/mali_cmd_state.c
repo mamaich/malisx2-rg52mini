@@ -586,7 +586,18 @@ MALI_PER_ARCH(CmdPushConstants2KHR)(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(mali_cmd_buffer, cmd, commandBuffer);
    assert(info->offset + info->size <= sizeof(cmd->push_constants));
    memcpy(cmd->push_constants + info->offset, info->pValues, info->size);
-   cmd->gfx.draw.dirty |= MALI_GFX_DIRTY_VS_FAU | MALI_GFX_DIRTY_FS_FAU;
+   /* Only the stages the call names: a range may be updated only with
+    * every stage of the layout's ranges that cover it, so a stage left out
+    * does not read these bytes and its FAU block stays. ARMSX2 sets its
+    * vertex shader's base vertex this way before every draw that expands
+    * sprites, lines or points in the vertex shader; with both stages
+    * marked, each such draw built the fragment shader's block anew too,
+    * and on v7 copied its uniform buffer words in once more with a compute
+    * job. Compute dispatches build their block every time. */
+   if (info->stageFlags & VK_SHADER_STAGE_VERTEX_BIT)
+      cmd->gfx.draw.dirty |= MALI_GFX_DIRTY_VS_FAU;
+   if (info->stageFlags & VK_SHADER_STAGE_FRAGMENT_BIT)
+      cmd->gfx.draw.dirty |= MALI_GFX_DIRTY_FS_FAU;
 #if PAN_ARCH < 10
    cmd->jm.stats.push_constants++;
 #endif
