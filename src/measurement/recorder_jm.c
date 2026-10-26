@@ -176,6 +176,16 @@ mali_jm_measure_capture_end(struct mali_device *dev, struct mali_jm_measure_capt
 {
    if (!cap)
       return;
+   /* A submit that built no atom (its command buffers recorded nothing)
+    * does not advance the queue's submission number, so the next submit
+    * takes the same number: written, its capture would be overwritten by
+    * the next one's, or overwrite a real one. It has nothing to show
+    * anyway. */
+   if (!util_dynarray_num_elements(&cap->atoms, struct kb_jm_atom)) {
+      util_dynarray_fini(&cap->atoms);
+      free(cap);
+      return;
+   }
    struct mali_measure *m = dev->measure;
    char name[40], path[600];
    snprintf(name, sizeof(name), "jm-%08" PRIu64 ".bin", cap->seqno);
