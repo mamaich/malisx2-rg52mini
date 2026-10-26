@@ -157,6 +157,35 @@ save_dyn_bufs(const struct mali_shader *s, const struct mali_desc_state *desc,
       dyn_buf_or_none(desc, s->desc.dyn_bufs.map[i], &t->dyn_addrs[i], &t->dyn_ranges[i]);
 }
 
+/*
+ * Whether tables built for shader a serve shader b as they are. Their
+ * layout and the entries the copy job wrote into them come from the
+ * shader's descriptor map alone: the per-type counts, the copy map, the
+ * dynamic buffers (mali_v7_desc_prepare, mali_v7_desc_copy), and the sets
+ * they were checked against are the ones the shader reads (used_set_mask).
+ * ARMSX2 switches pipelines for most of its draws, and its fragment
+ * shaders, one per blend and texture mode, mostly read the same bindings
+ * the same way: with this the tables, and the descriptor copy job that
+ * fills them, stay across such a switch.
+ */
+static bool
+same_tables_layout(const struct mali_shader *a, const struct mali_shader *b)
+{
+   if (a == b)
+      return true;
+   if (!a || !b)
+      return false;
+   const struct mali_v7_shader_desc *x = &a->v7, *y = &b->v7;
+   if (memcmp(x->count, y->count, sizeof(x->count)) || x->map_count != y->map_count ||
+       x->dyn_ubo_count != y->dyn_ubo_count ||
+       a->desc.dyn_bufs.count != b->desc.dyn_bufs.count ||
+       a->desc.used_set_mask != b->desc.used_set_mask)
+      return false;
+   return !memcmp(x->map, y->map, x->map_count * sizeof(x->map[0])) &&
+          !memcmp(a->desc.dyn_bufs.map, b->desc.dyn_bufs.map,
+                  a->desc.dyn_bufs.count * sizeof(a->desc.dyn_bufs.map[0]));
+}
+
 bool
 mali_v7_desc_refresh(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
                      const struct mali_desc_state *desc, bool img,
@@ -164,7 +193,7 @@ mali_v7_desc_refresh(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
 {
    const struct mali_v7_shader_desc *v7 = &s->v7;
    *unchanged = false;
-   if (t->shader != s || v7->count[MALI_V7_DESC_TABLE_UBO] ||
+   if (!same_tables_layout(t->shader, s) || v7->count[MALI_V7_DESC_TABLE_UBO] ||
        (!img && v7->count[MALI_V7_DESC_TABLE_IMG]))
       return false;
    /* Only the sets the shader reads (desc.used_set_mask): the copy took
@@ -192,6 +221,7 @@ mali_v7_desc_refresh(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
       same = t->dyn_addrs[i] == addr && t->dyn_ranges[i] == range;
    }
    if (same) {
+      t->shader = s;
       *unchanged = true;
       return true;
    }
@@ -215,6 +245,7 @@ mali_v7_desc_refresh(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
    }
    t->tables[MALI_V7_DESC_TABLE_UBO] = ubo;
    t->dyn_ssbos = dyn_ssbos;
+   t->shader = s;
    save_dyn_bufs(s, desc, t);
    return true;
 }
