@@ -1094,6 +1094,15 @@ stats_log(const char *what, const struct mali_jm_draw_totals *to,
              (unsigned long long)D(atoms), (unsigned long long)D(job_submits),
              (unsigned long long)D(partial_flushes), (unsigned long long)D(number_waits),
              D(vtc_jobs) * per, D(frag_jobs) * per, D(cmd.push_constants) * per);
+   const uint64_t passes = D(passes);
+   const double pp = passes ? 1.0 / (double)passes : 0.0;
+   mesa_logi("malisx2 stats, %s, per pass: %.2f draws; %.2f clear, %.2f every tile, %.2f whole "
+             "framebuffer, %.2f with at most two draws; area %.0f%% of the framebuffer's tiles; "
+             "%.2f frag barriers (%.2f with a cache flush); %.2f primitive barriers",
+             what, draws * pp, D(cmd.passes_clear) * pp, D(cmd.passes_all_tiles) * pp,
+             D(cmd.passes_full_area) * pp, D(cmd.passes_few_draws) * pp,
+             D(cmd.fb_tiles) ? 100.0 * D(cmd.area_tiles) / D(cmd.fb_tiles) : 0.0,
+             D(cmd.frag_barriers) * pp, D(cmd.frag_flushes) * pp, D(cmd.fb_barriers) * pp);
 #if PAN_ARCH < 9
    static const char *const stage[2] = {"VS", "FS"};
    for (unsigned i = 0; i < 2; i++) {

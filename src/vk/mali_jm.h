@@ -327,6 +327,19 @@ struct mali_v7_range {
 struct mali_jm_cmd_stats {
    uint64_t draws;
    uint64_t push_constants;   /* vkCmdPushConstants calls */
+   /* Passes with a Fragment job (mali_jm_cmd_render.c cmd_render_end): */
+   uint64_t passes_all_tiles; /* every tile of the area runs its frame
+                               * shaders and is written back (a clear, or
+                               * always_write) */
+   uint64_t passes_clear;     /* clearing an attachment */
+   uint64_t passes_full_area; /* with the whole framebuffer as their area */
+   uint64_t passes_few_draws; /* with at most two draws */
+   uint64_t area_tiles;       /* 16x16 tiles of their areas */
+   uint64_t fb_tiles;         /* ... and of their framebuffers */
+   uint64_t fb_barriers;      /* primitive barriers inside passes
+                               * (cmd_fb_barrier) */
+   uint64_t frag_barriers;    /* fragment jobs behind a frag -> frag barrier */
+   uint64_t frag_flushes;     /* ... of them with a cache flush job */
 #if PAN_ARCH < 9
    /* Per stage, [0] the vertex shader, [1] the fragment shader (v7 draws,
     * mali_jm_cmd_draw_v7.c prepare_draw): */

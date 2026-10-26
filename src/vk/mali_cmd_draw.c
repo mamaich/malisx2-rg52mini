@@ -588,4 +588,7 @@ MALI_PER_ARCH(cmd_fb_barrier)(struct mali_cmd_buffer *cmd)
    }
    const VkRect2D all = {{0, 0}, {r->desc.width, r->desc.height}};
    MALI_PER_ARCH(cmd_run_fullscreen)(cmd, dcd.gpu, &all, 0, MAX2(r->desc.layer_count, 1));
+#if PAN_ARCH < 10
+   cmd->jm.stats.fb_barriers++;
+#endif
 }

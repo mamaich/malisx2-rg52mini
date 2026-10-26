@@ -523,6 +523,35 @@ fragment_jobs(struct mali_cmd_buffer *cmd, struct mali_render_state *r, uint64_t
       mali_jm_measure_end(cmd, r->measure_frag, c);
 }
 
+/* MALISX2_STATS: what kind of pass this was. */
+static void
+count_pass(struct mali_cmd_buffer *cmd, const struct mali_render_state *r)
+{
+   struct mali_jm_cmd_stats *s = &cmd->jm.stats;
+   bool clear = false, all = false;
+   const struct mali_fb_target *t[2 + ARRAY_SIZE(r->desc.rt)];
+   unsigned n = 0;
+   t[n++] = &r->desc.z;
+   t[n++] = &r->desc.s;
+   for (unsigned i = 0; i < r->desc.rt_count; i++)
+      t[n++] = &r->desc.rt[i];
+   for (unsigned i = 0; i < n; i++) {
+      if (!t[i]->image)
+         continue;
+      clear |= t[i]->load == MALI_ATT_LOAD_CLEAR;
+      all |= t[i]->store && (t[i]->load == MALI_ATT_LOAD_CLEAR || t[i]->always_write);
+   }
+   s->passes_clear += clear;
+   s->passes_all_tiles += all;
+   s->passes_full_area += r->minx == 0 && r->miny == 0 && r->maxx + 1 >= r->desc.width &&
+                          r->maxy + 1 >= r->desc.height;
+   s->passes_few_draws += r->draws <= 2;
+   s->area_tiles += (uint64_t)((r->maxx >> MALI_TILE_SHIFT) - (r->minx >> MALI_TILE_SHIFT) + 1) *
+                    ((r->maxy >> MALI_TILE_SHIFT) - (r->miny >> MALI_TILE_SHIFT) + 1);
+   s->fb_tiles += (uint64_t)DIV_ROUND_UP(r->desc.width, 1u << MALI_TILE_SHIFT) *
+                  DIV_ROUND_UP(r->desc.height, 1u << MALI_TILE_SHIFT);
+}
+
 void
 MALI_PER_ARCH(cmd_render_end)(struct mali_cmd_buffer *cmd)
 {
@@ -547,6 +576,7 @@ MALI_PER_ARCH(cmd_render_end)(struct mali_cmd_buffer *cmd)
             mali_jm_measure_end(cmd, r->measure_vt, &cmd->jm.cur.vtc);
          fragment_jobs(cmd, r, fbds, fbd_size);
          cmd->jm.cur.passes++;
+         count_pass(cmd, r);
       }
    }
 

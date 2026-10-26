@@ -601,9 +601,12 @@ mali_jm_cmd_frag(struct mali_cmd_buffer *cmd, bool new_segment)
    if (unlikely(req & (REQ_FRAG_AFTER_VTC | REQ_FRAG_AFTER_FRAG | REQ_FRAG_FLUSH))) {
       if (req & REQ_FRAG_AFTER_VTC)
          b->frag_after_vtc = true;
-      if (c->jobs && (req & REQ_FRAG_AFTER_FRAG))
+      if (c->jobs && (req & REQ_FRAG_AFTER_FRAG)) {
          c->pending |= MALI_JM_PENDING_BARRIER |
                        ((req & REQ_FRAG_FLUSH) ? MALI_JM_PENDING_FLUSH : 0);
+         cmd->jm.stats.frag_barriers++;
+         cmd->jm.stats.frag_flushes += !!(req & REQ_FRAG_FLUSH);
+      }
       cmd->jm.req &= ~(REQ_FRAG_AFTER_VTC | REQ_FRAG_AFTER_FRAG | REQ_FRAG_FLUSH);
    }
    return c;
