@@ -383,11 +383,25 @@ MALI_PER_ARCH(CmdBindDescriptorSets)(VkCommandBuffer commandBuffer, VkPipelineBi
 
 /*
  * A push descriptor set (VK_KHR_push_descriptor): a set whose storage is
- * the command buffer's, not a pool's. Pushing always allocates a fresh
- * block for the set's slots (mali_cmd_alloc, freed only when the command
+ * the command buffer's, not a pool's. A push that changes the set's slots
+ * gets a fresh block for them (mali_cmd_alloc, freed only when the command
  * buffer is reset), so a draw already recorded keeps reading the memory
  * its resource table pointed at even after a later push changes what is
  * bound at that set index.
+ *
+ * A push that leaves the slots as the set's newest block has them (the
+ * same layout, the same bytes) gets that block again. ARMSX2 pushes a
+ * texture again when only its image layout changed, which these
+ * descriptors do not record, and every binding again when it switches
+ * back from its utility pipeline layout. The set's address does not
+ * change then, so the v7 descriptor tables built from it stand
+ * (mali_v7_desc_refresh compares addresses) and no descriptor copy job is
+ * needed. The block is read, never written, by the GPU, and lives as long
+ * as the command buffer's recording. One block per set index is
+ * remembered, as the v7 tables remember one build per stage.
+ * A push layout has no inline uniform block (the spec forbids one), the
+ * only kind of slot whose bytes name the set's own address, so the bytes
+ * are all there is to compare.
  *
  * A binding the push does not mention carries over from the set's last
  * push in this command buffer: push[idx] is reused as the container across
@@ -398,14 +412,18 @@ MALI_PER_ARCH(CmdBindDescriptorSets)(VkCommandBuffer commandBuffer, VkPipelineBi
  * push start over, from zeroed slots.
  *
  * The slots are written in the set's cached copy (struct mali_push_shadow:
- * set->cpu points there, set->gpu at the new block), which holds what the
- * previous push left, and push_end copies the finished set into the block.
- * Command memory is never read by the CPU.
+ * set->cpu points there), which holds what the previous push left, and
+ * push_end compares the finished set with what the newest block holds
+ * (the shadow's last copy) and either points set->gpu at that block or
+ * copies the set into a new one. Command memory is never read by the CPU.
  */
 struct push_target {
    struct mali_descriptor_set *set;
-   void *dst;                /* the new block's mapping; NULL: no slots */
-   uint32_t size;
+   struct mali_push_shadow *sh;
+   uint32_t size;            /* the set's bytes; 0: no slots */
+   /* The set's newest block and its layout, before this push. */
+   uint64_t prev_gpu;
+   const struct mali_descriptor_set_layout *prev_layout;
 };
 
 static bool
@@ -419,32 +437,35 @@ push_begin(struct mali_cmd_buffer *cmd, struct mali_desc_state *st, unsigned sha
    const uint32_t size = layout->desc_count * MALI_DESCRIPTOR_SIZE;
 
    out->set = set;
-   out->dst = NULL;
+   out->sh = sh;
    out->size = size;
+   out->prev_gpu = set->gpu;
+   out->prev_layout = set->layout;
    if (size) {
       if (size > sh->size) {
          /* Only a new layout grows it, and a new layout carries nothing. */
          assert(!carry);
          vk_free(&cmd->vk.pool->alloc, sh->data);
-         sh->size = 0;
+         vk_free(&cmd->vk.pool->alloc, sh->last);
+         sh->size = sh->last_size = 0;
          sh->data = vk_alloc(&cmd->vk.pool->alloc, size, 16,
                              VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
-         if (!sh->data) {
+         sh->last = vk_alloc(&cmd->vk.pool->alloc, size, 16,
+                             VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+         if (!sh->data || !sh->last) {
+            vk_free(&cmd->vk.pool->alloc, sh->data);
+            vk_free(&cmd->vk.pool->alloc, sh->last);
+            sh->data = sh->last = NULL;
             vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
             return false;
          }
          sh->size = size;
-      }
-      struct mali_ptr p = mali_cmd_alloc(cmd, size, MALI_DESCRIPTOR_SIZE);
-      if (!p.cpu) {
-         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
-         return false;
+         /* The newest block's bytes went with the old copy. */
+         out->prev_gpu = 0;
       }
       if (!carry)
          memset(sh->data, 0, size);
       set->cpu = sh->data;
-      set->gpu = p.gpu;
-      out->dst = p.cpu;
    } else {
       set->cpu = NULL;
       set->gpu = 0;
@@ -456,10 +477,28 @@ push_begin(struct mali_cmd_buffer *cmd, struct mali_desc_state *st, unsigned sha
 }
 
 static void
-push_end(const struct push_target *t)
+push_end(struct mali_cmd_buffer *cmd, const struct push_target *t)
 {
-   if (t->dst)
-      memcpy(t->dst, t->set->cpu, t->size);
+   struct mali_descriptor_set *set = t->set;
+   struct mali_push_shadow *sh = t->sh;
+   if (!t->size)
+      return;
+   if (t->prev_gpu && t->prev_layout == set->layout && sh->last_size == t->size &&
+       !memcmp(sh->last, set->cpu, t->size)) {
+      set->gpu = t->prev_gpu;
+      return;
+   }
+   struct mali_ptr p = mali_cmd_alloc(cmd, t->size, MALI_DESCRIPTOR_SIZE);
+   if (!p.cpu) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      set->gpu = 0;
+      sh->last_size = 0;
+      return;
+   }
+   memcpy(p.cpu, set->cpu, t->size);
+   memcpy(sh->last, set->cpu, t->size);
+   sh->last_size = t->size;
+   set->gpu = p.gpu;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -497,7 +536,7 @@ MALI_PER_ARCH(CmdPushDescriptorSet2KHR)(VkCommandBuffer commandBuffer,
          return;
       MALI_PER_ARCH(descriptor_set_write)(t.set, info->descriptorWriteCount,
                                           info->pDescriptorWrites);
-      push_end(&t);
+      push_end(cmd, &t);
    }
 }
 
@@ -576,7 +615,7 @@ MALI_PER_ARCH(CmdPushDescriptorSetWithTemplate2KHR)(
          MALI_PER_ARCH(descriptor_set_write)(t.set, 1, &w1);
       }
    }
-   push_end(&t);
+   push_end(cmd, &t);
 }
 
 VKAPI_ATTR void VKAPI_CALL

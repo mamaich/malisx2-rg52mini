@@ -101,10 +101,18 @@ struct mali_desc_state {
  * across resets (the contents count only while push[idx] says the push is
  * still current; a reset clears that). The command buffer's destroy frees
  * them (mali_push_shadows_fini).
+ *
+ * last holds what the set's newest block of command memory holds, the
+ * block push[idx].gpu points at: a push that ends with the same slots in
+ * the same layout gets that block again instead of a new one (push_end).
+ * It counts while push[idx].gpu is set, which a reset clears with the
+ * memory the block was in.
  */
 struct mali_push_shadow {
    void *data;
-   uint32_t size;            /* bytes allocated */
+   void *last;
+   uint32_t size;            /* bytes allocated, each of data and last */
+   uint32_t last_size;       /* bytes of last that count */
 };
 
 enum {
@@ -122,8 +130,9 @@ mali_push_shadows_fini(struct mali_push_shadows *ps, const VkAllocationCallbacks
    for (unsigned b = 0; b < 2; b++) {
       for (unsigned i = 0; i < MALI_MAX_SETS; i++) {
          vk_free(alloc, ps->s[b][i].data);
-         ps->s[b][i].data = NULL;
-         ps->s[b][i].size = 0;
+         vk_free(alloc, ps->s[b][i].last);
+         ps->s[b][i].data = ps->s[b][i].last = NULL;
+         ps->s[b][i].size = ps->s[b][i].last_size = 0;
       }
    }
 }
