@@ -167,7 +167,15 @@ mali_v7_desc_refresh(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
    if (t->shader != s || v7->count[MALI_V7_DESC_TABLE_UBO] ||
        (!img && v7->count[MALI_V7_DESC_TABLE_IMG]))
       return false;
-   for (unsigned i = 0; i < MALI_MAX_SETS; i++) {
+   /* Only the sets the shader reads (desc.used_set_mask): the copy took
+    * its entries from those alone (the map's sets, mali_v7_desc_copy), and
+    * the FAU block takes only their addresses (mali_v7_desc_sysvals). The
+    * dynamic buffers are compared below. Another set bound in the meantime
+    * leaves the tables as they are: a texture pushed for the fragment
+    * shader, say, while only the vertex shader's set was bound again with
+    * new dynamic offsets. Its entry in t->sets then goes stale, which
+    * nothing reads. */
+   u_foreach_bit(i, s->desc.used_set_mask) {
       const struct mali_descriptor_set *set = desc ? desc->sets[i] : NULL;
       if (t->sets[i] != (set ? set->gpu : 0) ||
           t->set_desc_counts[i] != (set ? set->layout->desc_count : 0))
