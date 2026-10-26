@@ -4,40 +4,70 @@
  */
 
 /*
- * Timestamp queries on the job manager (v7 and v9): vkCreateQueryPool,
+ * Queries on the job manager (v7 and v9): vkCreateQueryPool,
  * vkDestroyQueryPool, vkCmdResetQueryPool, vkCmdWriteTimestamp,
- * vkGetQueryPoolResults. ARMSX2 turns GPU timing on for any device
- * whose name is not "Mali-G615", so the G57 and G52 builds need these;
- * the G615 build does not (they stay waist stubs there,
- * mali_v11_device_entrypoints never gets them -- see the file comment
- * in mali_jm.h).
+ * vkCmdBeginQuery, vkCmdEndQuery, vkGetQueryPoolResults. ARMSX2 turns
+ * GPU timing on for any device whose name is not "Mali-G615", so the
+ * G57 and G52 builds need these; the G615 build does not (they stay
+ * waist stubs there, mali_v11_device_entrypoints never gets them -- see
+ * the file comment in mali_jm.h).
  *
- * TIMESTAMP is the only query type: ARMSX2's other query use (OSD GPU
- * stats, VK_QUERY_TYPE_PIPELINE_STATISTICS) is gated on the
- * pipelineStatisticsQuery feature, which mali_physical_device.c
- * reports false (the counters it would need are deferred), so
- * ARMSX2 never creates that pool; occlusion queries are not in
- * ARMSX2's waist either (it only uses the timestamp and
- * pipeline-statistics query types). Implementing only TIMESTAMP here
- * matches the driver's ARMSX2-only scope.
+ * Two query types, and only one of them counts anything. ARMSX2's third
+ * use (OSD GPU stats, VK_QUERY_TYPE_PIPELINE_STATISTICS) is gated on
+ * the pipelineStatisticsQuery feature, which mali_physical_device.c
+ * reports false (the counters it would need are deferred), so that pool
+ * is never created and is refused here.
  *
- * Each query is 16 bytes of host-visible, uncached device memory: the
- * value System Timestamp writes at +0, an Immediate 64 availability
- * flag at +8 (our own layout; nothing reads it but our own
- * vkGetQueryPoolResults). Both words are Write Value jobs with the
- * header Barrier bit (the blob's own query and timestamp jobs are
- * the same two types, same bit). mali_jm_measure_begin/end
- * (timing_jm.c) use the identical pair for MALISX2_MEASURE's timing
- * regions; this file does not share code with them beyond
- * mali_jm_cmd_write_value, because a query's two jobs are not a
- * "region" (no CSV row, no handle to end later from a different
- * call).
+ *  - TIMESTAMP, implemented. Each query is 16 bytes of host-visible,
+ *    uncached device memory: the value System Timestamp writes at +0, an
+ *    Immediate 64 availability flag at +8 (our own layout; nothing reads
+ *    it but our own vkGetQueryPoolResults). Both words are Write Value
+ *    jobs with the header Barrier bit (the blob's own query and
+ *    timestamp jobs are the same two types, same bit).
+ *    mali_jm_measure_begin/end (timing_jm.c) use the identical pair for
+ *    MALISX2_MEASURE's timing regions; this file does not share code
+ *    with them beyond mali_jm_cmd_write_value, because a query's two
+ *    jobs are not a "region" (no CSV row, no handle to end later from a
+ *    different call).
+ *
+ *  - OCCLUSION, accepted but not counted: the pool is created,
+ *    vkCmdBeginQuery and vkCmdEndQuery record nothing, and every result
+ *    reads back as zero samples, available. Occlusion queries are
+ *    mandatory in Vulkan with no feature bit to turn them off, and
+ *    Dolphin's video backend creates a 512-entry occlusion pool at
+ *    startup and throws the whole backend away if the pool is refused
+ *    ("Failed to create query pool"), which is why refusing them kept
+ *    Dolphin off this driver entirely. Zero samples is what Dolphin's
+ *    own dummy PerfQuery reports when a backend has no query support,
+ *    so a game that reads the PE performance metrics behaves as it does
+ *    with PerfQueries off; a program that culls on occlusion results
+ *    would draw nothing.
+ *
+ *    The hardware can do this properly and doing it is the next step.
+ *    The Tiler job's Draw descriptor has an Occlusion query mode
+ *    (Predicate or Counter) and an Occlusion address, and the Fragment
+ *    job increments the counter there, per shader core -- so a pool
+ *    needs one report per core id (pan_query_core_id_range; the G52 in
+ *    the RG52 Mini has one core) and the CPU sums them. Counting
+ *    correctly also needs: a fragment Renderer State Descriptor whose
+ *    depth/stencil update is late while a query counts
+ *    (mali_pipeline_state.c earlyzs_get takes writes_zs_or_oq for
+ *    exactly this, and the v9 bake already keeps both variants in
+ *    mali_gfx_baked::dcd0); the draw's Tiler job kept even under
+ *    rasterizerDiscardEnable; the counter zeroed at vkCmdBeginQuery, for
+ *    which the vtc chain is the right place (the pass's Fragment job
+ *    runs after the whole vtc atom); and the availability flag written
+ *    after that Fragment job, which is what writes the counter -- so
+ *    that write belongs on the fragment chain at the end of the pass,
+ *    not in the vtc chain, where it would run too early. panvk's
+ *    jm/panvk_vX_cmd_query.c and panvk_vX_query_pool.c are the model.
  */
 
 #include "mali_cmd_state.h"
 
 #include <string.h>
 
+#include "util/log.h"
 #include "util/os_time.h"
 #include "vk_alloc.h"
 #include "vk_log.h"
@@ -59,9 +89,21 @@ MALI_PER_ARCH(CreateQueryPool)(VkDevice _device, const VkQueryPoolCreateInfo *pC
 {
    VK_FROM_HANDLE(mali_device, dev, _device);
 
-   if (pCreateInfo->queryType != VK_QUERY_TYPE_TIMESTAMP)
+   switch (pCreateInfo->queryType) {
+   case VK_QUERY_TYPE_TIMESTAMP:
+      break;
+   case VK_QUERY_TYPE_OCCLUSION:
+      /* Accepted, never counted (file comment). Said once per device, so
+       * that a program drawing nothing because it culls on the results
+       * has a line in its log saying why. */
+      if (__atomic_fetch_add(&dev->diag.occlusion_stub, 1, __ATOMIC_RELAXED) == 0)
+         mesa_logi("malisx2: occlusion query pools are accepted but not counted: "
+                   "every result reads back as 0 samples");
+      break;
+   default:
       return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
-                       "only timestamp query pools are supported");
+                       "only timestamp and occlusion query pools are supported");
+   }
 
    struct mali_query_pool *pool =
       vk_query_pool_create(&dev->vk, pCreateInfo, pAllocator, sizeof(*pool));
@@ -107,6 +149,10 @@ MALI_PER_ARCH(CmdResetQueryPool)(VkCommandBuffer commandBuffer, VkQueryPool _poo
 {
    VK_FROM_HANDLE(mali_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(mali_query_pool, pool, _pool);
+
+   /* An occlusion pool holds nothing to reset (file comment). */
+   if (pool->vk.query_type == VK_QUERY_TYPE_OCCLUSION)
+      return;
 
    /* Not valid inside a render pass instance (Vulkan). */
    struct mali_jm_chain *c = mali_jm_cmd_vtc(cmd);
@@ -159,6 +205,25 @@ MALI_PER_ARCH(CmdWriteTimestamp)(VkCommandBuffer commandBuffer, VkPipelineStageF
    mali_jm_cmd_write_value(cmd, c, MALI_WRITE_VALUE_TYPE_IMMEDIATE_64, addr + 8, 1, true);
 }
 
+/*
+ * An occlusion query's begin and end, which record nothing (file
+ * comment). They are entry points rather than waist stubs so that the
+ * calls are not counted as skipped work: a skipped vkCmd* call means the
+ * command buffer is missing something it was asked to do, and here
+ * nothing is missing -- the results are zero by design. The only other
+ * pool type, TIMESTAMP, is not valid on these.
+ */
+VKAPI_ATTR void VKAPI_CALL
+MALI_PER_ARCH(CmdBeginQuery)(VkCommandBuffer commandBuffer, VkQueryPool _pool, uint32_t query,
+                             VkQueryControlFlags flags)
+{
+}
+
+VKAPI_ATTR void VKAPI_CALL
+MALI_PER_ARCH(CmdEndQuery)(VkCommandBuffer commandBuffer, VkQueryPool _pool, uint32_t query)
+{
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 MALI_PER_ARCH(GetQueryPoolResults)(VkDevice _device, VkQueryPool _pool, uint32_t firstQuery,
                                    uint32_t queryCount, size_t dataSize, void *pData,
@@ -167,14 +232,19 @@ MALI_PER_ARCH(GetQueryPoolResults)(VkDevice _device, VkQueryPool _pool, uint32_t
    VK_FROM_HANDLE(mali_device, dev, _device);
    VK_FROM_HANDLE(mali_query_pool, pool, _pool);
    const uint64_t *slots = pool->bo.cpu;
+   /* An occlusion pool's results are zero and always available (file
+    * comment). Nothing writes its memory, so the wait below must not
+    * read it: the availability flag would never come up and a wait would
+    * spin to the device timeout. */
+   const bool stub = pool->vk.query_type == VK_QUERY_TYPE_OCCLUSION;
    VkResult result = VK_SUCCESS;
 
    for (uint32_t i = 0; i < queryCount; i++) {
       const uint32_t q = firstQuery + i;
       uint8_t *out = (uint8_t *)pData + i * stride;
-      uint64_t avail;
+      uint64_t avail = 1;
 
-      for (;;) {
+      while (!stub) {
          avail = slots[(uint64_t)q * 2 + 1];
          if (avail || !(flags & VK_QUERY_RESULT_WAIT_BIT) || !dev->jm)
             break;
@@ -186,7 +256,7 @@ MALI_PER_ARCH(GetQueryPoolResults)(VkDevice _device, VkQueryPool _pool, uint32_t
       }
 
       if (avail || (flags & VK_QUERY_RESULT_PARTIAL_BIT)) {
-         const uint64_t value = slots[(uint64_t)q * 2];
+         const uint64_t value = stub ? 0 : slots[(uint64_t)q * 2];
          if (flags & VK_QUERY_RESULT_64_BIT)
             *(uint64_t *)out = value;
          else

@@ -250,6 +250,9 @@ struct mali_device {
    struct {
       uint32_t slow_waits;          /* host or submit waits over 1 s */
       uint32_t sync_file_errors;    /* sync-file import/export failures */
+      /* Occlusion query pools created, which this driver accepts without
+       * counting (mali_jm_query.c): the first one says so in the log. */
+      uint32_t occlusion_stub;
    } diag;
 
    /* Command-stream state specific to the device's frontend: struct
