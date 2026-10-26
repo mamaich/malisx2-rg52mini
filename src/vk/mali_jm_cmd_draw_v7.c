@@ -513,9 +513,10 @@ struct draw_data {
     * buffer index the vertex shader's image Attributes start at. */
    bool vs_copy, fs_copy;
    uint32_t vs_img_buf_offset;
-   /* The stages whose FAU block was rebuilt for this draw with uniform
-    * buffer words still to be copied in (mali_v7_ubo_copy). */
-   bool vs_ubo_copy, fs_ubo_copy;
+   /* The vertex shader's FAU block was rebuilt for this draw, with
+    * uniform buffer words still to be copied (mali_v7_ubo_copy); the
+    * fragment shader's block keeps that in the template (fs_ubo_owed). */
+   bool vs_ubo_copy;
 };
 
 /*
@@ -788,6 +789,65 @@ build_fs_rsd(struct mali_cmd_buffer *cmd, const struct mali_graphics_pipeline *p
 /* Draw state                                                              */
 
 /*
+ * What a stage's FAU block takes from the stage's tables, saved before the
+ * tables are built anew (mali_v7_desc_prepare) to tell whether the block
+ * must follow them. It takes two things. The set addresses and the dynamic
+ * storage buffer table's address (v7.needs_set_addrs, mali_v7_desc_sysvals)
+ * are new with every build. The uniform buffer words (fau.ubo_push_count)
+ * come from the dynamic uniform buffers alone (mali_v7_ubo_copy), which
+ * the tables record after every build or refresh (dyn_addrs, dyn_ranges:
+ * the address with the offset applied, and the range) -- so these are the
+ * buffers the current block was filled from.
+ *
+ * When the shader and those buffers are the same, the block stays, as it
+ * does when mali_v7_desc_refresh keeps the tables: its words were copied
+ * in by an earlier copy job, in this vtc chain or an earlier one. A Vertex
+ * job that reads the block starts after that copy job is done: the job
+ * manager starts a chain's jobs in order, the earlier Vertex job that the
+ * copy was for waited for it (Dependency 1), and an earlier vtc atom ends
+ * before a later one in the same slot starts. A fragment shader's block is
+ * read by the Fragment job, after its batch's whole vtc atom. A texture
+ * change then costs one descriptor copy job, not that and a uniform buffer
+ * copy job.
+ */
+struct fau_tables_key {
+   const struct mali_shader *shader;
+   uint64_t dyn_addrs[MALI_MAX_DYNAMIC_UNIFORM_BUFFERS];
+   uint64_t dyn_ranges[MALI_MAX_DYNAMIC_UNIFORM_BUFFERS];
+};
+
+static void
+fau_tables_save(struct fau_tables_key *k, const struct mali_v7_desc_tables *t,
+                const struct mali_shader *s)
+{
+   k->shader = t->shader;
+   if (t->shader != s)
+      return;
+   const uint32_t n = s->v7.dyn_ubo_count;
+   assert(n <= MALI_MAX_DYNAMIC_UNIFORM_BUFFERS);
+   memcpy(k->dyn_addrs, t->dyn_addrs, n * sizeof(k->dyn_addrs[0]));
+   memcpy(k->dyn_ranges, t->dyn_ranges, n * sizeof(k->dyn_ranges[0]));
+}
+
+/* After the tables were built anew: must the FAU block be too? */
+static bool
+fau_follows_tables(const struct fau_tables_key *k, const struct mali_v7_desc_tables *t,
+                   const struct mali_shader *s)
+{
+   if (s->v7.needs_set_addrs)
+      return true;
+   if (!s->fau.ubo_push_count)
+      return false;
+   if (k->shader != s)
+      return true;
+   /* The dynamic uniform buffers lead the shader's dynamic buffer map
+    * (mali_nir_lower_descriptors_v7.c), so they are the first entries. */
+   const uint32_t n = s->v7.dyn_ubo_count;
+   return memcmp(k->dyn_addrs, t->dyn_addrs, n * sizeof(k->dyn_addrs[0])) ||
+          memcmp(k->dyn_ranges, t->dyn_ranges, n * sizeof(k->dyn_ranges[0]));
+}
+
+/*
  * The draw's state (mali_cmd_state.h, "A draw's state"), v7 shape: the
  * shared step 1, then each dirty group's descriptors into the template.
  */
@@ -851,21 +911,26 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
       /* The same sets with other dynamic offsets keep the copied tables;
        * with the same dynamic buffers too, the tables and the FAU block
        * stay. */
-      bool same = false;
+      bool same = false, fau;
       if (!mali_v7_desc_refresh(cmd, p->vs, &cmd->gfx.desc, false, &t->vs_tab, &same)) {
+         struct fau_tables_key was;
+         fau_tables_save(&was, &t->vs_tab, p->vs);
          if (vk_command_buffer_has_error(&cmd->vk) ||
              !mali_v7_desc_prepare(cmd, p->vs, &cmd->gfx.desc, false, &t->vs_tab))
             return false;
          dd->vs_copy = true;
          cmd->jm.stats.tables[0]++;
-      } else if (!same) {
-         cmd->jm.stats.refreshed[0]++;
+         fau = fau_follows_tables(&was, &t->vs_tab, p->vs);
+      } else {
+         cmd->jm.stats.refreshed[0] += !same;
+         fau = !same && (p->vs->v7.needs_set_addrs || p->vs->fau.ubo_push_count);
       }
       d->vs_srt_key = bd->vs_srt_key;
       d->vs_sets_dirty = 0;
       /* The set addresses and the uniform buffer words in FAU follow the
-       * tables (mali_gfx_update_dirty leaves the second to this). */
-      if (!same && (p->vs->v7.needs_set_addrs || p->vs->fau.ubo_push_count)) {
+       * tables when they hold something of them (mali_gfx_update_dirty
+       * leaves the second to this; fau_follows_tables). */
+      if (fau) {
          if (!(d->dirty & MALI_GFX_DIRTY_VS_FAU))
             cmd->jm.stats.fau_by_tables[0]++;
          d->dirty |= MALI_GFX_DIRTY_VS_FAU;
@@ -873,17 +938,21 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
    }
    if (d->dirty & MALI_GFX_DIRTY_FS_SRT) {
       if (p->fs) {
-         bool same = false;
+         bool same = false, fau;
          if (!mali_v7_desc_refresh(cmd, p->fs, &cmd->gfx.desc, true, &t->fs_tab, &same)) {
+            struct fau_tables_key was;
+            fau_tables_save(&was, &t->fs_tab, p->fs);
             if (vk_command_buffer_has_error(&cmd->vk) ||
                 !mali_v7_desc_prepare(cmd, p->fs, &cmd->gfx.desc, true, &t->fs_tab))
                return false;
             dd->fs_copy = true;
             cmd->jm.stats.tables[1]++;
-         } else if (!same) {
-            cmd->jm.stats.refreshed[1]++;
+            fau = fau_follows_tables(&was, &t->fs_tab, p->fs);
+         } else {
+            cmd->jm.stats.refreshed[1] += !same;
+            fau = !same && (p->fs->v7.needs_set_addrs || p->fs->fau.ubo_push_count);
          }
-         if (!same && (p->fs->v7.needs_set_addrs || p->fs->fau.ubo_push_count)) {
+         if (fau) {
             if (!(d->dirty & MALI_GFX_DIRTY_FS_FAU))
                cmd->jm.stats.fau_by_tables[1]++;
             d->dirty |= MALI_GFX_DIRTY_FS_FAU;
@@ -925,7 +994,7 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
       cmd->jm.stats.fau[1]++;
       assert(!p->fs || (v >> 56) == DIV_ROUND_UP(p->fs->info.fau.count, 2));
       t->fs_fau = v & BITFIELD64_MASK(56);
-      dd->fs_ubo_copy = p->fs && p->fs->fau.ubo_push_count && t->fs_fau;
+      t->fs_ubo_owed = p->fs && p->fs->fau.ubo_push_count && t->fs_fau;
    }
    if (d->dirty & MALI_GFX_DIRTY_VIEWPORT) {
       t->viewport = emit_viewport(cmd);
@@ -1252,10 +1321,15 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
    if (dd.fs_copy && !mali_v7_desc_copy(cmd, c, p->fs, &t->fs_tab, 0, &fs_copy))
       goto fail;
    /* The fragment shader's uniform buffer words, which only the fragment
-    * job reads. */
-   if (tiling && dd.fs_ubo_copy &&
-       !mali_v7_ubo_copy(cmd, c, p->fs, &cmd->gfx.desc, t->fs_fau, 0, &fs_ubo))
-      goto fail;
+    * job reads: copied by the first draw that tiles after the block was
+    * built. One built for a draw that does not tile (rasterizer discard)
+    * stays owed, and with it kept for later draws (fau_follows_tables), the
+    * next one that tiles must not find it empty. */
+   if (tiling && t->fs_ubo_owed) {
+      if (!mali_v7_ubo_copy(cmd, c, p->fs, &cmd->gfx.desc, t->fs_fau, 0, &fs_ubo))
+         goto fail;
+      t->fs_ubo_owed = false;
+   }
    cmd->jm.stats.desc_copies[0] += vs_copy != 0;
    cmd->jm.stats.ubo_copies[0] += vs_dep != vs_copy;
    cmd->jm.stats.desc_copies[1] += fs_copy != 0;

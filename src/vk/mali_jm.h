@@ -266,6 +266,10 @@ struct mali_jm_draw_tmpl {
    uint64_t viewport;       /* Viewport descriptor (VIEWPORT) */
    uint64_t tiler, tsd;     /* layer 0's Tiler Context, the pass's Local Storage (PASS) */
    int32_t raw_vertex_offset;   /* the value the VS FAU block was built with */
+   /* The FS FAU block was built for a draw that did not tile, so its
+    * uniform buffer words were not copied in yet: the next draw that tiles
+    * copies them (mali_jm_cmd_draw_v7.c). */
+   bool fs_ubo_owed;
    /* The bound index buffer's CPU view (mali_cmd_state.c), NULL when none. */
    const uint8_t *ib_cpu;
 };
