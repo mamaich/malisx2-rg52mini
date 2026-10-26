@@ -857,13 +857,19 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
              !mali_v7_desc_prepare(cmd, p->vs, &cmd->gfx.desc, false, &t->vs_tab))
             return false;
          dd->vs_copy = true;
+         cmd->jm.stats.tables[0]++;
+      } else if (!same) {
+         cmd->jm.stats.refreshed[0]++;
       }
       d->vs_srt_key = bd->vs_srt_key;
       d->vs_sets_dirty = 0;
       /* The set addresses and the uniform buffer words in FAU follow the
        * tables (mali_gfx_update_dirty leaves the second to this). */
-      if (!same && (p->vs->v7.needs_set_addrs || p->vs->fau.ubo_push_count))
+      if (!same && (p->vs->v7.needs_set_addrs || p->vs->fau.ubo_push_count)) {
+         if (!(d->dirty & MALI_GFX_DIRTY_VS_FAU))
+            cmd->jm.stats.fau_by_tables[0]++;
          d->dirty |= MALI_GFX_DIRTY_VS_FAU;
+      }
    }
    if (d->dirty & MALI_GFX_DIRTY_FS_SRT) {
       if (p->fs) {
@@ -873,9 +879,15 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
                 !mali_v7_desc_prepare(cmd, p->fs, &cmd->gfx.desc, true, &t->fs_tab))
                return false;
             dd->fs_copy = true;
+            cmd->jm.stats.tables[1]++;
+         } else if (!same) {
+            cmd->jm.stats.refreshed[1]++;
          }
-         if (!same && (p->fs->v7.needs_set_addrs || p->fs->fau.ubo_push_count))
+         if (!same && (p->fs->v7.needs_set_addrs || p->fs->fau.ubo_push_count)) {
+            if (!(d->dirty & MALI_GFX_DIRTY_FS_FAU))
+               cmd->jm.stats.fau_by_tables[1]++;
             d->dirty |= MALI_GFX_DIRTY_FS_FAU;
+         }
       } else {
          memset(&t->fs_tab, 0, sizeof(t->fs_tab));
       }
@@ -895,6 +907,7 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
       sv.common.constant_data = p->vs->v7.data_mem.gpu_va;
       if (!mali_gfx_build_vs_fau(cmd, &sv, &v))
          return false;
+      cmd->jm.stats.fau[0]++;
       /* The RSD's preload.uniform_count is the shader's FAU word count;
        * the block built here has as many words. */
       assert((v >> 56) == DIV_ROUND_UP(p->vs->info.fau.count, 2));
@@ -909,6 +922,7 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
       }
       if (!mali_gfx_build_fs_fau(cmd, &sv, &v))
          return false;
+      cmd->jm.stats.fau[1]++;
       assert(!p->fs || (v >> 56) == DIV_ROUND_UP(p->fs->info.fau.count, 2));
       t->fs_fau = v & BITFIELD64_MASK(56);
       dd->fs_ubo_copy = p->fs && p->fs->fau.ubo_push_count && t->fs_fau;
@@ -1242,6 +1256,10 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
    if (tiling && dd.fs_ubo_copy &&
        !mali_v7_ubo_copy(cmd, c, p->fs, &cmd->gfx.desc, t->fs_fau, 0, &fs_ubo))
       goto fail;
+   cmd->jm.stats.desc_copies[0] += vs_copy != 0;
+   cmd->jm.stats.ubo_copies[0] += vs_dep != vs_copy;
+   cmd->jm.stats.desc_copies[1] += fs_copy != 0;
+   cmd->jm.stats.ubo_copies[1] += fs_ubo != 0;
    struct mali_ptr vj = mali_jm_cmd_add_job(cmd, c, MALI_JOB_TYPE_VERTEX, pan_size(COMPUTE_JOB),
                                             pending && !vs_dep && (fs_copy || fs_ubo), vs_dep);
    cmd->jm.tiler_defer = false;
@@ -1351,6 +1369,7 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
     * memory; a guess, as on v9. */
    mali_jm_cmd_heap_use(cmd, (uint64_t)di->count * di->instance_count * 32);
    cmd->jm.cur.draws++;
+   cmd->jm.stats.draws++;
    r->draws++;
    cmd->draws++;
    return;

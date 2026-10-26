@@ -91,6 +91,10 @@
 
 #include "mali_measure.h"
 
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
+#endif
+
 /* One JOB_SUBMIT's worth of atoms being built. jc of a soft fence atom
  * points at its fences[] entry, which the kernel reads (and, for
  * FENCE_TRIGGER, writes the new fd into) during the call. */
@@ -1011,6 +1015,99 @@ prepare_command_buffers(struct mali_device *dev, struct vk_queue_submit *submit)
    return VK_SUCCESS;
 }
 
+/* ---------------------------------------------------------------------- */
+/* MALISX2_STATS                                                           */
+
+/* MALISX2_STATS=<seconds> (Android: debug.malisx2.stats), in ns; 0: off. */
+static uint64_t
+stats_interval(void)
+{
+   const char *s = getenv("MALISX2_STATS");
+#ifdef __ANDROID__
+   char prop[PROP_VALUE_MAX] = "";
+   if ((!s || !*s) && __system_property_get("debug.malisx2.stats", prop) > 0)
+      s = prop;
+#endif
+   const double sec = s && *s ? strtod(s, NULL) : 0.0;
+   return sec > 0.0 ? (uint64_t)(sec * 1e9) : 0;
+}
+
+static void
+stats_add(struct mali_jm_cmd_stats *t, const struct mali_jm_cmd_stats *s)
+{
+   const uint64_t *src = (const uint64_t *)s;
+   uint64_t *dst = (uint64_t *)t;
+   for (unsigned i = 0; i < sizeof(*s) / sizeof(uint64_t); i++)
+      dst[i] += src[i];
+}
+
+/* One log line: what happened between *from and *to, over sec seconds. */
+static void
+stats_log(const char *what, const struct mali_jm_draw_totals *to,
+          const struct mali_jm_draw_totals *from, double sec)
+{
+#define D(f) (to->f - from->f)
+   const uint64_t draws = D(cmd.draws);
+   const double per = draws ? 1.0 / (double)draws : 0.0;
+   mesa_logi("malisx2 stats, %s %.1f s: %llu submits, %llu draws, %llu passes in %llu batches; "
+             "%llu atoms in %llu JOB_SUBMIT calls (%llu partial flushes), %llu waits for a free "
+             "atom number; per draw: %.2f vtc jobs, %.2f fragment jobs, %.2f push constant calls",
+             what, sec, (unsigned long long)D(submits), (unsigned long long)draws,
+             (unsigned long long)D(passes), (unsigned long long)D(batches),
+             (unsigned long long)D(atoms), (unsigned long long)D(job_submits),
+             (unsigned long long)D(partial_flushes), (unsigned long long)D(number_waits),
+             D(vtc_jobs) * per, D(frag_jobs) * per, D(cmd.push_constants) * per);
+#if PAN_ARCH < 9
+   static const char *const stage[2] = {"VS", "FS"};
+   for (unsigned i = 0; i < 2; i++) {
+      mesa_logi("malisx2 stats, %s, %s per draw: tables %.2f new + %.2f refreshed, %.2f "
+                "descriptor copy jobs; FAU %.2f (%.2f only for tables or dynamic buffers), "
+                "%.2f uniform buffer copy jobs",
+                what, stage[i], D(cmd.tables[i]) * per, D(cmd.refreshed[i]) * per,
+                D(cmd.desc_copies[i]) * per, D(cmd.fau[i]) * per,
+                D(cmd.fau_by_tables[i]) * per, D(cmd.ubo_copies[i]) * per);
+   }
+#endif
+#undef D
+}
+
+/* After a submit that built: add its command buffers in, and say so every
+ * stats_interval_ns. With dev->lock held. */
+static void
+stats_note(struct mali_device *dev, struct vk_queue_submit *submit)
+{
+   struct mali_jm_device *jd = dev->jm;
+   struct mali_jm_draw_totals *t = &jd->stats_total;
+   t->submits++;
+   for (uint32_t c = 0; c < submit->command_buffer_count; c++) {
+      struct mali_cmd_buffer *cmd =
+         container_of(submit->command_buffers[c], struct mali_cmd_buffer, vk);
+      stats_add(&t->cmd, &cmd->jm.stats);
+      uint32_t nb;
+      const struct mali_jm_batch *b = mali_jm_cmd_batches(cmd, &nb);
+      t->batches += nb;
+      for (uint32_t i = 0; i < nb; i++) {
+         t->passes += b[i].passes;
+         t->vtc_jobs += b[i].vtc.jobs;
+      }
+      util_dynarray_foreach(&cmd->jm.frags, struct mali_jm_frag_seg, f)
+         t->frag_jobs += f->chain.jobs;
+   }
+   t->atoms = jd->stats.atoms;
+   t->job_submits = jd->stats.job_submits;
+   t->number_waits = jd->stats.number_waits;
+   t->partial_flushes = jd->stats.partial_flushes;
+
+   const int64_t now = os_time_get_nano();
+   if (!jd->stats_since_ns) {
+      jd->stats_start_ns = jd->stats_since_ns = now;
+   } else if (now - jd->stats_since_ns >= (int64_t)jd->stats_interval_ns) {
+      stats_log("last", t, &jd->stats_logged, (now - jd->stats_since_ns) / 1e9);
+      jd->stats_logged = *t;
+      jd->stats_since_ns = now;
+   }
+}
+
 VkResult
 MALI_PER_ARCH(queue_submit)(struct vk_queue *vkq, struct vk_queue_submit *submit)
 {
@@ -1119,6 +1216,8 @@ MALI_PER_ARCH(queue_submit)(struct vk_queue *vkq, struct vk_queue_submit *submit
          s->req[1] = q->tracker;
       }
       dev->stats.submits++;
+      if (unlikely(jd->stats_interval_ns) && built)
+         stats_note(dev, submit);
       pthread_cond_broadcast(&dev->cond);
    }
 
@@ -1156,6 +1255,7 @@ MALI_PER_ARCH(device_init)(struct mali_device *dev)
    mali_kbase_jm_atom_ids_init(&jd->ids);
    jd->free_ids = mali_kbase_jm_atom_ids_free_count(&jd->ids);
    mali_jm_heap_init(jd);
+   jd->stats_interval_ns = stats_interval();
 
    dev->jm = jd;
    dev->fe = jd;
@@ -1175,6 +1275,11 @@ MALI_PER_ARCH(device_finish)(struct mali_device *dev)
    pthread_mutex_lock(&dev->lock);
    mali_jm_drain_locked(dev);
    pthread_mutex_unlock(&dev->lock);
+   if (jd->stats_interval_ns) {
+      static const struct mali_jm_draw_totals zero;
+      stats_log("all", &jd->stats_total, &zero,
+                jd->stats_start_ns ? (os_time_get_nano() - jd->stats_start_ns) / 1e9 : 0.0);
+   }
    mali_jm_sync_file_finish(jd);
    mali_jm_heap_finish(jd);
 #if PAN_ARCH < 9

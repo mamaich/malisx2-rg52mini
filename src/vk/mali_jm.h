@@ -287,6 +287,29 @@ struct mali_v7_range {
 };
 #endif
 
+/*
+ * What a command buffer's recording did, for MALISX2_STATS (mali_jm_queue.c
+ * stats_note): plain increments while recording, added into the device's
+ * totals at every submit of the command buffer, so a command buffer that
+ * runs twice counts twice. Cleared with the command buffer.
+ */
+struct mali_jm_cmd_stats {
+   uint64_t draws;
+   uint64_t push_constants;   /* vkCmdPushConstants calls */
+#if PAN_ARCH < 9
+   /* Per stage, [0] the vertex shader, [1] the fragment shader (v7 draws,
+    * mali_jm_cmd_draw_v7.c prepare_draw): */
+   uint64_t tables[2];        /* tables built anew (mali_v7_desc_prepare) */
+   uint64_t refreshed[2];     /* tables kept, new dynamic buffers packed
+                               * (mali_v7_desc_refresh) */
+   uint64_t desc_copies[2];   /* descriptor copy jobs */
+   uint64_t fau[2];           /* FAU blocks built */
+   uint64_t fau_by_tables[2]; /* ... of them only because the tables or the
+                               * dynamic buffers changed */
+   uint64_t ubo_copies[2];    /* uniform buffer word copy jobs */
+#endif
+};
+
 /* Inside the job-manager command buffer: what submit reads, and the open
  * batch. */
 struct mali_jm_cmd {
@@ -317,6 +340,8 @@ struct mali_jm_cmd {
    /* Timing regions (measurement/timing_jm.c); NULL unless
     * MALISX2_MEASURE's "timing" mode is on. */
    struct mali_measure_cmd *measure;
+
+   struct mali_jm_cmd_stats stats;
 #if PAN_ARCH < 9
    /* Tiler jobs written and waiting to be linked into the open batch's
     * vtc chain (mali_v7_link_tilers). Each goes in behind the Vertex job
@@ -922,6 +947,21 @@ struct mali_jm_device {
       uint64_t atoms, job_submits, events, joins, partial_flushes, number_waits;
       uint64_t fence_waits, fence_triggers, fence_wait_errors;
    } stats;
+
+   /*
+    * MALISX2_STATS=<seconds> (Android: debug.malisx2.stats): every so many
+    * seconds, at a submit, the log gets the counters above and the
+    * command buffers' (struct mali_jm_cmd_stats) since the last line, and
+    * the totals when the device goes. Read once at device creation; 0
+    * when off, and then submits only skip a branch.
+    */
+   uint64_t stats_interval_ns;
+   int64_t stats_start_ns, stats_since_ns;
+   struct mali_jm_draw_totals {
+      struct mali_jm_cmd_stats cmd;
+      uint64_t submits, batches, passes, vtc_jobs, frag_jobs;
+      uint64_t atoms, job_submits, number_waits, partial_flushes;
+   } stats_total, stats_logged;
 };
 
 struct mali_jm_queue {

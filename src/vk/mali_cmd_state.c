@@ -587,4 +587,7 @@ MALI_PER_ARCH(CmdPushConstants2KHR)(VkCommandBuffer commandBuffer,
    assert(info->offset + info->size <= sizeof(cmd->push_constants));
    memcpy(cmd->push_constants + info->offset, info->pValues, info->size);
    cmd->gfx.draw.dirty |= MALI_GFX_DIRTY_VS_FAU | MALI_GFX_DIRTY_FS_FAU;
+#if PAN_ARCH < 10
+   cmd->jm.stats.push_constants++;
+#endif
 }

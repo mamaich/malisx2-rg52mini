@@ -928,6 +928,7 @@ cmd_clear(struct mali_cmd_buffer *cmd)
    memset(&cmd->gfx, 0, sizeof(cmd->gfx));
    cmd->gfx.draw.dirty = MALI_GFX_DIRTY_ALL;
    cmd->dispatches = cmd->draws = cmd->passes = 0;
+   memset(&cmd->jm.stats, 0, sizeof(cmd->jm.stats));
 #if PAN_ARCH < 9
    /* The v7 draw state goes with gfx: its descriptor tables were in the
     * command memory released above (a draw after the reset must not keep
