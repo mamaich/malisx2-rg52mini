@@ -1099,10 +1099,11 @@ stats_log(const char *what, const struct mali_jm_draw_totals *to,
    for (unsigned i = 0; i < 2; i++) {
       mesa_logi("malisx2 stats, %s, %s per draw: tables %.2f new + %.2f refreshed, %.2f "
                 "descriptor copy jobs; FAU %.2f (%.2f only for tables or dynamic buffers), "
-                "%.2f uniform buffer copy jobs",
+                "%.2f uniform buffer copy jobs; FAU kept %.2f",
                 what, stage[i], D(cmd.tables[i]) * per, D(cmd.refreshed[i]) * per,
                 D(cmd.desc_copies[i]) * per, D(cmd.fau[i]) * per,
-                D(cmd.fau_by_tables[i]) * per, D(cmd.ubo_copies[i]) * per);
+                D(cmd.fau_by_tables[i]) * per, D(cmd.ubo_copies[i]) * per,
+                D(cmd.fau_kept[i]) * per);
    }
 #endif
 #undef D

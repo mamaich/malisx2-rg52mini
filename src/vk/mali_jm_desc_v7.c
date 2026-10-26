@@ -744,6 +744,30 @@ build_ubo_copy_nir(struct mali_device *dev)
    return b.shader;
 }
 
+uint32_t
+mali_v7_ubo_sources(const struct mali_shader *s, const struct mali_desc_state *desc,
+                    uint64_t src[2 * MALI_MAX_UBO_PUSH_FAUS])
+{
+   const uint32_t n = s->fau.ubo_push_count;
+   assert(n <= MALI_MAX_UBO_PUSH_FAUS);
+   uint32_t dyn_cached = UINT32_MAX;
+   uint64_t addr = 0, range = 0;
+   for (uint32_t i = 0; i < n; i++) {
+      const struct mali_ubo_push_word *w = &s->fau.ubo_push[i];
+      if (w->dyn != dyn_cached) {
+         dyn_cached = w->dyn;
+         if (w->dyn >= s->v7.dyn_ubo_count ||
+             !dyn_buf(desc, s->desc.dyn_bufs.map[w->dyn], &addr, &range) || (addr >> 56))
+            addr = range = 0;
+      }
+      for (unsigned h = 0; h < 2; h++) {
+         const uint64_t off = w->offset + 4 * h;
+         src[2 * i + h] = addr && off + 4 <= range ? addr + off : 0;
+      }
+   }
+   return 2 * n;
+}
+
 bool
 mali_v7_ubo_copy(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c, const struct mali_shader *s,
                  const struct mali_desc_state *desc, uint64_t fau_va, uint16_t dep, uint16_t *index)
@@ -764,20 +788,10 @@ mali_v7_ubo_copy(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c, const str
       return false;
    const uint64_t zero = p.gpu + 2 * n * sizeof(uint64_t);
    uint64_t table[2 * MALI_MAX_UBO_PUSH_FAUS + 1];
-   uint32_t dyn_cached = UINT32_MAX;
-   uint64_t addr = 0, range = 0;
-   for (uint32_t i = 0; i < n; i++) {
-      const struct mali_ubo_push_word *w = &s->fau.ubo_push[i];
-      if (w->dyn != dyn_cached) {
-         dyn_cached = w->dyn;
-         if (w->dyn >= s->v7.dyn_ubo_count ||
-             !dyn_buf(desc, s->desc.dyn_bufs.map[w->dyn], &addr, &range) || (addr >> 56))
-            addr = range = 0;
-      }
-      for (unsigned h = 0; h < 2; h++) {
-         const uint64_t off = w->offset + 4 * h;
-         table[2 * i + h] = addr && off + 4 <= range ? addr + off : zero;
-      }
+   mali_v7_ubo_sources(s, desc, table);
+   for (uint32_t i = 0; i < 2 * n; i++) {
+      if (!table[i])
+         table[i] = zero;
    }
    table[2 * n] = 0;
    memcpy(p.cpu, table, (2 * n + 1) * sizeof(uint64_t));

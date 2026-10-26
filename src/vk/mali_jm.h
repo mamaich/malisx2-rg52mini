@@ -288,6 +288,15 @@ struct mali_jm_draw_tmpl {
     * uniform buffer words were not copied in yet: the next draw that tiles
     * copies them (mali_jm_cmd_draw_v7.c). */
    bool fs_ubo_owed;
+   /* What each stage's FAU block holds (mali_jm_cmd_draw_v7.c fau_keep):
+    * the words the CPU wrote and where its uniform buffer words were copied
+    * from. total 0: nothing to compare with. */
+   struct mali_v7_fau_record {
+      uint32_t total;
+      uint32_t ubo_src_count;
+      uint64_t words[MALI_FAU_WORD_COUNT];
+      uint64_t ubo_src[2 * MALI_MAX_UBO_PUSH_FAUS];
+   } vs_fau_rec, fs_fau_rec;
    /* The bound index buffer's CPU view (mali_cmd_state.c), NULL when none. */
    const uint8_t *ib_cpu;
 };
@@ -328,6 +337,8 @@ struct mali_jm_cmd_stats {
    uint64_t fau[2];           /* FAU blocks built */
    uint64_t fau_by_tables[2]; /* ... of them only because the tables or the
                                * dynamic buffers changed */
+   uint64_t fau_kept[2];      /* FAU blocks due to be built that were kept,
+                               * the new one coming out the same */
    uint64_t ubo_copies[2];    /* uniform buffer word copy jobs */
 #endif
 };
@@ -722,6 +733,13 @@ bool mali_v7_desc_copy(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
 bool mali_v7_ubo_copy(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
                       const struct mali_shader *s, const struct mali_desc_state *desc,
                       uint64_t fau_va, uint16_t dep, uint16_t *index);
+
+/* Where mali_v7_ubo_copy would copy a shader's uniform buffer words from
+ * now: for each 32-bit half of each word, the address in its dynamic
+ * uniform buffer, or 0 for one outside the buffer (copied as zero).
+ * Returns how many: twice s->fau.ubo_push_count. */
+uint32_t mali_v7_ubo_sources(const struct mali_shader *s, const struct mali_desc_state *desc,
+                             uint64_t src[2 * MALI_MAX_UBO_PUSH_FAUS]);
 
 /* The v7_desc.sets system values of one stage: the addresses of the bound
  * sets the shader reads and, at MALI_V7_SETS_DYN_SSBOS, its dynamic

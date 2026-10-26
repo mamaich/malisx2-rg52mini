@@ -449,6 +449,16 @@ MALI_PER_ARCH_DECL(uint64_t, cmd_gfx_fau,
                    (struct mali_cmd_buffer *cmd, const struct mali_shader *s,
                     const void *sysvals, const void *push, uint32_t push_size));
 
+/* The words cmd_gfx_fau writes into a block at GPU address `block` (its
+ * push-uniforms system value is the block's own address):
+ * s->fau.total_count words into out, which has room for
+ * MALI_FAU_WORD_COUNT. The pushed uniform-buffer words are zero here; the
+ * GPU copies them in. For a caller that compares a block before it
+ * builds one (mali_jm_cmd_draw_v7.c). */
+MALI_PER_ARCH_DECL(void, cmd_gfx_fau_words,
+                   (const struct mali_shader *s, const void *sysvals, const void *push,
+                    uint32_t push_size, uint64_t block, uint64_t *out));
+
 /* ---------------------------------------------------------------------- */
 /* mali_cmd_draw.c                                                         */
 

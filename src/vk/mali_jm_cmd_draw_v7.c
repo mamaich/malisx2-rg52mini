@@ -848,6 +848,65 @@ fau_follows_tables(const struct fau_tables_key *k, const struct mali_v7_desc_tab
 }
 
 /*
+ * A stage's FAU block, due to be built, is kept when the new one would come
+ * out the same: the same words written by the CPU (system values, push
+ * constants and promoted constants, mali_cmd_gfx_fau_words, the
+ * push-uniforms word taken as the kept block's own address), and its
+ * uniform buffer words copied from the same addresses
+ * (mali_v7_ubo_sources). A new pipeline marks both stages' blocks, and on v7
+ * a block with uniform buffer words costs a compute job in front of the
+ * Vertex job to copy them in. ARMSX2 switches pipelines for most draws, but
+ * often keeps the vertex shader (God of War's demo: 0.47 of the 0.88
+ * switches per draw), and many of its fragment shaders lay their blocks out
+ * alike (0.28): such blocks are kept, with no copy job. Their uniform buffer
+ * words were copied in before from the same addresses, as when
+ * fau_follows_tables keeps a block, or for a fragment shader's block built
+ * for a draw that did not tile, are still owed and copied by the next draw
+ * that tiles (fs_ubo_owed).
+ */
+static bool
+fau_keep(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
+         const struct mali_graphics_sysvals *sv, uint64_t block,
+         const struct mali_v7_fau_record *rec)
+{
+   const uint32_t total = s->fau.total_count;
+   if (!block || !total || rec->total != total)
+      return false;
+   uint64_t words[MALI_FAU_WORD_COUNT];
+   MALI_PER_ARCH(cmd_gfx_fau_words)(s, sv, cmd->push_constants, sizeof(cmd->push_constants),
+                                    block, words);
+   if (memcmp(words, rec->words, total * sizeof(words[0])))
+      return false;
+   uint64_t src[2 * MALI_MAX_UBO_PUSH_FAUS];
+   const uint32_t n = mali_v7_ubo_sources(s, &cmd->gfx.desc, src);
+   return n == rec->ubo_src_count && !memcmp(src, rec->ubo_src, n * sizeof(src[0]));
+}
+
+/* A new FAU block for the stage (MALI_PER_ARCH(cmd_gfx_fau) with its words
+ * recorded for fau_keep): *out = its address | its word count << 56, 0 for
+ * a shader without one. */
+static bool
+fau_build(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
+          const struct mali_graphics_sysvals *sv, struct mali_v7_fau_record *rec, uint64_t *out)
+{
+   const uint32_t total = s ? s->fau.total_count : 0;
+   rec->total = 0;
+   *out = 0;
+   if (!total)
+      return true;
+   struct mali_ptr p = mali_cmd_alloc(cmd, total * sizeof(uint64_t), 16);
+   if (!p.cpu)
+      return false;
+   MALI_PER_ARCH(cmd_gfx_fau_words)(s, sv, cmd->push_constants, sizeof(cmd->push_constants),
+                                    p.gpu, rec->words);
+   memcpy(p.cpu, rec->words, total * sizeof(rec->words[0]));
+   rec->ubo_src_count = mali_v7_ubo_sources(s, &cmd->gfx.desc, rec->ubo_src);
+   rec->total = total;
+   *out = p.gpu | ((uint64_t)total << 56);
+   return true;
+}
+
+/*
  * The draw's state (mali_cmd_state.h, "A draw's state"), v7 shape: the
  * shared step 1, then each dirty group's descriptors into the template.
  */
@@ -974,14 +1033,18 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
        * take the place of fs.blend_descs, which v7 shaders never read). */
       mali_v7_desc_sysvals(&t->vs_tab, p->vs, sv.v7_desc.sets);
       sv.common.constant_data = p->vs->v7.data_mem.gpu_va;
-      if (!mali_gfx_build_vs_fau(cmd, &sv, &v))
-         return false;
-      cmd->jm.stats.fau[0]++;
-      /* The RSD's preload.uniform_count is the shader's FAU word count;
-       * the block built here has as many words. */
-      assert((v >> 56) == DIV_ROUND_UP(p->vs->info.fau.count, 2));
-      t->vs_fau = v & BITFIELD64_MASK(56);
-      dd->vs_ubo_copy = p->vs->fau.ubo_push_count && t->vs_fau;
+      if (fau_keep(cmd, p->vs, &sv, t->vs_fau, &t->vs_fau_rec)) {
+         cmd->jm.stats.fau_kept[0]++;
+      } else {
+         if (!fau_build(cmd, p->vs, &sv, &t->vs_fau_rec, &v))
+            return false;
+         cmd->jm.stats.fau[0]++;
+         /* The RSD's preload.uniform_count is the shader's FAU word count;
+          * the block built here has as many words. */
+         assert((v >> 56) == DIV_ROUND_UP(p->vs->info.fau.count, 2));
+         t->vs_fau = v & BITFIELD64_MASK(56);
+         dd->vs_ubo_copy = p->vs->fau.ubo_push_count && t->vs_fau;
+      }
       t->raw_vertex_offset = dd->raw_vertex_offset;
    }
    if (d->dirty & MALI_GFX_DIRTY_FS_FAU) {
@@ -989,12 +1052,16 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
          mali_v7_desc_sysvals(&t->fs_tab, p->fs, sv.v7_desc.sets);
          sv.common.constant_data = p->fs->v7.data_mem.gpu_va;
       }
-      if (!mali_gfx_build_fs_fau(cmd, &sv, &v))
-         return false;
-      cmd->jm.stats.fau[1]++;
-      assert(!p->fs || (v >> 56) == DIV_ROUND_UP(p->fs->info.fau.count, 2));
-      t->fs_fau = v & BITFIELD64_MASK(56);
-      t->fs_ubo_owed = p->fs && p->fs->fau.ubo_push_count && t->fs_fau;
+      if (p->fs && fau_keep(cmd, p->fs, &sv, t->fs_fau, &t->fs_fau_rec)) {
+         cmd->jm.stats.fau_kept[1]++;
+      } else {
+         if (!fau_build(cmd, p->fs, &sv, &t->fs_fau_rec, &v))
+            return false;
+         cmd->jm.stats.fau[1]++;
+         assert(!p->fs || (v >> 56) == DIV_ROUND_UP(p->fs->info.fau.count, 2));
+         t->fs_fau = v & BITFIELD64_MASK(56);
+         t->fs_ubo_owed = p->fs && p->fs->fau.ubo_push_count && t->fs_fau;
+      }
    }
    if (d->dirty & MALI_GFX_DIRTY_VIEWPORT) {
       t->viewport = emit_viewport(cmd);

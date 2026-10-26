@@ -199,28 +199,23 @@ MALI_PER_ARCH(CmdBindIndexBuffer2KHR)(VkCommandBuffer commandBuffer, VkBuffer bu
 /* ---------------------------------------------------------------------- */
 /* FAU                                                                     */
 
-uint64_t
-MALI_PER_ARCH(cmd_gfx_fau)(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
-                           const void *sysvals, const void *push, uint32_t push_size)
+void
+MALI_PER_ARCH(cmd_gfx_fau_words)(const struct mali_shader *s, const void *sysvals,
+                                 const void *push, uint32_t push_size, uint64_t block,
+                                 uint64_t *tmp)
 {
-   if (!s || !s->fau.total_count)
-      return 0;
-
    const uint32_t total = s->fau.total_count;
-   struct mali_ptr p = mali_cmd_alloc(cmd, total * 8, 16);
-   if (!p.cpu)
-      return 0;
+   assert(total <= MALI_FAU_WORD_COUNT);
 
    /* The sysval words the shader reads, with the block's own address in
     * common.push_uniforms, then its push-constant words (zero past the
     * end of push). Read in place: this runs twice a draw. */
    const unsigned push_uniforms_word =
       offsetof(struct mali_graphics_sysvals, common.push_uniforms) / MALI_FAU_WORD_SIZE;
-   uint64_t tmp[MALI_FAU_WORD_COUNT];
    unsigned n = 0, w;
    BITSET_FOREACH_SET(w, s->fau.used_sysvals, MALI_MAX_SYSVAL_FAUS) {
       tmp[n++] = w == push_uniforms_word ?
-                    p.gpu :
+                    block :
                     mali_sysval_word(sysvals, sizeof(struct mali_graphics_sysvals), w);
    }
    const uint32_t push_len = MIN2(push_size, MALI_MAX_PUSH_CONST_FAUS * MALI_FAU_WORD_SIZE);
@@ -245,7 +240,24 @@ MALI_PER_ARCH(cmd_gfx_fau)(struct mali_cmd_buffer *cmd, const struct mali_shader
       tmp[idx] = (tmp[idx] & ((uint64_t)UINT32_MAX << (32 * !hi))) |
                  ((uint64_t)s->info.fau.words[i].constant << (32 * hi));
    }
+}
 
+uint64_t
+MALI_PER_ARCH(cmd_gfx_fau)(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
+                           const void *sysvals, const void *push, uint32_t push_size)
+{
+   if (!s || !s->fau.total_count)
+      return 0;
+
+   const uint32_t total = s->fau.total_count;
+   struct mali_ptr p = mali_cmd_alloc(cmd, total * 8, 16);
+   if (!p.cpu)
+      return 0;
+
+   /* Built in cached memory and copied out once: command memory is
+    * write-combined. */
+   uint64_t tmp[MALI_FAU_WORD_COUNT];
+   MALI_PER_ARCH(cmd_gfx_fau_words)(s, sysvals, push, push_size, p.gpu, tmp);
    memcpy(p.cpu, tmp, total * sizeof(tmp[0]));
    return p.gpu | ((uint64_t)total << 56);
 }
