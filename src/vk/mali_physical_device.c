@@ -811,7 +811,10 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       props->subgroupSize = 8;
    }
 
-   snprintf(props->deviceName, sizeof(props->deviceName), "%s", name);
+   /* dArkOS: the blob's name plus the driver's, so that an emulator listing both drivers
+    * (and keeping its choice by name: PCSX2, DuckStation, PPSSPP) can tell them apart;
+    * "Mali" stays in it for the programs that look for it. */
+   snprintf(props->deviceName, sizeof(props->deviceName), "%s (malisx2)", name);
    /* The blob reports the device name as driverName too. */
    snprintf(props->driverName, sizeof(props->driverName), "%s", name);
    snprintf(props->driverInfo, sizeof(props->driverInfo), "%s", driver_info);
