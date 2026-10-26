@@ -163,6 +163,27 @@ stage_init(struct mali_device *dev, VkPipelineCreateFlags2KHR flags,
    st->info = info;
    vk_pipeline_robustness_state_fill(&dev->vk.robustness_state, &st->rs,
                                      pipeline_pNext, info->pNext);
+#if PAN_ARCH < 9
+   /*
+    * The v7 Vertex job shades every vertex of an indexed draw's index range
+    * [min, max] (mali_jm_cmd_draw_v7.c), not just the ones the indices
+    * name, so a vertex shader also runs for vertices the application never
+    * draws, and does storage buffer reads it never meant to happen. Dolphin
+    * expands lines in the vertex shader when there is no geometry shader
+    * and reads the other end of the line at vertex_id - 1 in the corners
+    * the indices only ever take from the second vertex of a pair. Shaded
+    * for the first vertex too, that is input_buffer[0xffffffff]: element
+    * -1, which the 32-bit offset wraps to almost 4 GiB past the buffer's
+    * start, an unmapped address, so the GPU faults and the device is lost
+    * (ND Demo, at its first EFB draw). So a vertex shader's storage buffer
+    * accesses are bounds-checked whatever the pipeline's robustness: such a
+    * read returns zeros, which go out with the vertex that nothing draws.
+    * Before the stage hash, so the cache key follows.
+    */
+   if (info->stage == VK_SHADER_STAGE_VERTEX_BIT &&
+       st->rs.storage_buffers == VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT)
+      st->rs.storage_buffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_EXT;
+#endif
    vk_pipeline_hash_shader_stage(flags, info, &st->rs, st->stage_hash);
 }
 
