@@ -124,7 +124,7 @@ can_use_afbc(const struct mali_image *image, const enum pipe_format *formats, un
  * sampler border colours swizzled to match (panvk_vX_sampler.c).
  */
 static bool
-v7_afbc_format(enum pipe_format f)
+v7_afbc_format(enum pipe_format f, bool depth)
 {
    switch (f) {
    case PIPE_FORMAT_R8_UNORM:
@@ -132,6 +132,8 @@ v7_afbc_format(enum pipe_format f)
    case PIPE_FORMAT_R8G8B8A8_UNORM:
    case PIPE_FORMAT_R8G8B8A8_SRGB:
       return true;
+   case PIPE_FORMAT_Z32_FLOAT:
+      return depth;
    default:
       return false;
    }
@@ -152,20 +154,36 @@ v7_afbc_format(enum pipe_format f)
  * (mali_cmd_image.c). On God of War (ARMSX2) that cut the texture unit's
  * reads from memory by 8-10 % and gave 2-3 % more frames; textures is
  * false under MALISX2_V7_AFBC_TEX=0 (colour attachments only).
+ *
+ * A D32_SFLOAT depth attachment is AFBC too when depth is set
+ * (MALISX2_V7_AFBC_DEPTH): Arm's driver writes it so on the G52, with the
+ * 32-bit colour compression mode, and it is read as such by the preload and
+ * the texture unit alike (Z32 textures with the AFBC texel ordering). On
+ * God of War that cut the tile writes to memory by a fifth and the texture
+ * reads by a seventh.
  */
 static bool
 v7_can_use_afbc(const struct mali_image *image, const enum pipe_format *formats,
-                const VkImageCreateInfo *info, bool textures)
+                const VkImageCreateInfo *info, bool textures, bool depth_afbc)
 {
    const VkImageUsageFlags usage = image->vk.usage | image->vk.stencil_usage;
    const VkImageUsageFlags rt_or_tex =
       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | (textures ? VK_IMAGE_USAGE_SAMPLED_BIT : 0);
-   if (!(usage & rt_or_tex) ||
-       (usage & (VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
-                 VK_IMAGE_USAGE_HOST_TRANSFER_BIT)))
+   /* A D32 depth attachment (v7_afbc_depth): the same rules, with the
+    * depth usage in place of the colour one. */
+   const bool depth = image->vk.format == VK_FORMAT_D32_SFLOAT && depth_afbc;
+   if (depth) {
+      if (!(usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) ||
+          (usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                    VK_IMAGE_USAGE_HOST_TRANSFER_BIT)))
+         return false;
+   } else if (!(usage & rt_or_tex) ||
+              (usage & (VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                        VK_IMAGE_USAGE_HOST_TRANSFER_BIT))) {
       return false;
-   if (image->plane_count != 1 || vk_format_is_depth_or_stencil(image->vk.format) ||
-       !v7_afbc_format(formats[0]))
+   }
+   if (image->plane_count != 1 || (!depth && vk_format_is_depth_or_stencil(image->vk.format)) ||
+       !v7_afbc_format(formats[0], depth))
       return false;
    if (image->vk.create_flags &
        (VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT |
@@ -201,14 +219,14 @@ v7_can_use_afbc(const struct mali_image *image, const enum pipe_format *formats,
  */
 static uint64_t
 choose_modifier(const struct mali_image *image, const enum pipe_format *formats, unsigned arch,
-                const VkImageCreateInfo *info, bool v7_textures)
+                const VkImageCreateInfo *info, bool v7_textures, bool v7_depth)
 {
    /* A scanout buffer (a VK_KHR_display swapchain image): the kernel and
     * the GPU have to agree on the layout, and only linear (or a DRM
     * modifier the display's plane lists) qualifies. */
    if (image->wsi_scanout || image->vk.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT)
       return DRM_FORMAT_MOD_LINEAR;
-   if (arch == 7 ? v7_can_use_afbc(image, formats, info, v7_textures)
+   if (arch == 7 ? v7_can_use_afbc(image, formats, info, v7_textures, v7_depth)
                  : can_use_afbc(image, formats, arch))
       return mali_afbc_can_ytr(formats[0]) ? MALI_MOD_AFBC_YTR : MALI_MOD_AFBC;
    if (image->vk.tiling == VK_IMAGE_TILING_LINEAR ||
@@ -321,7 +339,8 @@ mali_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
    }
    const unsigned arch = mali_device_physical(dev)->arch;
    image->vk.drm_format_mod =
-      choose_modifier(image, formats, arch, pCreateInfo, dev->v7_afbc_textures);
+      choose_modifier(image, formats, arch, pCreateInfo, dev->v7_afbc_textures,
+                      dev->v7_afbc_depth);
    /* No CRC on v7 and v9 yet: the job manager cannot update the seed from the
     * GPU, and the CPU-side seed it needs is not written yet. */
    const bool crc = !mali_arch_is_jm(arch) &&

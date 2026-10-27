@@ -1325,6 +1325,10 @@ MALI_PER_ARCH(device_init)(struct mali_device *dev)
    jd->fpk_under_roa = knob_uint("MALISX2_V7_FPK_ROA", "debug.malisx2.v7_fpk_roa", 0, 1, 1);
    dev->v7_afbc_textures =
       knob_uint("MALISX2_V7_AFBC_TEX", "debug.malisx2.v7_afbc_tex", 0, 1, 1);
+   dev->v7_afbc_depth =
+      knob_uint("MALISX2_V7_AFBC_DEPTH", "debug.malisx2.v7_afbc_depth", 0, 1, 1);
+   dev->jm_hierarchy_mask =
+      knob_uint("MALISX2_JM_HIER_MASK", "debug.malisx2.jm_hier_mask", 0, 255, 0);
    mali_jm_heap_init(jd);
    jd->stats_interval_ns = stats_interval();
 

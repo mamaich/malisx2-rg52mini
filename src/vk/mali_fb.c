@@ -712,25 +712,35 @@ pack_zs_ext(const struct mali_render_state *r, unsigned layer, uint64_t crc_clea
    }
 
 #if PAN_ARCH < 9
-   /* v7 depth/stencil images are never AFBC (mali_image.c v7_can_use_afbc). */
-   assert(!target_is_afbc(zt) && !target_is_afbc(st));
-   if (zt->image && zt->store) {
-#else
+   /* v7 stencil images are never AFBC (mali_image.c v7_can_use_afbc); a
+    * D32 depth one may be (v7_afbc_depth). */
+   assert(!target_is_afbc(st));
+#endif
    if (zt->image && zt->store && target_is_afbc(zt)) {
       uint64_t header;
       uint32_t body, row;
       target_afbc_mem(zt, layer, &header, &body, &row);
+#if PAN_ARCH < 9
+      /* As the colour targets (pack_rt_afbc): the body's address, the row
+       * stride in header tiles. */
+      const enum pipe_format zpf = zt->image->planes[zt->plane].format;
+      const uint32_t zrow_blocks = row / (MALI_AFBC_HEADER_BYTES * mali_afbc_header_tile_sbs(zpf));
+#endif
       pan_pack(&part, ZS_CRC_EXTENSION, cfg) {
          cfg.afbc_zs.write_format = zs_write_format(zt->format);
          cfg.afbc_zs.block_format = MALI_BLOCK_FORMAT_AFBC_TILED;
          cfg.afbc_zs.reverse_issue_order = afbc_reverse_issue_order(r);
          cfg.afbc_zs.header = header;
+#if PAN_ARCH >= 9
          cfg.afbc_zs.body_offset = body;
          cfg.afbc_zs.header_row_stride = row;
+#else
+         cfg.afbc_zs.body = header + body;
+         cfg.afbc_zs.header_row_stride = zrow_blocks;
+#endif
       }
       pan_merge(&desc, &part, ZS_CRC_EXTENSION);
    } else if (zt->image && zt->store) {
-#endif
       uint64_t base, surf;
       uint32_t row;
       target_mem(zt, layer, &base, &row, &surf);
@@ -802,7 +812,8 @@ pack_rt_afbc(const struct mali_render_state *r, const struct mali_fb_target *t, 
 #if PAN_ARCH < 9
    const enum pipe_format pf = t->image->planes[t->plane].format;
    const uint32_t row_blocks = row / (MALI_AFBC_HEADER_BYTES * mali_afbc_header_tile_sbs(pf));
-   assert(util_format_linear(t->format) == util_format_linear(pf));
+   assert(util_format_linear(t->format) == util_format_linear(pf) ||
+          (pf == PIPE_FORMAT_Z32_FLOAT && t->format == PIPE_FORMAT_R8G8B8A8_UNORM));
 #endif
 
    pan_cast_and_pack(out, AFBC_RGB_RENDER_TARGET, cfg) {

@@ -243,7 +243,9 @@ emit_surface(const struct view_src *src, unsigned level, unsigned layer, unsigne
       const uint64_t mod = image->vk.drm_format_mod;
       assert(image->vk.image_type == VK_IMAGE_TYPE_2D && sample == 0);
       assert(util_format_linear(src->format) ==
-             util_format_linear(image->planes[src->plane].format));
+                util_format_linear(image->planes[src->plane].format) ||
+             (image->planes[src->plane].format == PIPE_FORMAT_Z32_FLOAT &&
+              src->format == PIPE_FORMAT_R8G8B8A8_UNORM));
       unsigned flags = MALI_AFBC_SURFACE_FLAG_PREFETCH | MALI_AFBC_SURFACE_FLAG_CHECK_PAYLOAD_RANGE;
       if (mod & AFBC_FORMAT_MOD_YTR)
          flags |= MALI_AFBC_SURFACE_FLAG_YTR;

@@ -246,7 +246,7 @@ copy_read_format(const struct mali_image *img, unsigned plane)
    /* v7 decompresses by the texture's format: an AFBC plane is read in its
     * own (linear) format and converted to bits in the shader. */
    if (mali_image_is_afbc(img))
-      return util_format_linear(f);
+      return f == PIPE_FORMAT_Z32_FLOAT ? PIPE_FORMAT_R8G8B8A8_UNORM : util_format_linear(f);
 #endif
    if (f == PIPE_FORMAT_S8_UINT)
       return f;
@@ -263,6 +263,9 @@ v7_copy_fmt(const struct mali_image *img, unsigned plane)
    case PIPE_FORMAT_R8_UNORM: return MALI_META_COPY_FMT_R8;
    case PIPE_FORMAT_R8G8_UNORM: return MALI_META_COPY_FMT_R8G8;
    case PIPE_FORMAT_R8G8B8A8_UNORM: return MALI_META_COPY_FMT_R8G8B8A8;
+   /* A D32 plane compresses with the 32-bit colour mode (pan_afbc.h), so
+    * its blocks copy as RGBA8 (mali_image.c v7_afbc_depth). */
+   case PIPE_FORMAT_Z32_FLOAT: return MALI_META_COPY_FMT_R8G8B8A8;
    default:
       /* v7_afbc_format (mali_image.c) admits no other format. */
       UNREACHABLE("no v7 AFBC copy format");
@@ -359,7 +362,10 @@ copy_to_afbc(struct mali_cmd_buffer *cmd, const struct mali_image *img, unsigned
 #if PAN_ARCH < 9
    /* v7: an AFBC target and source in their own formats, the bits
     * converted in the shader (mali_meta_copy_fmt). */
-   const enum pipe_format target_format = util_format_linear(img->planes[plane].format);
+   const enum pipe_format target_format =
+      img->planes[plane].format == PIPE_FORMAT_Z32_FLOAT
+         ? PIPE_FORMAT_R8G8B8A8_UNORM
+         : util_format_linear(img->planes[plane].format);
    key.rt_type[0] = MALI_META_FS_FLOAT;
    key.copy_dst_fmt = v7_copy_fmt(img, plane);
    if (src->img)

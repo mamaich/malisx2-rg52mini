@@ -271,6 +271,12 @@ struct mali_device {
     * (mali_image.c v7_can_use_afbc); set by the job manager's device init,
     * MALISX2_V7_AFBC_TEX=0 turns it off. */
    bool v7_afbc_textures;
+   /* v7: D32 depth attachments are AFBC (mali_image.c v7_can_use_afbc;
+    * MALISX2_V7_AFBC_DEPTH=0 keeps them uncompressed). */
+   bool v7_afbc_depth;
+   /* The tiler hierarchy mask to use outright (mali_jm_cmd_render.c
+    * hierarchy_mask; MALISX2_JM_HIER_MASK), 0 for the rule there. */
+   uint8_t jm_hierarchy_mask;
 
    /* Timing and command-stream capture (src/measurement/); NULL unless
     * MALISX2_MEASURE or debug.malisx2.measure turns them on. */

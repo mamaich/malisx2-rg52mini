@@ -123,17 +123,22 @@ MALI_PER_ARCH(cmd_render_begin)(struct mali_cmd_buffer *cmd, const struct mali_r
 /* ---------------------------------------------------------------------- */
 /* Tiler side                                                              */
 
-/* The tiler's hierarchy levels: the blob's fixed 0xaa (levels 1, 3, 5, 7)
- * when the tiler can keep four levels active, which covers framebuffers
- * up to 2048 pixels; otherwise Mesa's spread for fewer levels
- * (pan_select_tiler_hierarchy_mask). To be checked against the G57's
- * TILER_FEATURES on the device. */
+/* The tiler's hierarchy levels: the blob's 0xaa (levels 1, 3, 5 and 7:
+ * bins of 32, 128, 512 and 2048 pixels) when the tiler keeps four levels
+ * active, and the lowest of those levels when it keeps fewer. Arm's driver
+ * uses 0x0a on the G52's two-level tiler; Mesa's spread for two levels
+ * (pan_select_tiler_hierarchy_mask, 0x82: 32 and 2048 pixels) costs the
+ * tiler 16 % more time there and the GPU 1-2 % on ARMSX2 (docs/changes.md).
+ * MALISX2_JM_HIER_MASK sets a mask outright. */
 static uint32_t
 hierarchy_mask(struct mali_device *dev)
 {
-   static const uint32_t fewer[4] = {MALI_TILER_HIERARCHY_MASK, 0x80, 0x82, 0xa2};
+   if (dev->jm_hierarchy_mask)
+      return dev->jm_hierarchy_mask;
    const unsigned levels = mali_device_physical(dev)->props.tiler_max_active_levels;
-   return levels < 4 ? fewer[levels] : MALI_TILER_HIERARCHY_MASK;
+   if (levels == 0 || levels >= 4)
+      return MALI_TILER_HIERARCHY_MASK;
+   return MALI_TILER_HIERARCHY_MASK & BITFIELD_MASK(2 * levels);
 }
 
 /*
