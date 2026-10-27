@@ -267,6 +267,10 @@ struct mali_device {
    /* Same object as csf or jm above, untyped: lets frontend-neutral code
     * hold a device pointer without the frontend's type. */
    void *fe;
+   /* v7: sampled images get AFBC too, not only colour attachments
+    * (mali_image.c v7_can_use_afbc); set by the job manager's device init,
+    * MALISX2_V7_AFBC_TEX=0 turns it off. */
+   bool v7_afbc_textures;
 
    /* Timing and command-stream capture (src/measurement/); NULL unless
     * MALISX2_MEASURE or debug.malisx2.measure turns them on. */

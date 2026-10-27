@@ -69,8 +69,8 @@ external_memory(const VkImageCreateInfo *info)
  * v9 and v11. On a G57 at 2x upscaling, uncompressed render targets made
  * fragment-bound dumps 20-25 % slower than with AFBC.
  *
- * v7 has narrower rules of its own, colour attachments only
- * (v7_can_use_afbc).
+ * v7 has narrower rules of its own: colour attachments and sampled
+ * images (v7_can_use_afbc).
  */
 static bool
 afbc_mode_on_arch(enum mali_afbc_mode mode, unsigned arch)
@@ -139,20 +139,28 @@ v7_afbc_format(enum pipe_format f)
 
 /*
  * AFBC on v7 (panvk_image_can_use_mod and pan_mod_afbc_test_props at
- * PAN_ARCH 7, narrowed): a single-plane 2D colour attachment in a format
- * of v7_afbc_format, optimal tiling, single-sampled, one level and one
- * layer, at least half a header tile each way. Not for images whose bytes
- * are read or written uncompressed (storage, host transfer, external
- * memory, swapchain and Android native buffers), nor for mutable,
- * block-compatible or aliased ones (v7 cannot read an AFBC plane in
- * another format), nor for disjoint or sparse ones.
+ * PAN_ARCH 7, narrowed): a single-plane 2D colour attachment or sampled
+ * image in a format of v7_afbc_format, optimal tiling, single-sampled, one
+ * level and one layer, at least half a header tile each way. Not for
+ * images whose bytes are read or written uncompressed (storage, host
+ * transfer, external memory, swapchain and Android native buffers), nor
+ * for mutable, block-compatible or aliased ones (v7 cannot read an AFBC
+ * plane in another format), nor for disjoint or sparse ones.
+ *
+ * Sampled images that are no colour attachment (an emulator's textures)
+ * are uploaded through the tile buffer like a render target
+ * (mali_cmd_image.c). On God of War (ARMSX2) that cut the texture unit's
+ * reads from memory by 8-10 % and gave 2-3 % more frames; textures is
+ * false under MALISX2_V7_AFBC_TEX=0 (colour attachments only).
  */
 static bool
 v7_can_use_afbc(const struct mali_image *image, const enum pipe_format *formats,
-                const VkImageCreateInfo *info)
+                const VkImageCreateInfo *info, bool textures)
 {
    const VkImageUsageFlags usage = image->vk.usage | image->vk.stencil_usage;
-   if (!(usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) ||
+   const VkImageUsageFlags rt_or_tex =
+      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | (textures ? VK_IMAGE_USAGE_SAMPLED_BIT : 0);
+   if (!(usage & rt_or_tex) ||
        (usage & (VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
                  VK_IMAGE_USAGE_HOST_TRANSFER_BIT)))
       return false;
@@ -181,7 +189,8 @@ v7_can_use_afbc(const struct mali_image *image, const enum pipe_format *formats,
  *
  * - DRM_FORMAT_MOD_LINEAR for DRM format modifier tiling, the only
  *   modifier offered (mali_formats.c; checked in mali_CreateImage);
- * - AFBC when can_use_afbc says so (v7_can_use_afbc on v7);
+ * - AFBC when can_use_afbc says so (v7_can_use_afbc on v7, sampled images
+ *   too when v7_textures);
  * - linear when the application asks for linear tiling, for 1D images,
  *   and when the base level is a single texel wide or high (tiling cannot
  *   help then);
@@ -192,14 +201,15 @@ v7_can_use_afbc(const struct mali_image *image, const enum pipe_format *formats,
  */
 static uint64_t
 choose_modifier(const struct mali_image *image, const enum pipe_format *formats, unsigned arch,
-                const VkImageCreateInfo *info)
+                const VkImageCreateInfo *info, bool v7_textures)
 {
    /* A scanout buffer (a VK_KHR_display swapchain image): the kernel and
     * the GPU have to agree on the layout, and only linear (or a DRM
     * modifier the display's plane lists) qualifies. */
    if (image->wsi_scanout || image->vk.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT)
       return DRM_FORMAT_MOD_LINEAR;
-   if (arch == 7 ? v7_can_use_afbc(image, formats, info) : can_use_afbc(image, formats, arch))
+   if (arch == 7 ? v7_can_use_afbc(image, formats, info, v7_textures)
+                 : can_use_afbc(image, formats, arch))
       return mali_afbc_can_ytr(formats[0]) ? MALI_MOD_AFBC_YTR : MALI_MOD_AFBC;
    if (image->vk.tiling == VK_IMAGE_TILING_LINEAR ||
        image->vk.image_type == VK_IMAGE_TYPE_1D ||
@@ -310,7 +320,8 @@ mali_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
       goto fail;
    }
    const unsigned arch = mali_device_physical(dev)->arch;
-   image->vk.drm_format_mod = choose_modifier(image, formats, arch, pCreateInfo);
+   image->vk.drm_format_mod =
+      choose_modifier(image, formats, arch, pCreateInfo, dev->v7_afbc_textures);
    /* No CRC on v7 and v9 yet: the job manager cannot update the seed from the
     * GPU, and the CPU-side seed it needs is not written yet. */
    const bool crc = !mali_arch_is_jm(arch) &&

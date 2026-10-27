@@ -18,9 +18,10 @@
  *    samples the source inside the destination rectangle and reloads the
  *    destination outside it; one fragment job, no tiler work.
  *
- * AFBC images (render targets and depth buffers) have no raw addressing,
- * so copies that touch one go another way, as panvk's
- * (copy_to_image_use_gfx_pipeline, panvk_meta_copy_get_image_properties):
+ * AFBC images (render targets, depth buffers, on v7 also sampled images)
+ * have no raw addressing, so copies that touch one go another way, as
+ * panvk's (copy_to_image_use_gfx_pipeline,
+ * panvk_meta_copy_get_image_properties):
  *
  *  - into an AFBC plane: a render pass on it whose frame shader writes the
  *    source blocks as a uint format of the block size (the tile buffer

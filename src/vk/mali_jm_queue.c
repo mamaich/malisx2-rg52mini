@@ -1323,6 +1323,8 @@ MALI_PER_ARCH(device_init)(struct mali_device *dev)
    jd->desc_cpu_copy =
       !knob_uint("MALISX2_V7_GPU_DESC_COPY", "debug.malisx2.v7_gpu_desc_copy", 0, 1, 0);
    jd->fpk_under_roa = knob_uint("MALISX2_V7_FPK_ROA", "debug.malisx2.v7_fpk_roa", 0, 1, 1);
+   dev->v7_afbc_textures =
+      knob_uint("MALISX2_V7_AFBC_TEX", "debug.malisx2.v7_afbc_tex", 0, 1, 1);
    mali_jm_heap_init(jd);
    jd->stats_interval_ns = stats_interval();
 
