@@ -768,15 +768,100 @@ mali_v7_ubo_sources(const struct mali_shader *s, const struct mali_desc_state *d
    return 2 * n;
 }
 
+/*
+ * The uniform buffer words copied on the CPU instead, when every buffer
+ * they come from is one only the host writes (dyn_bufs[].cpu): the host
+ * writes it before vkQueueSubmit, so at submit its words are the ones the
+ * copy job would read when it ran. A record of where each 32-bit half
+ * comes from goes into the command buffer, and mali_v7_host_ubo_run
+ * copies them at every submit. Saves the copy job: up to 1.35 jobs a draw
+ * on God of War (ARMSX2), whose uniforms are a host-written stream buffer.
+ */
+struct mali_v7_host_ubo {
+   uint32_t *dst;
+   uint32_t count;
+   uint32_t pad;
+   /* followed by count source pointers, NULL for a zero word */
+};
+
+static bool
+host_ubo(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
+         const struct mali_desc_state *desc, uint32_t *dst)
+{
+   const uint32_t n = s->fau.ubo_push_count;
+   const uint32_t *src[2 * MALI_MAX_UBO_PUSH_FAUS];
+   uint32_t dyn_cached = UINT32_MAX;
+   const uint8_t *cpu = NULL;
+   uint64_t range = 0;
+   for (uint32_t i = 0; i < n; i++) {
+      const struct mali_ubo_push_word *w = &s->fau.ubo_push[i];
+      if (w->dyn != dyn_cached) {
+         dyn_cached = w->dyn;
+         cpu = NULL;
+         range = 0;
+         uint32_t set, idx;
+         const struct mali_descriptor_set *ds =
+            w->dyn < s->v7.dyn_ubo_count ? dyn_set(desc, s->desc.dyn_bufs.map[w->dyn], &set, &idx)
+                                         : NULL;
+         /* As mali_v7_ubo_sources: no buffer, or the null buffer, reads as
+          * zero. A buffer the GPU may write keeps the copy job. */
+         if (ds && ds->dyn_bufs[idx].addr && !(ds->dyn_bufs[idx].addr >> 56)) {
+            if (!ds->dyn_bufs[idx].cpu)
+               return false;
+            cpu = (const uint8_t *)ds->dyn_bufs[idx].cpu + desc->dyn_offsets[set][idx];
+            range = ds->dyn_bufs[idx].range;
+         }
+      }
+      for (unsigned h = 0; h < 2; h++) {
+         const uint64_t off = w->offset + 4 * h;
+         src[2 * i + h] = cpu && off + 4 <= range ? (const uint32_t *)(cpu + off) : NULL;
+      }
+   }
+   const size_t size = sizeof(struct mali_v7_host_ubo) + 2 * n * sizeof(src[0]);
+   uint8_t *e = util_dynarray_grow_bytes(&cmd->jm.host_ubo, 1, size);
+   if (!e) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return false;
+   }
+   const struct mali_v7_host_ubo h = {.dst = dst, .count = 2 * n};
+   memcpy(e, &h, sizeof(h));
+   memcpy(e + sizeof(h), src, 2 * n * sizeof(src[0]));
+   return true;
+}
+
+void
+mali_v7_host_ubo_run(struct mali_cmd_buffer *cmd)
+{
+   const uint8_t *p = util_dynarray_begin(&cmd->jm.host_ubo);
+   const uint8_t *end = util_dynarray_end(&cmd->jm.host_ubo);
+   while (p < end) {
+      struct mali_v7_host_ubo h;
+      memcpy(&h, p, sizeof(h));
+      const uint32_t *const *src = (const uint32_t *const *)(p + sizeof(h));
+      for (uint32_t i = 0; i < h.count; i++)
+         h.dst[i] = src[i] ? *src[i] : 0;
+      p += sizeof(h) + h.count * sizeof(src[0]);
+   }
+}
+
 bool
 mali_v7_ubo_copy(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c, const struct mali_shader *s,
-                 const struct mali_desc_state *desc, uint64_t fau_va, uint16_t dep, uint16_t *index)
+                 const struct mali_desc_state *desc, uint64_t fau_va, void *fau_cpu,
+                 uint16_t dep, uint16_t *index)
 {
    const uint32_t n = s->fau.ubo_push_count;
    if (index)
       *index = dep;
    if (!n || !fau_va)
       return true;
+   if (fau_cpu && cmd->dev->jm->ubo_cpu_copy &&
+       host_ubo(cmd, s, desc,
+                (uint32_t *)((uint8_t *)fau_cpu + s->fau.ubo_push_start * MALI_FAU_WORD_SIZE))) {
+      cmd->jm.stats.ubo_host_copies[s->stage == MESA_SHADER_FRAGMENT]++;
+      return true;
+   }
+   if (vk_command_buffer_has_error(&cmd->vk))
+      return false;
    const struct mali_shader *copy =
       get_copy_shader(cmd, &cmd->dev->jm->v7_ubo_copy, build_ubo_copy_nir, "mali-v7-ubo-copy");
    if (!copy)

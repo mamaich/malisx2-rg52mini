@@ -295,6 +295,22 @@ write_buffer(const struct mali_descriptor_set *set, const VkDescriptorBufferInfo
    write_slot(set, binding, elem, MALI_SUBDESC_NONE, &desc);
 }
 
+/* The CPU address of offset in a buffer that only the host writes, for
+ * struct mali_descriptor_set::dyn_bufs; NULL for one the GPU may write or
+ * the CPU cannot read (not host visible, or an import, whose CPU view is
+ * not at its GPU address). */
+static const void *
+host_written_buffer_cpu(const struct mali_buffer *buffer, uint64_t offset)
+{
+   const struct mali_device_memory *mem = buffer->mem;
+   if (!mem || !(mem->props & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) || !mem->bo.cpu ||
+       (mem->bo.attrs & MALI_KBASE_BO_IMPORTED) ||
+       (buffer->vk.usage & (VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                            VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT)))
+      return NULL;
+   return (const uint8_t *)mem->bo.cpu + buffer->mem_offset + offset;
+}
+
 static void
 write_dynamic_buffer(struct mali_descriptor_set *set, const VkDescriptorBufferInfo *info,
                      uint32_t binding, uint32_t elem)
@@ -306,9 +322,12 @@ write_dynamic_buffer(struct mali_descriptor_set *set, const VkDescriptorBufferIn
    if (buffer) {
       set->dyn_bufs[idx].addr = mali_buffer_gpu_va(buffer, info->offset);
       set->dyn_bufs[idx].range = vk_buffer_range(&buffer->vk, info->offset, info->range);
+      set->dyn_bufs[idx].cpu =
+         set->dyn_bufs[idx].addr ? host_written_buffer_cpu(buffer, info->offset) : NULL;
    } else {
       set->dyn_bufs[idx].addr = MALI_NULL_BUFFER_ADDR;
       set->dyn_bufs[idx].range = 0;
+      set->dyn_bufs[idx].cpu = NULL;
    }
 }
 

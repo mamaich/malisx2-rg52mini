@@ -891,6 +891,7 @@ fau_build(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
 {
    const uint32_t total = s ? s->fau.total_count : 0;
    rec->total = 0;
+   rec->cpu = NULL;
    *out = 0;
    if (!total)
       return true;
@@ -902,6 +903,7 @@ fau_build(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
    memcpy(p.cpu, rec->words, total * sizeof(rec->words[0]));
    rec->ubo_src_count = mali_v7_ubo_sources(s, &cmd->gfx.desc, rec->ubo_src);
    rec->total = total;
+   rec->cpu = p.cpu;
    *out = p.gpu | ((uint64_t)total << 56);
    return true;
 }
@@ -1383,7 +1385,8 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
     * from its FAU block: a copy job between the descriptor copy and it. */
    uint16_t vs_dep = vs_copy;
    if (dd.vs_ubo_copy &&
-       !mali_v7_ubo_copy(cmd, c, p->vs, &cmd->gfx.desc, t->vs_fau, vs_copy, &vs_dep))
+       !mali_v7_ubo_copy(cmd, c, p->vs, &cmd->gfx.desc, t->vs_fau, t->vs_fau_rec.cpu, vs_copy,
+                         &vs_dep))
       goto fail;
    if (dd.fs_copy && !mali_v7_desc_copy(cmd, c, p->fs, &t->fs_tab, 0, &fs_copy))
       goto fail;
@@ -1393,7 +1396,8 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
     * stays owed, and with it kept for later draws (fau_follows_tables), the
     * next one that tiles must not find it empty. */
    if (tiling && t->fs_ubo_owed) {
-      if (!mali_v7_ubo_copy(cmd, c, p->fs, &cmd->gfx.desc, t->fs_fau, 0, &fs_ubo))
+      if (!mali_v7_ubo_copy(cmd, c, p->fs, &cmd->gfx.desc, t->fs_fau, t->fs_fau_rec.cpu, 0,
+                            &fs_ubo))
          goto fail;
       t->fs_ubo_owed = false;
    }

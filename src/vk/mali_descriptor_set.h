@@ -81,6 +81,11 @@ struct mali_descriptor_set {
    struct {
       uint64_t addr;
       uint64_t range;
+      /* addr on the CPU, when the buffer's memory is host visible and the
+       * GPU cannot write the buffer (no transfer destination or storage
+       * usage); NULL otherwise. v7 then copies the uniform buffer words a
+       * shader reads from FAU on the CPU at submit (mali_v7_ubo_copy). */
+      const void *cpu;
    } dyn_bufs[MALI_MAX_DYNAMIC_BUFFERS];
 };
 

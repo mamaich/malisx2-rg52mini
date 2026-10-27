@@ -920,6 +920,7 @@ cmd_clear(struct mali_cmd_buffer *cmd)
    cmd->jm.tiler_defer = false;
    cmd->jm.copy_tsd = 0;
    util_dynarray_clear(&cmd->jm.buf_writes);
+   util_dynarray_clear(&cmd->jm.host_ubo);
 #endif
    cmd->jm.req = cmd->jm.end_req = 0;
    cmd->jm.resubmit = false;
@@ -966,6 +967,7 @@ cmd_create(struct vk_command_pool *pool, VkCommandBufferLevel level,
    util_dynarray_init(&cmd->jm.reset_data, NULL);
 #if PAN_ARCH < 9
    util_dynarray_init(&cmd->jm.buf_writes, NULL);
+   util_dynarray_init(&cmd->jm.host_ubo, NULL);
 #endif
    list_inithead(&cmd->slabs);
    mali_jm_draw_tmpl_init(&cmd->jm.draw);
@@ -997,6 +999,7 @@ cmd_destroy(struct vk_command_buffer *vk_cmd)
    util_dynarray_fini(&cmd->jm.reset_data);
 #if PAN_ARCH < 9
    util_dynarray_fini(&cmd->jm.buf_writes);
+   util_dynarray_fini(&cmd->jm.host_ubo);
 #endif
    mali_push_shadows_fini(&cmd->push_shadow, &cmd->vk.pool->alloc);
    vk_command_buffer_finish(&cmd->vk);

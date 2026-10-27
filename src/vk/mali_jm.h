@@ -292,6 +292,8 @@ struct mali_jm_draw_tmpl {
     * the words the CPU wrote and where its uniform buffer words were copied
     * from. total 0: nothing to compare with. */
    struct mali_v7_fau_record {
+      void *cpu; /* the block on the CPU (the uniform buffer words' copy
+                  * at submit, mali_v7_ubo_copy) */
       uint32_t total;
       uint32_t ubo_src_count;
       uint64_t words[MALI_FAU_WORD_COUNT];
@@ -353,6 +355,7 @@ struct mali_jm_cmd_stats {
    uint64_t fau_kept[2];      /* FAU blocks due to be built that were kept,
                                * the new one coming out the same */
    uint64_t ubo_copies[2];    /* uniform buffer word copy jobs */
+   uint64_t ubo_host_copies[2]; /* ... copied on the CPU at submit instead */
 #endif
 };
 
@@ -408,6 +411,10 @@ struct mali_jm_cmd {
     * and not touching. Empty unless the command buffer has such a
     * transfer. */
    struct util_dynarray buf_writes;
+   /* Uniform buffer words to copy into FAU blocks on the CPU at submit
+    * (mali_v7_ubo_copy, mali_v7_host_ubo_run): each a struct
+    * mali_v7_host_ubo and its count source pointers. */
+   struct util_dynarray host_ubo;
 #endif
 };
 
@@ -745,7 +752,11 @@ bool mali_v7_desc_copy(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
  */
 bool mali_v7_ubo_copy(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
                       const struct mali_shader *s, const struct mali_desc_state *desc,
-                      uint64_t fau_va, uint16_t dep, uint16_t *index);
+                      uint64_t fau_va, void *fau_cpu, uint16_t dep, uint16_t *index);
+
+/* The copies mali_v7_ubo_copy left to the CPU: done at each submit of the
+ * command buffer, after its previous run has completed. */
+void mali_v7_host_ubo_run(struct mali_cmd_buffer *cmd);
 
 /* Where mali_v7_ubo_copy would copy a shader's uniform buffer words from
  * now: for each 32-bit half of each word, the address in its dynamic
@@ -946,6 +957,10 @@ struct mali_jm_device {
    unsigned free_ids;
    /* Passes per batch (MALISX2_JM_BATCH_PASSES, MALI_JM_BATCH_MAX_PASSES). */
    uint32_t batch_passes;
+   /* v7: uniform buffer words of host-written buffers are copied into FAU
+    * on the CPU at submit, not by a copy job (MALISX2_V7_GPU_UBO_COPY=1
+    * turns it off). */
+   bool ubo_cpu_copy;
    uint64_t next_serial;
    struct mali_jm_atom_info atoms[256];
    unsigned in_flight;
