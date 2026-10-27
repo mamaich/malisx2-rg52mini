@@ -972,6 +972,10 @@ struct mali_jm_device {
     * CPU while the draw records, not by a copy job
     * (MALISX2_V7_GPU_DESC_COPY=1 turns it off). */
    bool desc_cpu_copy;
+   /* v7: a draw under rasterization order colour access that reads no
+    * colour attachment may still kill earlier fragments (pack_rsd_state;
+    * MALISX2_V7_FPK_ROA=0 turns it off). */
+   bool fpk_under_roa;
    uint64_t next_serial;
    struct mali_jm_atom_info atoms[256];
    unsigned in_flight;

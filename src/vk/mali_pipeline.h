@@ -237,6 +237,7 @@ struct mali_gfx_pack_input {
    const struct mali_shader *vs;
    const struct mali_shader *fs;       /* may be NULL */
    uint32_t view_mask;                 /* multiview, 0 without */
+   bool fpk_under_roa;                 /* mali_jm_device::fpk_under_roa */
 };
 
 MALI_PER_ARCH_DECL(void, gfx_pack_state,

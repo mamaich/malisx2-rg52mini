@@ -819,6 +819,9 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
       .vs = p->vs,
       .fs = p->fs,
       .view_mask = view_mask,
+#if PAN_ARCH < 9
+      .fpk_under_roa = dev->jm->fpk_under_roa,
+#endif
    };
    MALI_PER_ARCH(gfx_pack_state)(&pack, &p->baked);
    MALI_PER_ARCH(blend_shaders_prepare)(dev, p);

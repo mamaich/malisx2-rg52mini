@@ -990,7 +990,18 @@ pack_rsd_state(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
                               attachment_read(fs, dyn->ial.stencil_att) ||
                               (dyn->rasterization_order_access &
                                (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT));
-         const bool roa_color = dyn->rasterization_order_access & VK_IMAGE_ASPECT_COLOR_BIT;
+         /* Rasterization order colour access orders a draw's reads of the
+          * colour attachments after the earlier fragments' writes. A draw
+          * that reads none of them (no input attachment, no blending with
+          * the destination, no output read: can_fpk) and writes all of
+          * them only replaces what the earlier fragments would leave, so
+          * killing those changes nothing, as FPK kills blended fragments
+          * in any pass; fragments with side effects are not killable.
+          * ARMSX2 puts the flag on every pipeline of a feedback pass,
+          * readers or not. panvk turns FPK off for the whole flag
+          * (MALISX2_V7_FPK_ROA=0 does so here). */
+         const bool roa_color = (dyn->rasterization_order_access & VK_IMAGE_ASPECT_COLOR_BIT) &&
+                                !in->fpk_under_roa;
 
          cfg.properties.allow_forward_pixel_to_kill =
             fs->info.fs.can_fpk && !(rt_mask & ~out->rt_written) &&
