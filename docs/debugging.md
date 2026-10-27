@@ -10,13 +10,14 @@
 | `MALISX2_JM_HEAP_SLOTS=<1–32>` | слотов кучи тайлера (по умолчанию 4) |
 | `MALISX2_V7_GPU_UBO_COPY=1` | v7: uniform-слова в FAU копирует задание, а не CPU |
 | `MALISX2_V7_GPU_DESC_COPY=1` | v7: таблицы дескрипторов без images заполняет задание, а не CPU |
+| `MALISX2_V7_FPK_ROA=0` | v7: forward pixel kill выключен у всех конвейеров с порядком растеризации для цвета, как в panvk |
 | `BIFROST_MESA_DEBUG=shaderdb` | статистика каждого шейдера v7 (инструкции, кортежи, клаузы, регистры) в stderr; `shaders` — ещё NIR и дизассемблер. Чтобы шейдеры действительно компилировались, нужны `VK_ENABLE_PIPELINE_CACHE=false MESA_SHADER_CACHE_DISABLE=true` |
 | `MESA_DEBUG=1`, `MESA_LOG_LEVEL=debug` | отладочный вывод Mesa |
 
 На Android вместо переменных — свойства `debug.malisx2.measure`,
 `debug.malisx2.stats`, `debug.malisx2.jm_batch_passes`,
 `debug.malisx2.jm_heap_slots`, `debug.malisx2.v7_gpu_ubo_copy`,
-`debug.malisx2.v7_gpu_desc_copy`.
+`debug.malisx2.v7_gpu_desc_copy`, `debug.malisx2.v7_fpk_roa`.
 
 Чтобы понять, **почему** таблицы и FAU пересобираются, вне репозитория
 хранится временная отладка `debug-v7-why.patch` (накладывается поверх
