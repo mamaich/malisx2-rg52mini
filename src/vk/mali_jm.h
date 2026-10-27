@@ -420,7 +420,7 @@ struct mali_jm_cmd {
    struct util_dynarray buf_writes;
    /* Uniform buffer words to copy into FAU blocks on the CPU at submit
     * (mali_v7_ubo_copy, mali_v7_host_ubo_run): each a struct
-    * mali_v7_host_ubo and its count source pointers. */
+    * mali_v7_host_ubo and its count runs of words. */
    struct util_dynarray host_ubo;
 #endif
 };

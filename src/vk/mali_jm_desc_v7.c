@@ -778,16 +778,31 @@ mali_v7_ubo_sources(const struct mali_shader *s, const struct mali_desc_state *d
  * The uniform buffer words copied on the CPU instead, when every buffer
  * they come from is one only the host writes (dyn_bufs[].cpu): the host
  * writes it before vkQueueSubmit, so at submit its words are the ones the
- * copy job would read when it ran. A record of where each 32-bit half
- * comes from goes into the command buffer, and mali_v7_host_ubo_run
- * copies them at every submit. Saves the copy job: up to 1.35 jobs a draw
- * on God of War (ARMSX2), whose uniforms are a host-written stream buffer.
+ * copy job would read when it ran. A record of the runs of consecutive
+ * source words (and of zero words) goes into the command buffer, and
+ * mali_v7_host_ubo_run copies each run with one memcpy at every submit.
+ * Saves the copy job: up to 1.35 jobs a draw on God of War (ARMSX2), whose
+ * uniforms are a host-written stream buffer.
+ *
+ * Such buffers are mostly CPU-uncached (memory type 0), where every load is
+ * a memory transaction of its own. Loaded a word at a time, this copy was
+ * 2.4 % of ARMSX2's GS thread on Jak and Daxter (17 000 draws a second);
+ * memcpy reads a run 16 bytes at a time, and it falls under 1 %.
  */
 struct mali_v7_host_ubo {
    uint32_t *dst;
    uint32_t count;
    uint32_t pad;
-   /* followed by count source pointers, NULL for a zero word */
+   /* followed by count struct mali_v7_host_ubo_span */
+};
+
+/* count 32-bit words to dst[first...] from src, or zeros where src is
+ * NULL. */
+struct mali_v7_host_ubo_span {
+   const uint32_t *src;
+   uint16_t first;
+   uint16_t count;
+   uint32_t pad;
 };
 
 static bool
@@ -823,15 +838,25 @@ host_ubo(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
          src[2 * i + h] = cpu && off + 4 <= range ? (const uint32_t *)(cpu + off) : NULL;
       }
    }
-   const size_t size = sizeof(struct mali_v7_host_ubo) + 2 * n * sizeof(src[0]);
+   struct mali_v7_host_ubo_span spans[2 * MALI_MAX_UBO_PUSH_FAUS];
+   uint32_t count = 0;
+   for (uint32_t i = 0; i < 2 * n; i++) {
+      struct mali_v7_host_ubo_span *last = count ? &spans[count - 1] : NULL;
+      if (last && (src[i] ? last->src && src[i] == last->src + last->count : !last->src)) {
+         last->count++;
+         continue;
+      }
+      spans[count++] = (struct mali_v7_host_ubo_span){.src = src[i], .first = i, .count = 1};
+   }
+   const size_t size = sizeof(struct mali_v7_host_ubo) + count * sizeof(spans[0]);
    uint8_t *e = util_dynarray_grow_bytes(&cmd->jm.host_ubo, 1, size);
    if (!e) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
       return false;
    }
-   const struct mali_v7_host_ubo h = {.dst = dst, .count = 2 * n};
+   const struct mali_v7_host_ubo h = {.dst = dst, .count = count};
    memcpy(e, &h, sizeof(h));
-   memcpy(e + sizeof(h), src, 2 * n * sizeof(src[0]));
+   memcpy(e + sizeof(h), spans, count * sizeof(spans[0]));
    return true;
 }
 
@@ -843,10 +868,15 @@ mali_v7_host_ubo_run(struct mali_cmd_buffer *cmd)
    while (p < end) {
       struct mali_v7_host_ubo h;
       memcpy(&h, p, sizeof(h));
-      const uint32_t *const *src = (const uint32_t *const *)(p + sizeof(h));
-      for (uint32_t i = 0; i < h.count; i++)
-         h.dst[i] = src[i] ? *src[i] : 0;
-      p += sizeof(h) + h.count * sizeof(src[0]);
+      const struct mali_v7_host_ubo_span *sp =
+         (const struct mali_v7_host_ubo_span *)(p + sizeof(h));
+      for (uint32_t i = 0; i < h.count; i++) {
+         if (sp[i].src)
+            memcpy(h.dst + sp[i].first, sp[i].src, sp[i].count * sizeof(uint32_t));
+         else
+            memset(h.dst + sp[i].first, 0, sp[i].count * sizeof(uint32_t));
+      }
+      p += sizeof(h) + h.count * sizeof(sp[0]);
    }
 }
 
