@@ -241,6 +241,7 @@ struct mali_device {
       uint64_t kernel_events;       /* EVENT notifications read */
       uint64_t group_errors;
       uint64_t waits;               /* host waits that had to sleep */
+      uint64_t wait_ns;             /* ... and how long, from their first sleep */
       uint64_t wakeups;             /* condition wake-ups while waiting */
       uint64_t submits;
    } stats;

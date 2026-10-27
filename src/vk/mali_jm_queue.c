@@ -1094,6 +1094,8 @@ stats_log(const char *what, const struct mali_jm_draw_totals *to,
              (unsigned long long)D(atoms), (unsigned long long)D(job_submits),
              (unsigned long long)D(partial_flushes), (unsigned long long)D(number_waits),
              D(vtc_jobs) * per, D(frag_jobs) * per, D(cmd.push_constants) * per);
+   mesa_logi("malisx2 stats, %s, host waits for the GPU: %llu that slept, %.0f ms of every second",
+             what, (unsigned long long)D(host_waits), sec > 0 ? D(host_wait_ns) / 1e6 / sec : 0.0);
    const uint64_t passes = D(passes);
    const double pp = passes ? 1.0 / (double)passes : 0.0;
    mesa_logi("malisx2 stats, %s, per pass: %.2f draws; %.2f clear, %.2f every tile, %.2f whole "
@@ -1144,6 +1146,8 @@ stats_note(struct mali_device *dev, struct vk_queue_submit *submit)
    t->job_submits = jd->stats.job_submits;
    t->number_waits = jd->stats.number_waits;
    t->partial_flushes = jd->stats.partial_flushes;
+   t->host_waits = dev->stats.waits;
+   t->host_wait_ns = dev->stats.wait_ns;
 
    const int64_t now = os_time_get_nano();
    if (!jd->stats_since_ns) {

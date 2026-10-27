@@ -248,6 +248,7 @@ sync_wait_many(struct vk_device *vkdev, uint32_t count,
    const int64_t slice = has_notifier ? WAIT_SLICE_EVENTS_NS : WAIT_SLICE_NO_EVENTS_NS;
    VkResult result;
    bool slept = false;
+   int64_t slept_at = 0;
    const int64_t start = os_time_get_nano();
    bool warned = false;
    uint32_t report = 0;
@@ -303,6 +304,7 @@ sync_wait_many(struct vk_device *vkdev, uint32_t count,
       if (!slept) {
          dev->stats.waits++;
          slept = true;
+         slept_at = now;
       }
       if (nfds) {
          /* A sync file cannot wake the condition variable. With GPU work
@@ -322,6 +324,8 @@ sync_wait_many(struct vk_device *vkdev, uint32_t count,
       }
       dev->stats.wakeups++;
    }
+   if (slept)
+      dev->stats.wait_ns += os_time_get_nano() - slept_at;
    pthread_mutex_unlock(&dev->lock);
    if (report) {
       mesa_logw("malisx2: slow wait %u ended after %lld ms: %s", report,

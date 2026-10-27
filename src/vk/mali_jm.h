@@ -1032,6 +1032,7 @@ struct mali_jm_device {
       struct mali_jm_cmd_stats cmd;
       uint64_t submits, batches, passes, vtc_jobs, frag_jobs;
       uint64_t atoms, job_submits, number_waits, partial_flushes;
+      uint64_t host_waits, host_wait_ns; /* the device's stats.waits, wait_ns */
    } stats_total, stats_logged;
 };
 
