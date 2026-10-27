@@ -251,6 +251,11 @@ struct mali_v7_desc_tables {
    uint64_t dyn_ssbos;                        /* the dynamic storage buffer table */
    uint64_t sets[MALI_MAX_SETS];              /* the bound sets' memory, 0 when unbound */
    uint32_t set_desc_counts[MALI_MAX_SETS];   /* their slot counts */
+   /* The same on the CPU, for the copy done there (mali_v7_desc_copy):
+    * the tables, and the sets' slots (a push set's shadow). Valid while
+    * the draw that built the tables records. */
+   void *tables_cpu[MALI_V7_DESC_TABLE_COUNT];
+   const void *sets_cpu[MALI_MAX_SETS];
    /* The shader the tables were built for (their layout is its own). */
    const struct mali_shader *shader;
    /* The dynamic buffers they were built with, one per entry of the
@@ -356,6 +361,8 @@ struct mali_jm_cmd_stats {
                                * the new one coming out the same */
    uint64_t ubo_copies[2];    /* uniform buffer word copy jobs */
    uint64_t ubo_host_copies[2]; /* ... copied on the CPU at submit instead */
+   uint64_t desc_host_copies[2]; /* descriptor copies done on the CPU instead
+                                  * of by a job */
 #endif
 };
 
@@ -961,6 +968,10 @@ struct mali_jm_device {
     * on the CPU at submit, not by a copy job (MALISX2_V7_GPU_UBO_COPY=1
     * turns it off). */
    bool ubo_cpu_copy;
+   /* v7: a shader's descriptor tables without images are filled on the
+    * CPU while the draw records, not by a copy job
+    * (MALISX2_V7_GPU_DESC_COPY=1 turns it off). */
+   bool desc_cpu_copy;
    uint64_t next_serial;
    struct mali_jm_atom_info atoms[256];
    unsigned in_flight;

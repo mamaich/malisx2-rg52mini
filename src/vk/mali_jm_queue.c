@@ -1109,10 +1109,12 @@ stats_log(const char *what, const struct mali_jm_draw_totals *to,
    static const char *const stage[2] = {"VS", "FS"};
    for (unsigned i = 0; i < 2; i++) {
       mesa_logi("malisx2 stats, %s, %s per draw: tables %.2f new + %.2f refreshed, %.2f "
-                "descriptor copy jobs; FAU %.2f (%.2f only for tables or dynamic buffers), "
+                "descriptor copy jobs (%.2f copies on the CPU); FAU %.2f (%.2f only for tables "
+                "or dynamic buffers), "
                 "%.2f uniform buffer copy jobs (%.2f copies on the CPU); FAU kept %.2f",
                 what, stage[i], D(cmd.tables[i]) * per, D(cmd.refreshed[i]) * per,
-                D(cmd.desc_copies[i]) * per, D(cmd.fau[i]) * per,
+                D(cmd.desc_copies[i]) * per, D(cmd.desc_host_copies[i]) * per,
+                D(cmd.fau[i]) * per,
                 D(cmd.fau_by_tables[i]) * per, D(cmd.ubo_copies[i]) * per,
                 D(cmd.ubo_host_copies[i]) * per, D(cmd.fau_kept[i]) * per);
    }
@@ -1318,6 +1320,8 @@ MALI_PER_ARCH(device_init)(struct mali_device *dev)
                               MALI_JM_HEAP_SLOTS_MAX, MALI_JM_HEAP_SLOTS);
    jd->ubo_cpu_copy =
       !knob_uint("MALISX2_V7_GPU_UBO_COPY", "debug.malisx2.v7_gpu_ubo_copy", 0, 1, 0);
+   jd->desc_cpu_copy =
+      !knob_uint("MALISX2_V7_GPU_DESC_COPY", "debug.malisx2.v7_gpu_desc_copy", 0, 1, 0);
    mali_jm_heap_init(jd);
    jd->stats_interval_ns = stats_interval();
 

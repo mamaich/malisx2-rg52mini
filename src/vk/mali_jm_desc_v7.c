@@ -229,6 +229,7 @@ mali_v7_desc_refresh(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
    const uint32_t dyn_ubo_count = v7->dyn_ubo_count;
    const uint32_t dyn_ssbo_count = s->desc.dyn_bufs.count - dyn_ubo_count;
    uint64_t ubo = t->tables[MALI_V7_DESC_TABLE_UBO];
+   void *ubo_cpu = t->tables_cpu[MALI_V7_DESC_TABLE_UBO];
    if (dyn_ubo_count) {
       struct mali_ptr p =
          mali_cmd_alloc(cmd, (uint64_t)dyn_ubo_count * pan_size(UNIFORM_BUFFER), 64);
@@ -236,6 +237,7 @@ mali_v7_desc_refresh(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
          return false;
       pack_dyn_ubos(s, desc, p.cpu);
       ubo = p.gpu;
+      ubo_cpu = p.cpu;
    }
    uint64_t dyn_ssbos = t->dyn_ssbos;
    if (dyn_ssbo_count) {
@@ -244,6 +246,7 @@ mali_v7_desc_refresh(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
          return false;
    }
    t->tables[MALI_V7_DESC_TABLE_UBO] = ubo;
+   t->tables_cpu[MALI_V7_DESC_TABLE_UBO] = ubo_cpu;
    t->dyn_ssbos = dyn_ssbos;
    t->shader = s;
    save_dyn_bufs(s, desc, t);
@@ -271,6 +274,7 @@ mali_v7_desc_prepare(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
       const struct mali_descriptor_set *set = desc ? desc->sets[i] : NULL;
       out->sets[i] = set ? set->gpu : 0;
       out->set_desc_counts[i] = set ? set->layout->desc_count : 0;
+      out->sets_cpu[i] = set ? set->cpu : NULL;
    }
 
    for (unsigned t = 0; t < MALI_V7_DESC_TABLE_COUNT; t++) {
@@ -288,6 +292,7 @@ mali_v7_desc_prepare(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
       if (!p.cpu)
          return false;
       out->tables[t] = p.gpu;
+      out->tables_cpu[t] = p.cpu;
 
       /* The dynamic uniform buffers behind the regular ones. */
       if (t == MALI_V7_DESC_TABLE_UBO && dyn_ubo_count)
@@ -312,6 +317,7 @@ mali_v7_desc_prepare(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
          return false;
       MALI_PER_ARCH(pack_dummy_sampler)(p.cpu);
       out->tables[MALI_V7_DESC_TABLE_SAMPLER] = p.gpu;
+      out->tables_cpu[MALI_V7_DESC_TABLE_SAMPLER] = p.cpu;
    }
 
    /* The dynamic storage buffers. */
@@ -901,6 +907,43 @@ mali_v7_desc_finish(struct mali_device *dev)
 /* ---------------------------------------------------------------------- */
 /* Filling the copied entries                                              */
 
+/*
+ * The copy job's work done on the CPU while the draw records, for a shader
+ * without images (whose entries the job turns into Attribute descriptors):
+ * each map entry's slot, the whole Texture or Sampler descriptor or the
+ * Uniform Buffer one at its start, into its table; zero for a slot past
+ * its set's end. Without update-after-bind a bound set's slots stay as they
+ * are until the command buffer has run, and a push set's shadow holds what
+ * its block in command memory holds, so the slots read now are the ones the
+ * job would read. Saves the job: 0.78 a draw on God of War (ARMSX2), most
+ * of them for its pushed textures.
+ */
+static void
+host_desc_copy(const struct mali_shader *s, const struct mali_v7_desc_tables *t)
+{
+   uint32_t m = 0;
+   for (unsigned tab = 0; tab < MALI_V7_DESC_TABLE_COUNT; tab++) {
+      const uint32_t n = s->v7.count[tab];
+      if (!n)
+         continue;
+      const unsigned size = table_entry_size(tab);
+      uint8_t *dst = t->tables_cpu[tab];
+      for (uint32_t i = 0; i < n; i++, m++) {
+         const uint32_t h = s->v7.map[m];
+         const uint32_t set = MALI_COPY_DESC_HANDLE_SET(h);
+         const uint32_t idx = MALI_COPY_DESC_HANDLE_INDEX(h);
+         const uint8_t *src = set < MALI_MAX_SETS && idx < t->set_desc_counts[set] &&
+                                    t->sets_cpu[set]
+                                 ? (const uint8_t *)t->sets_cpu[set] + idx * MALI_DESCRIPTOR_SIZE
+                                 : NULL;
+         if (src)
+            memcpy(dst + i * size, src, size);
+         else
+            memset(dst + i * size, 0, size);
+      }
+   }
+}
+
 bool
 mali_v7_desc_copy(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
                   const struct mali_shader *s, const struct mali_v7_desc_tables *t,
@@ -910,6 +953,16 @@ mali_v7_desc_copy(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
    assert(t->shader == s);
    if (!s->v7.map_count)
       return true;
+   if (!s->v7.count[MALI_V7_DESC_TABLE_IMG] && cmd->dev->jm->desc_cpu_copy) {
+      bool ok = true;
+      for (unsigned tab = 0; tab < MALI_V7_DESC_TABLE_COUNT; tab++)
+         ok &= !s->v7.count[tab] || t->tables_cpu[tab];
+      if (ok) {
+         host_desc_copy(s, t);
+         cmd->jm.stats.desc_host_copies[s->stage == MESA_SHADER_FRAGMENT]++;
+         return true;
+      }
+   }
    /* The map is in GPU memory: shader_upload uploads it whatever the size
     * of the code, or fails the shader (mali_shader.c). */
    assert(s->v7.map_mem.gpu_va);
