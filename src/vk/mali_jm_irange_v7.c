@@ -90,30 +90,112 @@ store32(nir_builder *b, nir_def *addr, nir_def *v)
 
 #define DRAW_FIELD(name) offsetof(struct mali_v7_irange_draw, name)
 
-/* One loop over n indices of 1 << log2 bytes from addr, min and max into
- * the variables (restart indices left out when restart). */
+/* min and max of v into lo and hi, a restart index left out when restart. */
 static void
-scan_loop(nir_builder *b, nir_def *addr, nir_def *n, unsigned log2, nir_def *restart,
-          nir_variable *vmin, nir_variable *vmax)
+merge_index(nir_builder *b, nir_def *v, unsigned bits, bool restart, nir_def **lo, nir_def **hi)
+{
+   if (restart) {
+      const uint32_t restart_value = bits == 32 ? UINT32_MAX : (1u << bits) - 1;
+      nir_def *skip = nir_ieq_imm(b, v, restart_value);
+      *lo = nir_bcsel(b, skip, *lo, nir_umin(b, *lo, v));
+      *hi = nir_bcsel(b, skip, *hi, nir_umax(b, *hi, v));
+   } else {
+      *lo = nir_umin(b, *lo, v);
+      *hi = nir_umax(b, *hi, v);
+   }
+}
+
+/* min and max of indices [from, to) of 1 << log2 bytes from addr into the
+ * variables, one index a load. */
+static void
+scan_scalar(nir_builder *b, nir_def *addr, nir_def *from, nir_def *to, unsigned log2,
+            bool restart, nir_variable *vmin, nir_variable *vmax)
 {
    const unsigned bits = 8u << log2;
-   const uint32_t restart_value = bits == 32 ? UINT32_MAX : (1u << bits) - 1;
    nir_variable *i = nir_local_variable_create(b->impl, glsl_uint_type(), "i");
-   nir_store_var(b, i, nir_imm_int(b, 0), 1);
+   nir_store_var(b, i, from, 1);
    nir_push_loop(b);
    {
       nir_def *iv = nir_load_var(b, i);
-      nir_break_if(b, nir_uge(b, iv, n));
+      nir_break_if(b, nir_uge(b, iv, to));
       nir_def *a = nir_iadd(b, addr, nir_u2u64(b, nir_ishl_imm(b, iv, log2)));
-      nir_def *v = nir_load_global(b, 1, bits, a, .align_mul = 1u << log2);
-      v = nir_u2u32(b, v);
-      nir_def *skip = nir_iand(b, restart, nir_ieq_imm(b, v, restart_value));
+      nir_def *v = nir_u2u32(b, nir_load_global(b, 1, bits, a, .align_mul = 1u << log2));
       nir_def *lo = nir_load_var(b, vmin), *hi = nir_load_var(b, vmax);
-      nir_store_var(b, vmin, nir_bcsel(b, skip, lo, nir_umin(b, lo, v)), 1);
-      nir_store_var(b, vmax, nir_bcsel(b, skip, hi, nir_umax(b, hi, v)), 1);
+      merge_index(b, v, bits, restart, &lo, &hi);
+      nir_store_var(b, vmin, lo, 1);
+      nir_store_var(b, vmax, hi, 1);
       nir_store_var(b, i, nir_iadd_imm(b, iv, 1), 1);
    }
    nir_pop_loop(b, NULL);
+}
+
+/*
+ * min and max of n indices of 1 << log2 bytes from addr into the
+ * variables. 16- and 32-bit indices go 16 bytes a load (8 or 4 indices)
+ * from the first 16-byte aligned one, with the indices before it and the
+ * ones after the last whole load one a load: ARMSX2 appends its indices to
+ * a stream buffer, so a draw's start is only as aligned as its index size.
+ */
+static void
+scan_range(nir_builder *b, nir_def *addr, nir_def *n, unsigned log2, bool restart,
+           nir_variable *vmin, nir_variable *vmax)
+{
+   const unsigned bits = 8u << log2;
+   if (!log2) {
+      scan_scalar(b, addr, nir_imm_int(b, 0), n, 0, restart, vmin, vmax);
+      return;
+   }
+   const unsigned per_load_log2 = 4 - log2; /* 8 or 4 indices */
+   /* Indices up to the first 16-byte boundary. */
+   nir_def *mis = nir_iand_imm(b, nir_u2u32(b, addr), 15);
+   nir_def *head = nir_umin(b, n, nir_ushr_imm(b, nir_iand_imm(b, nir_isub(b, nir_imm_int(b, 16),
+                                                                           mis), 15),
+                                                 log2));
+   scan_scalar(b, addr, nir_imm_int(b, 0), head, log2, restart, vmin, vmax);
+   nir_def *groups = nir_ushr_imm(b, nir_isub(b, n, head), per_load_log2);
+   nir_def *base = nir_iadd(b, addr, nir_u2u64(b, nir_ishl_imm(b, head, log2)));
+   nir_variable *g = nir_local_variable_create(b->impl, glsl_uint_type(), "g");
+   nir_store_var(b, g, nir_imm_int(b, 0), 1);
+   nir_push_loop(b);
+   {
+      nir_def *gv = nir_load_var(b, g);
+      nir_break_if(b, nir_uge(b, gv, groups));
+      nir_def *a = nir_iadd(b, base, nir_u2u64(b, nir_ishl_imm(b, gv, 4)));
+      nir_def *w = nir_load_global(b, 4, 32, a, .align_mul = 16);
+      nir_def *lo = nir_load_var(b, vmin), *hi = nir_load_var(b, vmax);
+      for (unsigned c = 0; c < 4; c++) {
+         nir_def *word = nir_channel(b, w, c);
+         if (bits == 16) {
+            merge_index(b, nir_iand_imm(b, word, 0xffff), 16, restart, &lo, &hi);
+            merge_index(b, nir_ushr_imm(b, word, 16), 16, restart, &lo, &hi);
+         } else {
+            merge_index(b, word, 32, restart, &lo, &hi);
+         }
+      }
+      nir_store_var(b, vmin, lo, 1);
+      nir_store_var(b, vmax, hi, 1);
+      nir_store_var(b, g, nir_iadd_imm(b, gv, 1), 1);
+   }
+   nir_pop_loop(b, NULL);
+   /* The rest after the last whole load. */
+   nir_def *done = nir_iadd(b, head, nir_ishl_imm(b, groups, per_load_log2));
+   scan_scalar(b, addr, done, n, log2, restart, vmin, vmax);
+}
+
+/* scan_range for the draw's index size, which is the same for all of it. */
+static void
+scan_sizes(nir_builder *b, nir_def *addr, nir_def *n, nir_def *log2, bool restart,
+           nir_variable *vmin, nir_variable *vmax)
+{
+   nir_push_if(b, nir_ieq_imm(b, log2, 1));
+   scan_range(b, addr, n, 1, restart, vmin, vmax);
+   nir_push_else(b, NULL);
+   nir_push_if(b, nir_ieq_imm(b, log2, 2));
+   scan_range(b, addr, n, 2, restart, vmin, vmax);
+   nir_push_else(b, NULL);
+   scan_range(b, addr, n, 0, restart, vmin, vmax);
+   nir_pop_if(b, NULL);
+   nir_pop_if(b, NULL);
 }
 
 static nir_shader *
@@ -149,15 +231,12 @@ build_scan_nir(struct mali_device *dev)
       nir_variable *vmax = nir_local_variable_create(b.impl, glsl_uint_type(), "max");
       nir_store_var(&b, vmin, nir_imm_int(&b, UINT32_MAX), 1);
       nir_store_var(&b, vmax, nir_imm_int(&b, 0), 1);
-      /* One loop per index size: the size is the same for the whole draw. */
-      nir_push_if(&b, nir_ieq_imm(&b, log2, 1));
-      scan_loop(&b, addr, n, 1, restart, vmin, vmax);
+      /* The loops per index size and restart, both the same for the whole
+       * draw. */
+      nir_push_if(&b, restart);
+      scan_sizes(&b, addr, n, log2, true, vmin, vmax);
       nir_push_else(&b, NULL);
-      nir_push_if(&b, nir_ieq_imm(&b, log2, 2));
-      scan_loop(&b, addr, n, 2, restart, vmin, vmax);
-      nir_push_else(&b, NULL);
-      scan_loop(&b, addr, n, 0, restart, vmin, vmax);
-      nir_pop_if(&b, NULL);
+      scan_sizes(&b, addr, n, log2, false, vmin, vmax);
       nir_pop_if(&b, NULL);
 
       nir_def *lo = nir_load_var(&b, vmin), *hi = nir_load_var(&b, vmax);
