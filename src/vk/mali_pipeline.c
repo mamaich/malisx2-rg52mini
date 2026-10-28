@@ -187,10 +187,24 @@ stage_init(struct mali_device *dev, VkPipelineCreateFlags2KHR flags,
    vk_pipeline_hash_shader_stage(flags, info, &st->rs, st->stage_hash);
 }
 
+/* MALISX2_NO_PIPELINE_CACHE=1: every stage compiles anew, for shader dumps
+ * (BIFROST_MESA_DEBUG=shaders, MALISX2_MEASURE=shaders) of an application
+ * whose pipeline cache would otherwise serve the binaries. */
+static bool
+no_pipeline_cache(void)
+{
+   static int v = -1;
+   if (v < 0) {
+      const char *s = getenv("MALISX2_NO_PIPELINE_CACHE");
+      v = s && !strcmp(s, "1");
+   }
+   return v;
+}
+
 static bool
 stage_lookup(struct mali_device *dev, struct vk_pipeline_cache *cache, struct stage *st)
 {
-   if (!cache)
+   if (!cache || no_pipeline_cache())
       return false;
 
    struct vk_pipeline_cache_object *obj =
