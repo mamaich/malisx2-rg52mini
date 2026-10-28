@@ -1118,6 +1118,8 @@ stats_log(const char *what, const struct mali_jm_draw_totals *to,
                 D(cmd.fau_by_tables[i]) * per, D(cmd.ubo_copies[i]) * per,
                 D(cmd.ubo_host_copies[i]) * per, D(cmd.fau_kept[i]) * per);
    }
+   mesa_logi("malisx2 stats, %s, draws as one Indexed Vertex job: %.1f%%", what,
+             draws ? 100.0 * D(cmd.idvs_draws) / draws : 0.0);
 #endif
 #undef D
 }
@@ -1327,6 +1329,7 @@ MALI_PER_ARCH(device_init)(struct mali_device *dev)
       knob_uint("MALISX2_V7_AFBC_TEX", "debug.malisx2.v7_afbc_tex", 0, 1, 1);
    dev->v7_afbc_depth =
       knob_uint("MALISX2_V7_AFBC_DEPTH", "debug.malisx2.v7_afbc_depth", 0, 1, 1);
+   dev->v7_idvs = knob_uint("MALISX2_V7_IDVS", "debug.malisx2.v7_idvs", 0, 1, 1);
    dev->jm_hierarchy_mask =
       knob_uint("MALISX2_JM_HIER_MASK", "debug.malisx2.jm_hier_mask", 0, 255, 0);
    mali_jm_heap_init(jd);

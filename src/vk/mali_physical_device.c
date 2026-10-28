@@ -598,12 +598,13 @@ hash_uuid(uint8_t out[VK_UUID_SIZE], const void *data, size_t size)
  */
 static void
 pipeline_cache_uuid(uint8_t out[VK_UUID_SIZE], const char *cache_id, size_t cache_id_size,
-                    uint64_t gpu_id)
+                    uint64_t gpu_id, uint32_t variant)
 {
    struct mesa_blake3 ctx;
    _mesa_blake3_init(&ctx);
    _mesa_blake3_update(&ctx, cache_id, cache_id_size);
    _mesa_blake3_update(&ctx, &gpu_id, sizeof(gpu_id));
+   _mesa_blake3_update(&ctx, &variant, sizeof(variant));
 
    blake3_hash h;
    _mesa_blake3_final(&ctx, h);
@@ -825,15 +826,20 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
    props->deviceUUID[4] = 1;
    /* driverUUID: a hash of driverInfo, so never the blob's. */
    hash_uuid(props->driverUUID, driver_info, strlen(driver_info) + 1);
-   if (p->arch_major == 7)
+   if (p->arch_major == 7) {
+      /* MALISX2_V7_IDVS=0 compiles vertex shaders whole (mali_shader.c):
+       * its own cache. */
+      const char *idvs = getenv("MALISX2_V7_IDVS");
       pipeline_cache_uuid(props->pipelineCacheUUID, MALI_SHADER_CACHE_ID_V7,
-                          sizeof(MALI_SHADER_CACHE_ID_V7), p->gpu_id);
-   else if (p->arch_major == 9)
+                          sizeof(MALI_SHADER_CACHE_ID_V7), p->gpu_id,
+                          idvs && !strcmp(idvs, "0") ? 1 : 0);
+   } else if (p->arch_major == 9) {
       pipeline_cache_uuid(props->pipelineCacheUUID, MALI_SHADER_CACHE_ID_V9,
-                          sizeof(MALI_SHADER_CACHE_ID_V9), p->gpu_id);
-   else
+                          sizeof(MALI_SHADER_CACHE_ID_V9), p->gpu_id, 0);
+   } else {
       pipeline_cache_uuid(props->pipelineCacheUUID, MALI_SHADER_CACHE_ID,
-                          sizeof(MALI_SHADER_CACHE_ID), p->gpu_id);
+                          sizeof(MALI_SHADER_CACHE_ID), p->gpu_id, 0);
+   }
 }
 
 /* ---------------------------------------------------------------------- */

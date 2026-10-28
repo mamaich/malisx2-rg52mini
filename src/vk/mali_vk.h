@@ -274,6 +274,10 @@ struct mali_device {
    /* v7: D32 depth attachments are AFBC (mali_image.c v7_can_use_afbc;
     * MALISX2_V7_AFBC_DEPTH=0 keeps them uncompressed). */
    bool v7_afbc_depth;
+   /* v7: vertex shaders are split for Index-Driven Vertex Shading and a
+    * draw is one Indexed Vertex job (mali_shader.c, mali_jm_cmd_draw_v7.c;
+    * MALISX2_V7_IDVS=0 keeps the Vertex and Tiler job pair). */
+   bool v7_idvs;
    /* The tiler hierarchy mask to use outright (mali_jm_cmd_render.c
     * hierarchy_mask; MALISX2_JM_HIER_MASK), 0 for the rule there. */
    uint8_t jm_hierarchy_mask;

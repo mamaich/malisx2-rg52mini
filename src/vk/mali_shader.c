@@ -1687,8 +1687,6 @@ v7_fixup_info(struct mali_device *dev, const nir_shader *nir, struct mali_shader
       const uint32_t generic =
          (s->info.attributes_read & VERT_BIT_GENERIC_ALL) >> VERT_ATTRIB_GENERIC0;
       s->info.attribute_count = util_last_bit(generic);
-      /* bi_should_idvs() honours no_idvs (shader_compile). */
-      assert(!s->info.vs.idvs && !s->info.vs.secondary_enable);
    } else {
       s->info.attribute_count = 0;
    }
@@ -1904,8 +1902,9 @@ shader_upload(struct mali_device *dev, struct mali_shader *s)
     * compute shader's goes into spd[MALI_SPD_MAIN], the State of the
     * dispatch's Draw section (mali_jm_cmd_dispatch.c); a vertex shader's
     * into both position slots, as there is no point-size variant (the
-    * point size goes to its own varying buffer) and no varying shader (no
-    * IDVS). A fragment shader's RSD also carries depth/stencil, multisample
+    * point size goes to its own varying buffer), and the varying shader
+    * IDVS splits off is in the same RSD (mali_v7_rsd_shader). A fragment
+    * shader's RSD also carries depth/stencil, multisample
     * and pixel-kill state and is followed by the Blend descriptors, so it
     * is built per pipeline and draw (mali_pipeline_state.c,
     * mali_jm_cmd_draw_v7.c); spd[MALI_SPD_MAIN] holds its code address.
@@ -2060,11 +2059,13 @@ MALI_PER_ARCH(shader_compile)(struct mali_device *dev,
       .robust_modes = robust_modes,
       .robust_descriptors = dev->vk.enabled_features.nullDescriptor,
 #if PAN_ARCH < 9
-      /* One plain vertex shader per Vertex job, no IDVS pair: the v7 draw
-       * is a Vertex and a Tiler job (mali_jm_cmd_draw_v7.c), the form
-       * Mesa also uses on Bifrost when the shader writes gl_PointSize
-       * (bi_should_idvs). */
-      .no_idvs = true,
+      /* Index-Driven Vertex Shading: the compiler splits a vertex shader
+       * into a position part, the main entry, and a varying part, the
+       * secondary shader, and the v7 draw is one Indexed Vertex job
+       * (mali_jm_cmd_draw_v7.c). A shader that writes gl_PointSize stays
+       * whole (bi_should_idvs) and draws as a Vertex and a Tiler job, as
+       * every shader does under MALISX2_V7_IDVS=0. */
+      .no_idvs = !dev->v7_idvs,
 #endif
    };
    struct pan_varying_layout varying_layout;

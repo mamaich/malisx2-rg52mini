@@ -12,6 +12,7 @@
 | `MALISX2_V7_GPU_DESC_COPY=1` | v7: таблицы дескрипторов без images заполняет задание, а не CPU |
 | `MALISX2_V7_AFBC_TEX=0` | v7: текстуры (образы без COLOR_ATTACHMENT) без AFBC, как раньше |
 | `MALISX2_V7_AFBC_DEPTH=0` | v7: вложения глубины D32 без AFBC, как раньше |
+| `MALISX2_V7_IDVS=0` | v7: вершинные шейдеры целиком и пара заданий Vertex + Tiler на отрисовку вместо IDVS (одно задание Indexed Vertex с разделённым шейдером); свой кэш конвейеров |
 | `MALISX2_JM_HIER_MASK=<1–255>` | маска уровней иерархии тайлера вместо правила по числу уровней (десятичная: 10 = 0x0a — уровни 32 и 128 пикселей, 130 = 0x82 — 32 и 2048) |
 | `MALISX2_V7_FPK_ROA=0` | v7: forward pixel kill выключен у всех конвейеров с порядком растеризации для цвета, как в panvk |
 | `BIFROST_MESA_DEBUG=shaderdb` | статистика каждого шейдера v7 (инструкции, кортежи, клаузы, регистры) в stderr; `shaders` — ещё NIR и дизассемблер. Чтобы шейдеры действительно компилировались, нужны `VK_ENABLE_PIPELINE_CACHE=false MESA_SHADER_CACHE_DISABLE=true` |

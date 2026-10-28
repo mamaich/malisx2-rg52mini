@@ -497,6 +497,26 @@ emit_viewport(struct mali_cmd_buffer *cmd)
    return p.gpu;
 }
 
+/* A Viewport whose scissor culls everything, for a draw under rasterizer
+ * discard whose Indexed Vertex job tiles anyway (pan_cmdstream.c sets the
+ * range to [1, 1) the same way). */
+static uint64_t
+emit_viewport_none(struct mali_cmd_buffer *cmd)
+{
+   struct mali_ptr p = mali_cmd_alloc(cmd, pan_size(VIEWPORT), pan_alignment(VIEWPORT));
+   if (!p.cpu)
+      return 0;
+   pan_cast_and_pack(p.cpu, VIEWPORT, cfg) {
+      cfg.scissor_minimum_x = 1;
+      cfg.scissor_minimum_y = 1;
+      cfg.scissor_maximum_x = 0;
+      cfg.scissor_maximum_y = 0;
+      cfg.minimum_z = 0.0f;
+      cfg.maximum_z = 1.0f;
+   }
+   return p.gpu;
+}
+
 /* ---------------------------------------------------------------------- */
 /* Per-draw descriptors                                                    */
 
@@ -1332,8 +1352,14 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
       dd.raw_vertex_offset = (int32_t)min + di->vertex_offset;
       dd.indices = d->ib.addr + (uint64_t)di->first_index * d->ib.index_size;
    }
+   /* With IDVS the instances of a draw keep their positions in separate
+    * cache lines: 16 bytes each, so a multiple of 4 vertices
+    * (panvk_cmd_draw). */
+   const bool idvs = p->vs->info.vs.idvs;
    dd.padded_count =
-      di->instance_count > 1 ? padded_vertex_count(dd.vertex_range) : dd.vertex_range;
+      di->instance_count > 1
+         ? padded_vertex_count(idvs ? ALIGN_POT(dd.vertex_range, 4) : dd.vertex_range)
+         : dd.vertex_range;
 
    if (!prepare_draw(cmd, di, &dd)) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
@@ -1341,8 +1367,16 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
    }
 
    /* Rasterizer discard: the Vertex job alone, as in panvk, which keeps
-    * the Tiler job only for an occlusion query. */
+    * the Tiler job only for an occlusion query; an Indexed Vertex job
+    * tiles behind a scissor that culls everything. */
    const bool tiling = !st->rs.rasterizer_discard_enable;
+   if (idvs && !tiling && !t->viewport_none) {
+      t->viewport_none = emit_viewport_none(cmd);
+      if (!t->viewport_none) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         return;
+      }
+   }
 
    /* The Invocation of both jobs (panvk_cmd_draw): (1, vertex range,
     * instances) workgroups of one invocation, with the graphics quirks. */
@@ -1373,7 +1407,7 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
     * among themselves (Dependency 2). With a barrier pending they are
     * linked first, so that it orders this draw's jobs after them. */
    const bool pending = c->pending != 0;
-   const bool defer = !pending;
+   const bool defer = !pending && !idvs;
    if (!defer)
       mali_v7_link_tilers(cmd, 0);
    cmd->jm.tiler_defer = defer;
@@ -1405,23 +1439,12 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
    cmd->jm.stats.ubo_copies[0] += vs_dep != vs_copy;
    cmd->jm.stats.desc_copies[1] += fs_copy != 0;
    cmd->jm.stats.ubo_copies[1] += fs_ubo != 0;
-   struct mali_ptr vj = mali_jm_cmd_add_job(cmd, c, MALI_JOB_TYPE_VERTEX, pan_size(COMPUTE_JOB),
-                                            pending && !vs_dep && (fs_copy || fs_ubo), vs_dep);
-   cmd->jm.tiler_defer = false;
-   if (!vj.cpu)
-      return;
-   const uint16_t vertex_index = c->index;
-   /* The Tiler job of the draw MALI_V7_TILER_DEFER draws back goes in
-    * behind this Vertex job. */
-   if (defer)
-      mali_v7_link_tilers(cmd, MALI_V7_TILER_DEFER - 1);
+   const bool job_barrier = pending && !vs_dep && (fs_copy || fs_ubo);
 
-   /* The Vertex job (panvk_draw_prepare_vertex_job, panvk_emit_vertex_dcd). */
-   memcpy(pan_section_ptr(vj.cpu, COMPUTE_JOB, INVOCATION), &invocation, sizeof(invocation));
-   pan_section_pack(vj.cpu, COMPUTE_JOB, PARAMETERS, cfg) {
-      cfg.job_task_split = 5;
-   }
-   pan_section_pack(vj.cpu, COMPUTE_JOB, DRAW, cfg) {
+   /* The vertex shader's Draw (panvk_emit_vertex_dcd): the Vertex job's, or
+    * the Indexed Vertex job's Vertex Draw. */
+   struct mali_draw_packed vdcd;
+   pan_pack(&vdcd, DRAW, cfg) {
       cfg.state = t->vs_rsd;
       cfg.attributes = dd.attribs;
       cfg.attribute_buffers = dd.attrib_bufs;
@@ -1436,19 +1459,15 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
       cfg.samplers = t->vs_tab.tables[MALI_V7_DESC_TABLE_SAMPLER];
    }
 
-   if (tiling) {
-      /* The Tiler job is written here, its header and link when it goes
-       * into the chain (mali_v7_link_tilers): behind a later draw's Vertex
-       * job, in front of any other job, or when the batch closes. */
-      struct mali_ptr tj = mali_cmd_alloc(cmd, pan_size(TILER_JOB), 128);
-      if (!tj.cpu)
-         return;
-
-      memcpy(pan_section_ptr(tj.cpu, TILER_JOB, INVOCATION), &invocation, sizeof(invocation));
-
-      /* panvk_emit_tiler_primitive: the baked flags, this draw's index
-       * type, the pass's provoking vertex, and the counts. */
-      struct mali_primitive_packed prim;
+   /* The tiling sections (panvk_emit_tiler_primitive, _primitive_size,
+    * _dcd): the Tiler job's, or the Indexed Vertex job's, which tiles even
+    * under rasterizer discard, behind a scissor that culls everything. */
+   struct mali_primitive_packed prim;
+   struct mali_primitive_size_packed psize;
+   struct mali_draw_packed dcd;
+   if (tiling || idvs) {
+      /* The baked flags, this draw's index type, the pass's provoking
+       * vertex, and the counts. */
       pan_pack(&prim, PRIMITIVE, cfg) {
          cfg.index_count = di->count;
          if (di->indexed) {
@@ -1463,30 +1482,24 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
          di->indexed ? mali_gfx_index_type(d->ib.index_size) : MALI_INDEX_TYPE_NONE;
       prim.opaque[0] = (t->prim0 & ~prim_provoking_bit()) | prim_index_type(index_type) |
                        (r->first_provoking_vertex ? prim_provoking_bit() : 0);
-      memcpy(pan_section_ptr(tj.cpu, TILER_JOB, PRIMITIVE), &prim, sizeof(prim));
 
-      pan_section_pack(tj.cpu, TILER_JOB, PRIMITIVE_SIZE, cfg) {
+      pan_pack(&psize, PRIMITIVE_SIZE, cfg) {
          if (t->writes_psiz)
             cfg.size_array = dd.psiz;
          else
             cfg.fixed_sized = t->lines ? dyn->rs.line.width : 1.0f;
       }
-      pan_section_pack(tj.cpu, TILER_JOB, TILER, cfg) {
-         cfg.address = t->tiler;
-      }
-      pan_section_pack(tj.cpu, TILER_JOB, PADDING, cfg);
 
-      /* panvk_emit_tiler_dcd, with the baked culling bits ORed into word 0. */
+      /* With the baked culling bits ORed into word 0. */
       const uint32_t prims_per_instance =
          DIV_ROUND_UP(dd.padded_count, mesa_vertices_per_prim(t->prim));
-      struct mali_draw_packed dcd;
       pan_pack(&dcd, DRAW, cfg) {
          cfg.position = dd.position;
          cfg.state = t->fs_rsd;
          /* The fragment shader's images (panvk_emit_tiler_dcd). */
          cfg.attributes = t->fs_tab.img_attribs;
          cfg.attribute_buffers = t->fs_tab.tables[MALI_V7_DESC_TABLE_IMG];
-         cfg.viewport = t->viewport;
+         cfg.viewport = tiling ? t->viewport : t->viewport_none;
          cfg.varyings = t->fs_vary;
          cfg.varying_buffers = t->fs_vary ? dd.vary_bufs : 0;
          cfg.thread_storage = t->tsd;
@@ -1500,14 +1513,73 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
          cfg.occlusion_query = MALI_OCCLUSION_MODE_DISABLED;
       }
       dcd.opaque[0] |= t->dcd0;
-      memcpy(pan_section_ptr(tj.cpu, TILER_JOB, DRAW), &dcd, sizeof(dcd));
+   }
 
-      assert(cmd->jm.pend_tilers < MALI_V7_TILER_DEFER);
-      cmd->jm.pend_tiler[cmd->jm.pend_tilers] = tj;
-      cmd->jm.pend_tiler_dep1[cmd->jm.pend_tilers] = vertex_index;
-      cmd->jm.pend_tilers++;
-      if (!defer)
-         mali_v7_link_tilers(cmd, 0);
+   if (idvs) {
+      /* One Indexed Vertex job (panvk_draw_prepare_idvs_job): the tiler
+       * runs the position shader for the vertices the indices name, and
+       * the varying shader for those of the primitives it keeps. On the
+       * tiler side of the chain, so in draw order behind the pending Tiler
+       * jobs (mali_jm_cmd_add_job linked them first). */
+      struct mali_ptr ij = mali_jm_cmd_add_job(cmd, c, MALI_JOB_TYPE_INDEXED_VERTEX,
+                                               pan_size(INDEXED_VERTEX_JOB), job_barrier, vs_dep);
+      cmd->jm.tiler_defer = false;
+      if (!ij.cpu)
+         return;
+      memcpy(pan_section_ptr(ij.cpu, INDEXED_VERTEX_JOB, INVOCATION), &invocation,
+             sizeof(invocation));
+      memcpy(pan_section_ptr(ij.cpu, INDEXED_VERTEX_JOB, PRIMITIVE), &prim, sizeof(prim));
+      memcpy(pan_section_ptr(ij.cpu, INDEXED_VERTEX_JOB, PRIMITIVE_SIZE), &psize, sizeof(psize));
+      pan_section_pack(ij.cpu, INDEXED_VERTEX_JOB, TILER, cfg) {
+         cfg.address = t->tiler;
+      }
+      pan_section_pack(ij.cpu, INDEXED_VERTEX_JOB, PADDING, cfg);
+      memcpy(pan_section_ptr(ij.cpu, INDEXED_VERTEX_JOB, FRAGMENT_DRAW), &dcd, sizeof(dcd));
+      memcpy(pan_section_ptr(ij.cpu, INDEXED_VERTEX_JOB, VERTEX_DRAW), &vdcd, sizeof(vdcd));
+      cmd->jm.stats.idvs_draws++;
+   } else {
+      struct mali_ptr vj = mali_jm_cmd_add_job(cmd, c, MALI_JOB_TYPE_VERTEX,
+                                               pan_size(COMPUTE_JOB), job_barrier, vs_dep);
+      cmd->jm.tiler_defer = false;
+      if (!vj.cpu)
+         return;
+      const uint16_t vertex_index = c->index;
+      /* The Tiler job of the draw MALI_V7_TILER_DEFER draws back goes in
+       * behind this Vertex job. */
+      if (defer)
+         mali_v7_link_tilers(cmd, MALI_V7_TILER_DEFER - 1);
+
+      /* The Vertex job (panvk_draw_prepare_vertex_job). */
+      memcpy(pan_section_ptr(vj.cpu, COMPUTE_JOB, INVOCATION), &invocation, sizeof(invocation));
+      pan_section_pack(vj.cpu, COMPUTE_JOB, PARAMETERS, cfg) {
+         cfg.job_task_split = 5;
+      }
+      memcpy(pan_section_ptr(vj.cpu, COMPUTE_JOB, DRAW), &vdcd, sizeof(vdcd));
+
+      if (tiling) {
+         /* The Tiler job is written here, its header and link when it goes
+          * into the chain (mali_v7_link_tilers): behind a later draw's
+          * Vertex job, in front of any other job, or when the batch
+          * closes. */
+         struct mali_ptr tj = mali_cmd_alloc(cmd, pan_size(TILER_JOB), 128);
+         if (!tj.cpu)
+            return;
+         memcpy(pan_section_ptr(tj.cpu, TILER_JOB, INVOCATION), &invocation, sizeof(invocation));
+         memcpy(pan_section_ptr(tj.cpu, TILER_JOB, PRIMITIVE), &prim, sizeof(prim));
+         memcpy(pan_section_ptr(tj.cpu, TILER_JOB, PRIMITIVE_SIZE), &psize, sizeof(psize));
+         pan_section_pack(tj.cpu, TILER_JOB, TILER, cfg) {
+            cfg.address = t->tiler;
+         }
+         pan_section_pack(tj.cpu, TILER_JOB, PADDING, cfg);
+         memcpy(pan_section_ptr(tj.cpu, TILER_JOB, DRAW), &dcd, sizeof(dcd));
+
+         assert(cmd->jm.pend_tilers < MALI_V7_TILER_DEFER);
+         cmd->jm.pend_tiler[cmd->jm.pend_tilers] = tj;
+         cmd->jm.pend_tiler_dep1[cmd->jm.pend_tilers] = vertex_index;
+         cmd->jm.pend_tilers++;
+         if (!defer)
+            mali_v7_link_tilers(cmd, 0);
+      }
    }
 
    /* Heap use: polygon-list entries only, the varyings being in command
