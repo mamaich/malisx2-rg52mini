@@ -2027,6 +2027,74 @@ MALI_PER_ARCH(shader_unref)(struct mali_device *dev, struct mali_shader *s)
       vk_pipeline_cache_object_unref(&dev->vk, &s->base);
 }
 
+#if PAN_ARCH < 9
+/*
+ * MALISX2_V7_FP16=1. FP16 is not faster for every shader: values needed
+ * at both widths cost conversions, and 16-bit and 32-bit copies live at
+ * once can push a shader past 32 registers (one thread instead of two)
+ * or into spilling (a God of War post-processing shader with 21 texture
+ * samples: 15:28 spills:fills became 22:64). So a fragment shader the
+ * pass changed also compiles without it, and the build the compiler's own
+ * estimate prefers is kept: more threads, then fewer spills and fills,
+ * then fewer cycles; the FP16 build only when strictly better.
+ * MALISX2_V7_FP16_LOG=1 logs each choice.
+ */
+static bool
+fp16_wins(const struct bifrost_stats *h, const struct bifrost_stats *f)
+{
+   if (h->threads != f->threads)
+      return h->threads > f->threads;
+   if (h->spills + h->fills != f->spills + f->fills)
+      return h->spills + h->fills < f->spills + f->fills;
+   return h->cycles < f->cycles;
+}
+
+static bool
+fp16_log(void)
+{
+   static int v = -1;
+   if (v < 0) {
+      const char *e = getenv("MALISX2_V7_FP16_LOG");
+      v = e && !strcmp(e, "1");
+   }
+   return v;
+}
+
+static void
+fp16_pick(struct mali_device *dev, const struct mali_shader_compile_info *info,
+          const blake3_hash key, bool changed, nir_shader *fp32_nir,
+          struct mali_shader **out)
+{
+   if (!changed) {
+      ralloc_free(fp32_nir);
+      return;
+   }
+   const uint8_t *h8 = fp32_nir->info.source_blake3;
+   const uint32_t src = (uint32_t)h8[0] << 24 | (uint32_t)h8[1] << 16 | (uint32_t)h8[2] << 8 | h8[3];
+   struct mali_shader_compile_info alt = *info;
+   alt.nir = fp32_nir;
+   alt.no_fp16 = true;
+   struct mali_shader *f = NULL;
+   /* On failure the FP16 build stays (alt.nir is consumed either way). */
+   if (MALI_PER_ARCH(shader_compile)(dev, &alt, key, &f) != VK_SUCCESS)
+      return;
+   struct mali_shader *h = *out;
+   const struct bifrost_stats *hs = &h->info.stats.bifrost, *fs = &f->info.stats.bifrost;
+   const bool keep = fp16_wins(hs, fs);
+   if (fp16_log())
+      mesa_logi("malisx2 fp16 %08x: %s; FP16 %.2f cycles %u threads %u:%u spills, "
+                "FP32 %.2f cycles %u threads %u:%u spills", src, keep ? "FP16" : "FP32",
+                hs->cycles, hs->threads, hs->spills, hs->fills, fs->cycles, fs->threads,
+                fs->spills, fs->fills);
+   if (keep) {
+      shader_destroy(dev, f);
+   } else {
+      shader_destroy(dev, h);
+      *out = f;
+   }
+}
+#endif
+
 VkResult
 MALI_PER_ARCH(shader_compile)(struct mali_device *dev,
                               const struct mali_shader_compile_info *info,
@@ -2039,6 +2107,14 @@ MALI_PER_ARCH(shader_compile)(struct mali_device *dev,
    VkResult result;
 
    *out = NULL;
+
+#if PAN_ARCH < 9
+   /* MALISX2_V7_FP16 (mali_nir_fs_fp16.c). Under 1, a copy of the shader
+    * as it came, for the 32-bit build fp16_pick compares with. */
+   const bool fp16 = stage == MESA_SHADER_FRAGMENT && dev->v7_fp16 && !info->no_fp16;
+   nir_shader *fp32_nir = fp16 && dev->v7_fp16 == 1 ? nir_shader_clone(NULL, nir) : NULL;
+   bool fp16_changed = false;
+#endif
 
    struct mali_shader *s = shader_alloc(dev, stage, key, sizeof(blake3_hash));
    if (!s) {
@@ -2146,6 +2222,14 @@ MALI_PER_ARCH(shader_compile)(struct mali_device *dev,
          nir->info.fs.color_is_dual_source = false;
          NIR_PASS(_, nir, nir_opt_dce);
       }
+#if PAN_ARCH < 9
+      /* MALISX2_V7_FP16=1: the arithmetic that needs no 32 bits in FP16,
+       * which Bifrost does two at a time (mali_nir_fs_fp16.c). Before the
+       * outputs are gathered, so 16-bit colour stores make 16-bit
+       * temporaries there. */
+      if (fp16)
+         NIR_PASS(fp16_changed, nir, mali_nir_fs_fp16, state);
+#endif
       /* "if (c) discard;" (ARMSX2's alpha and destination-alpha tests)
        * as demote_if(c): kraid emits one conditional DISCARD instead of a
        * compare, an inversion, a branch and an unconditional DISCARD. Limit
@@ -2231,9 +2315,16 @@ MALI_PER_ARCH(shader_compile)(struct mali_device *dev,
       goto fail;
 
    *out = s;
+#if PAN_ARCH < 9
+   if (fp32_nir)
+      fp16_pick(dev, info, key, fp16_changed, fp32_nir, out);
+#endif
    return VK_SUCCESS;
 
 fail:
+#if PAN_ARCH < 9
+   ralloc_free(fp32_nir);
+#endif
    ralloc_free(nir);
    shader_destroy(dev, s);
    return result;

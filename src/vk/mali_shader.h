@@ -482,6 +482,9 @@ struct mali_shader_compile_info {
     * early depth/stencil and pixel kill unless it writes depth or
     * stencil: it gets no ATEST in that case, as panvk's frame shaders. */
    bool meta;
+   /* MALISX2_V7_FP16=1: the 32-bit build a fragment shader's FP16 build is
+    * compared with (mali_shader.c fp16_pick) compiles without the pass. */
+   bool no_fp16;
 };
 
 /* The fragment shader keeps its second colour output (location 0,
@@ -528,5 +531,9 @@ bool mali_nir_lower_descriptors_v7(nir_shader *nir,
 bool mali_nir_lower_input_attachment_loads(nir_shader *nir, unsigned arch,
                                            const struct vk_graphics_pipeline_state *state,
                                            uint32_t *input_attachment_read);
+/* MALISX2_V7_FP16=1: fragment shader arithmetic in 16-bit floats where
+ * nothing needs 32 bits (mali_nir_fs_fp16.c). Before pan_nir_lower_fs_outputs:
+ * colour outputs to targets FP16 holds become 16-bit stores. */
+bool mali_nir_fs_fp16(nir_shader *nir, const struct vk_graphics_pipeline_state *state);
 
 #endif

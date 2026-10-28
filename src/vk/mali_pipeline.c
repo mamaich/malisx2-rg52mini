@@ -453,6 +453,18 @@ hash_fs_state(struct mesa_blake3 *ctx, const struct mali_device *dev,
       _mesa_blake3_update(ctx, state->ial, sizeof(*state->ial));
    if (state->cal)
       _mesa_blake3_update(ctx, state->cal, sizeof(*state->cal));
+   /* MALISX2_V7_FP16: which colour outputs go out as 16-bit follows the
+    * targets' formats (mali_nir_fs_fp16.c). Nothing is added with it off,
+    * so the keys stay what they were. */
+   if (dev->v7_fp16) {
+      const uint8_t fp16 = dev->v7_fp16;
+      _mesa_blake3_update(ctx, &fp16, sizeof(fp16));
+      if (state->rp) {
+         const uint32_t n = state->rp->color_attachment_count;
+         _mesa_blake3_update(ctx, &n, sizeof(n));
+         _mesa_blake3_update(ctx, state->rp->color_attachment_formats, n * sizeof(VkFormat));
+      }
+   }
 }
 
 /* Descriptor sets a stage's resource table reads: the sets it indexes and

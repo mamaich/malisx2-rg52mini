@@ -278,6 +278,11 @@ struct mali_device {
     * draw is one Indexed Vertex job (mali_shader.c, mali_jm_cmd_draw_v7.c;
     * MALISX2_V7_IDVS=0 keeps the Vertex and Tiler job pair). */
    bool v7_idvs;
+   /* v7: fragment shader arithmetic in FP16 where nothing needs 32 bits
+    * (mali_nir_fs_fp16.c). MALISX2_V7_FP16=1: a shader the pass changes
+    * compiles both ways and the faster build is kept; 2: always the FP16
+    * build; 0 (the default): never. */
+   uint8_t v7_fp16;
    /* The tiler hierarchy mask to use outright (mali_jm_cmd_render.c
     * hierarchy_mask; MALISX2_JM_HIER_MASK), 0 for the rule there. */
    uint8_t jm_hierarchy_mask;
