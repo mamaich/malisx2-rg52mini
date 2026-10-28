@@ -109,7 +109,7 @@ dispatch(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
       return;
 
    uint16_t copy_dep = 0;
-   if (!mali_v7_desc_copy(cmd, c, cs, &tables, 0, &copy_dep))
+   if (!mali_v7_desc_copy(cmd, c, cs, &tables, 0, 0, &copy_dep))
       return;
 
    /* Timing. */

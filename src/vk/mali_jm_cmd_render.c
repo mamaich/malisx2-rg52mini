@@ -248,6 +248,7 @@ mali_jm_cmd_pass_split(struct mali_cmd_buffer *cmd)
    struct mali_jm_batch *b = mali_jm_cmd_batch(cmd);
    b->heap_slot = old.heap_slot;
    b->heap_desc = old.heap_desc;
+   b->vary_counter = old.vary_counter;
    b->est_heap_bytes = old.est_heap_bytes;
 }
 

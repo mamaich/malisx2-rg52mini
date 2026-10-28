@@ -537,6 +537,12 @@ struct draw_data {
     * uniform buffer words still to be copied (mali_v7_ubo_copy); the
     * fragment shader's block keeps that in the template (fs_ubo_owed). */
    bool vs_ubo_copy;
+   /* The index range is found on the GPU (mali_jm_irange_v7.c): the
+    * vertex range and start above are placeholders the patch job
+    * replaces, and the varying buffers are its to place. gpu_count: the
+    * indices in the bound range. */
+   bool gpu_range;
+   uint32_t gpu_count;
 };
 
 /*
@@ -559,7 +565,8 @@ emit_varying_bufs(struct mali_cmd_buffer *cmd, const struct mali_jm_draw_tmpl *t
    memset(descs, 0, sizeof(descs));
    uint64_t addrs[MALI_V7_VARY_BUF_COUNT] = {0};
    for (unsigned i = 0; i < MALI_V7_VARY_BUF_COUNT; i++) {
-      const uint64_t size = (uint64_t)dd->padded_count * di->instance_count * t->vary_stride[i];
+      const uint64_t size =
+         dd->gpu_range ? 0 : (uint64_t)dd->padded_count * di->instance_count * t->vary_stride[i];
       if (size) {
          if (size > UINT32_MAX)
             return false;
@@ -1314,6 +1321,32 @@ index_range(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, bool r
 /* ---------------------------------------------------------------------- */
 /* The jobs                                                                */
 
+/*
+ * Whether an indexed draw's index range is found on the GPU
+ * (mali_jm_irange_v7.c): one Indexed Vertex job of one instance, whose
+ * vertex shader does not read the raw vertex offset (gl_VertexIndex, or
+ * the noperspective mask in the same FAU word: its FAU block would have to
+ * be patched per draw too), and indices that fit a group. *count: the
+ * draw's indices in the bound range (0: none, nothing to draw), as
+ * index_range clamps them.
+ */
+static bool
+gpu_range_fits(struct mali_cmd_buffer *cmd, const struct mali_graphics_pipeline *p,
+               const struct mali_draw_info *di, uint32_t *count)
+{
+   const struct mali_gfx_draw_state *d = &cmd->gfx.draw;
+   const uint32_t size = d->ib.index_size;
+   if (!cmd->dev->jm->gpu_index_range || !p->vs->info.vs.idvs || di->instance_count != 1 ||
+       !size ||
+       BITSET_TEST(p->vs->fau.used_sysvals,
+                   offsetof(struct mali_graphics_sysvals, vs.raw_vertex_offset) /
+                      MALI_FAU_WORD_SIZE))
+      return false;
+   const uint64_t first = (uint64_t)di->first_index * size;
+   *count = first >= d->ib.size ? 0 : (uint32_t)MIN2(di->count, (d->ib.size - first) / size);
+   return *count <= MALI_V7_IRANGE_MAX_CHUNKS * MALI_V7_IRANGE_CHUNK;
+}
+
 static void
 draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
 {
@@ -1340,22 +1373,30 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
    memset(&dd, 0, sizeof(dd));
    dd.vertex_range = di->count;
    dd.raw_vertex_offset = di->vertex_offset;
+   const bool idvs = p->vs->info.vs.idvs;
    if (di->indexed) {
-      /* The vertex range, from the indices in the buffer at this point
-       * of recording (index_range says what that needs); a draw whose
-       * indices cannot be read here is skipped. */
-      uint32_t min, max;
-      bool empty;
-      if (!index_range(cmd, di, st->ia.primitive_restart_enable, &min, &max, &empty) || empty)
-         return;
-      dd.vertex_range = max - min + 1;
-      dd.raw_vertex_offset = (int32_t)min + di->vertex_offset;
       dd.indices = d->ib.addr + (uint64_t)di->first_index * d->ib.index_size;
+      if (gpu_range_fits(cmd, p, di, &dd.gpu_count)) {
+         /* The range comes from the GPU (mali_jm_irange_v7.c); a draw with
+          * no index in the bound range is skipped as below. */
+         if (!dd.gpu_count)
+            return;
+         dd.gpu_range = true;
+      } else {
+         /* The vertex range, from the indices in the buffer at this point
+          * of recording (index_range says what that needs); a draw whose
+          * indices cannot be read here is skipped. */
+         uint32_t min, max;
+         bool empty;
+         if (!index_range(cmd, di, st->ia.primitive_restart_enable, &min, &max, &empty) || empty)
+            return;
+         dd.vertex_range = max - min + 1;
+         dd.raw_vertex_offset = (int32_t)min + di->vertex_offset;
+      }
    }
    /* With IDVS the instances of a draw keep their positions in separate
     * cache lines: 16 bytes each, so a multiple of 4 vertices
     * (panvk_cmd_draw). */
-   const bool idvs = p->vs->info.vs.idvs;
    dd.padded_count =
       di->instance_count > 1
          ? padded_vertex_count(idvs ? ALIGN_POT(dd.vertex_range, 4) : dd.vertex_range)
@@ -1411,18 +1452,25 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
    if (!defer)
       mali_v7_link_tilers(cmd, 0);
    cmd->jm.tiler_defer = defer;
+   /* A GPU-ranged draw's Indexed Vertex job waits for the group's patch
+    * job, directly or through its vertex shader's copy jobs, which go in
+    * behind the group's jobs. */
+   uint16_t patch = 0;
+   if (dd.gpu_range &&
+       !mali_v7_irange_begin(cmd, c, DIV_ROUND_UP(dd.gpu_count, MALI_V7_IRANGE_CHUNK), &patch))
+      goto fail;
    uint16_t vs_copy = 0, fs_copy = 0, fs_ubo = 0;
    if (dd.vs_copy &&
-       !mali_v7_desc_copy(cmd, c, p->vs, &t->vs_tab, dd.vs_img_buf_offset, &vs_copy))
+       !mali_v7_desc_copy(cmd, c, p->vs, &t->vs_tab, dd.vs_img_buf_offset, patch, &vs_copy))
       goto fail;
    /* The vertex shader's uniform buffer words, which the Vertex job reads
     * from its FAU block: a copy job between the descriptor copy and it. */
-   uint16_t vs_dep = vs_copy;
+   uint16_t vs_dep = vs_copy ? vs_copy : patch;
    if (dd.vs_ubo_copy &&
-       !mali_v7_ubo_copy(cmd, c, p->vs, &cmd->gfx.desc, t->vs_fau, t->vs_fau_rec.cpu, vs_copy,
+       !mali_v7_ubo_copy(cmd, c, p->vs, &cmd->gfx.desc, t->vs_fau, t->vs_fau_rec.cpu, vs_dep,
                          &vs_dep))
       goto fail;
-   if (dd.fs_copy && !mali_v7_desc_copy(cmd, c, p->fs, &t->fs_tab, 0, &fs_copy))
+   if (dd.fs_copy && !mali_v7_desc_copy(cmd, c, p->fs, &t->fs_tab, 0, 0, &fs_copy))
       goto fail;
    /* The fragment shader's uniform buffer words, which only the fragment
     * job reads: copied by the first draw that tiles after the block was
@@ -1436,10 +1484,10 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
       t->fs_ubo_owed = false;
    }
    cmd->jm.stats.desc_copies[0] += vs_copy != 0;
-   cmd->jm.stats.ubo_copies[0] += vs_dep != vs_copy;
+   cmd->jm.stats.ubo_copies[0] += vs_dep != (vs_copy ? vs_copy : patch);
    cmd->jm.stats.desc_copies[1] += fs_copy != 0;
    cmd->jm.stats.ubo_copies[1] += fs_ubo != 0;
-   const bool job_barrier = pending && !vs_dep && (fs_copy || fs_ubo);
+   const bool job_barrier = pending && !patch && !vs_dep && (fs_copy || fs_ubo);
 
    /* The vertex shader's Draw (panvk_emit_vertex_dcd): the Vertex job's, or
     * the Indexed Vertex job's Vertex Draw. */
@@ -1537,6 +1585,38 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
       memcpy(pan_section_ptr(ij.cpu, INDEXED_VERTEX_JOB, FRAGMENT_DRAW), &dcd, sizeof(dcd));
       memcpy(pan_section_ptr(ij.cpu, INDEXED_VERTEX_JOB, VERTEX_DRAW), &vdcd, sizeof(vdcd));
       cmd->jm.stats.idvs_draws++;
+      if (dd.gpu_range) {
+         /* The header word as linked (Barrier may have been added for a
+          * pending barrier), and with the Null type for a draw the patch
+          * job finds nothing to shade in. */
+         uint32_t w4;
+         memcpy(&w4, (const uint8_t *)ij.cpu + 16, sizeof(w4));
+         struct mali_v7_irange_draw rec = {
+            .indices = dd.indices,
+            .job = ij.gpu,
+            .vary_table = dd.vary_bufs,
+            .vertex_offset = di->vertex_offset,
+            .flags = util_logbase2(d->ib.index_size) |
+                     (st->ia.primitive_restart_enable ? MALI_V7_IRANGE_RESTART : 0),
+            .w4_idvs = w4,
+            .w4_null = (w4 & ~(0x7fu << 1)) | ((uint32_t)MALI_JOB_TYPE_NULL << 1),
+         };
+         uint64_t stride = 0;
+         for (unsigned i = 0; i < MALI_V7_VARY_BUF_COUNT; i++) {
+            rec.stride[i] = t->vary_stride[i];
+            stride += t->vary_stride[i];
+         }
+         mali_v7_irange_add(cmd, &rec, dd.gpu_count);
+         /* Its varyings in the batch's varying heap, half the size of a
+          * tiler heap slot: guessed from the index count (a range is
+          * rarely wider) and counted twice into the heap estimate, which
+          * closes the batch at the next pass past half a tiler slot. */
+         mali_jm_cmd_heap_use(cmd, 2 * (uint64_t)dd.gpu_count * stride);
+         /* A run that turned the job into a Null job: an Indexed Vertex job
+          * again for the next. */
+         mali_jm_cmd_note_reset(cmd, (uint8_t *)ij.cpu + 16, &w4, sizeof(w4));
+         cmd->jm.stats.gpu_ranged++;
+      }
    } else {
       struct mali_ptr vj = mali_jm_cmd_add_job(cmd, c, MALI_JOB_TYPE_VERTEX,
                                                pan_size(COMPUTE_JOB), job_barrier, vs_dep);

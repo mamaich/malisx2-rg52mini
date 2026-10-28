@@ -139,6 +139,9 @@ struct mali_jm_batch {
    uint64_t est_heap_bytes; /* estimated tiler heap use, for batch closing */
    uint64_t heap_desc;      /* the Tiler Heap descriptor every pass of the
                                batch tiles through (0 until one tiles) */
+   uint64_t vary_counter;   /* v7: the varying heap's offset word, zeroed by a
+                               job when the batch first needs it (0: not
+                               yet); kept by a pass split, like heap_slot */
 };
 
 /*
@@ -231,6 +234,49 @@ struct mali_jm_draw_tmpl {
 #define MALI_V7_VARY_BUF_POSITION 1
 #define MALI_V7_VARY_BUF_PSIZ 2
 #define MALI_V7_VARY_BUF_COUNT 3
+
+/*
+ * Index ranges on the GPU (mali_jm_irange_v7.c): a record per draw and a
+ * chunk of up to MALI_V7_IRANGE_CHUNK indices per invocation of the scan
+ * job, in command memory; a group holds up to MALI_V7_IRANGE_MAX_DRAWS
+ * draws and MALI_V7_IRANGE_MAX_CHUNKS chunks (a bigger draw keeps the
+ * CPU's range).
+ */
+#define MALI_V7_IRANGE_CHUNK      128
+#define MALI_V7_IRANGE_MAX_DRAWS  256
+#define MALI_V7_IRANGE_MAX_CHUNKS 2048
+#define MALI_V7_IRANGE_SIZE_MASK  0x3 /* flags: log2 of the index size */
+#define MALI_V7_IRANGE_RESTART    0x4 /* flags: primitive restart on */
+
+struct mali_v7_irange_draw {
+   uint64_t indices;      /* GPU address of the draw's first index */
+   uint64_t job;          /* its Indexed Vertex job */
+   uint64_t vary_table;   /* its varying Attribute Buffers */
+   uint32_t min, max;     /* UINT32_MAX and 0, merged into by the scan */
+   int32_t vertex_offset; /* vkCmdDrawIndexed's vertexOffset */
+   uint32_t flags;        /* MALI_V7_IRANGE_* */
+   uint32_t w4_idvs;      /* the job's header word 4, as linked */
+   uint32_t w4_null;      /* ... with the Null job type */
+   uint32_t stride[MALI_V7_VARY_BUF_COUNT];
+   uint32_t pad;
+};
+
+struct mali_v7_irange_chunk {
+   uint32_t draw;  /* the record's index in the group */
+   uint32_t first; /* the chunk's first index, from the draw's first */
+   uint32_t count;
+   uint32_t pad;
+};
+
+/* The open group (scan_job set) of a command buffer. */
+struct mali_v7_irange {
+   void *scan_job, *patch_job;           /* CPU views, for their Invocation */
+   uint32_t *counts;                     /* draws, chunks: written at close */
+   struct mali_v7_irange_draw *draws;    /* CPU views of the arrays */
+   struct mali_v7_irange_chunk *chunks;
+   uint32_t ndraws, nchunks;
+   uint16_t patch_index;
+};
 
 /*
  * The v7 descriptor tables of one stage of a draw or dispatch
@@ -357,6 +403,8 @@ struct mali_jm_cmd_stats {
                                * (mali_v7_desc_refresh) */
    uint64_t desc_copies[2];   /* descriptor copy jobs */
    uint64_t idvs_draws;       /* draws as one Indexed Vertex job */
+   uint64_t gpu_ranged;       /* ... of them with the index range found on
+                               * the GPU (mali_jm_irange_v7.c) */
    uint64_t fau[2];           /* FAU blocks built */
    uint64_t fau_by_tables[2]; /* ... of them only because the tables or the
                                * dynamic buffers changed */
@@ -425,6 +473,9 @@ struct mali_jm_cmd {
     * (mali_v7_ubo_copy, mali_v7_host_ubo_run): each a struct
     * mali_v7_host_ubo and its count runs of words. */
    struct util_dynarray host_ubo;
+   /* The open group of draws whose index ranges the GPU finds
+    * (mali_jm_irange_v7.c); closed with the batch. */
+   struct mali_v7_irange irange;
 #endif
 };
 
@@ -743,14 +794,15 @@ bool mali_v7_desc_refresh(struct mali_cmd_buffer *cmd, const struct mali_shader 
  * Writes the table entries that come from the sets (the shader's copy map)
  * with a Compute job on chain c, one invocation per entry (panvk_v7
  * meta_get_copy_desc_job). *index: that job's index, the Dependency 1 of
- * the job that reads the tables; 0 when there is nothing to copy.
+ * the job that reads the tables; 0 when there is nothing to copy. The job
+ * waits for job dep (0: none).
  * attrib_buf_idx_offset: the buffer index the image Attribute descriptors
  * start at (twice the vertex binding count for a vertex shader, else 0).
  * False on failure, with the command buffer's error set.
  */
 bool mali_v7_desc_copy(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
                        const struct mali_shader *s, const struct mali_v7_desc_tables *t,
-                       uint32_t attrib_buf_idx_offset, uint16_t *index);
+                       uint32_t attrib_buf_idx_offset, uint16_t dep, uint16_t *index);
 
 /*
  * A shader's uniform buffer words in FAU (mali_shader.c lower_ubo_push): a
@@ -767,6 +819,28 @@ bool mali_v7_ubo_copy(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
 /* The copies mali_v7_ubo_copy left to the CPU: done at each submit of the
  * command buffer, after its previous run has completed. */
 void mali_v7_host_ubo_run(struct mali_cmd_buffer *cmd);
+
+/* A driver compute shader, built by build and compiled on first use into
+ * *slot (kept until the device is destroyed), and the Local Storage
+ * descriptor of a job running it (mali_jm_desc_v7.c). */
+const struct mali_shader *mali_v7_copy_shader(struct mali_cmd_buffer *cmd,
+                                              struct mali_shader **slot,
+                                              struct nir_shader *(*build)(struct mali_device *dev),
+                                              const char *name);
+uint64_t mali_v7_copy_tsd(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
+                          const uint32_t groups[3]);
+
+/* Index ranges on the GPU (mali_jm_irange_v7.c). */
+bool mali_v7_irange_begin(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
+                          uint32_t chunks, uint16_t *patch_index);
+void mali_v7_irange_add(struct mali_cmd_buffer *cmd, const struct mali_v7_irange_draw *draw,
+                        uint32_t count);
+void mali_v7_irange_close(struct mali_cmd_buffer *cmd);
+/* The varying heap of batch b's tiler heap slot: its GPU address and
+ * size. False on an allocation failure, with the command buffer's error
+ * set. */
+bool mali_jm_vary_heap(struct mali_cmd_buffer *cmd, const struct mali_jm_batch *b,
+                       uint64_t *base, uint64_t *size);
 
 /* Where mali_v7_ubo_copy would copy a shader's uniform buffer words from
  * now: for each 32-bit half of each word, the address in its dynamic
@@ -943,12 +1017,18 @@ struct mali_jm_atom_info {
 #define MALI_JM_HEAP_SLOTS 4
 #define MALI_JM_HEAP_CHUNK (2ull << 20)
 #define MALI_JM_HEAP_SLOT_SIZE (256ull << 20)
+/* The varying heap paired with each slot (mali_jm_irange_v7.c): GPU
+ * address space only, grown 2 MiB at a time as the GPU writes into it. */
+#define MALI_V7_VARY_HEAP_SIZE (128ull << 20)
 
 struct mali_jm_heap {
    simple_mtx_t lock;
    uint32_t next;           /* the slot the next batch takes */
    uint32_t slots;          /* slots in the ring (MALISX2_JM_HEAP_SLOTS) */
    struct mali_kbase_bo bo[MALI_JM_HEAP_SLOTS_MAX];
+   /* v7: the varying heap of each slot (mali_jm_vary_heap), allocated on
+    * first use. */
+   struct mali_kbase_bo vary[MALI_JM_HEAP_SLOTS_MAX];
 };
 
 #define MALI_JM_EVENTS_PER_READ 32
@@ -1021,6 +1101,11 @@ struct mali_jm_device {
    struct mali_shader *v7_desc_copy;
    /* The uniform buffer word copy shader (mali_v7_ubo_copy), the same way. */
    struct mali_shader *v7_ubo_copy;
+   /* The index range shaders (mali_jm_irange_v7.c), the same way. */
+   struct mali_shader *v7_irange_scan, *v7_irange_patch;
+   /* v7: the index ranges of draws drawn as one Indexed Vertex job are
+    * found on the GPU (MALISX2_V7_GPU_INDEX_RANGE=0: on the CPU). */
+   bool gpu_index_range;
    /* How many of mali_device::free_slabs are 1 MiB slabs for large blocks
     * (mali_jm_cmd_buffer.c); under mali_device::slab_lock. */
    unsigned free_big_slabs;

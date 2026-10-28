@@ -391,6 +391,13 @@ get_copy_shader(struct mali_cmd_buffer *cmd, struct mali_shader **slot,
    return s;
 }
 
+const struct mali_shader *
+mali_v7_copy_shader(struct mali_cmd_buffer *cmd, struct mali_shader **slot,
+                    nir_shader *(*build)(struct mali_device *dev), const char *name)
+{
+   return get_copy_shader(cmd, slot, build, name);
+}
+
 /* The Local Storage descriptor of a copy job: the same for every copy job
  * of the command buffer when the copy shader has no thread or workgroup
  * storage, so made once per command buffer. */
@@ -406,6 +413,13 @@ copy_tsd(struct mali_cmd_buffer *cmd, const struct mali_shader *copy, const uint
       cmd->jm.copy_tsd = mali_compute_tsd(cmd, copy, &tp, groups);
    }
    return cmd->jm.copy_tsd;
+}
+
+uint64_t
+mali_v7_copy_tsd(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
+                 const uint32_t groups[3])
+{
+   return copy_tsd(cmd, s, groups);
 }
 
 /*
@@ -932,6 +946,10 @@ mali_v7_desc_finish(struct mali_device *dev)
    jd->v7_desc_copy = NULL;
    MALI_PER_ARCH(shader_unref)(dev, jd->v7_ubo_copy);
    jd->v7_ubo_copy = NULL;
+   MALI_PER_ARCH(shader_unref)(dev, jd->v7_irange_scan);
+   jd->v7_irange_scan = NULL;
+   MALI_PER_ARCH(shader_unref)(dev, jd->v7_irange_patch);
+   jd->v7_irange_patch = NULL;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -977,7 +995,7 @@ host_desc_copy(const struct mali_shader *s, const struct mali_v7_desc_tables *t)
 bool
 mali_v7_desc_copy(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
                   const struct mali_shader *s, const struct mali_v7_desc_tables *t,
-                  uint32_t attrib_buf_idx_offset, uint16_t *index)
+                  uint32_t attrib_buf_idx_offset, uint16_t dep, uint16_t *index)
 {
    *index = 0;
    assert(t->shader == s);
@@ -1026,5 +1044,5 @@ mali_v7_desc_copy(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
    info.desc_copy.attrib_buf_idx_offset = attrib_buf_idx_offset;
    const uint32_t copy_count = info.desc_copy.limits[MALI_V7_DESC_TABLE_COUNT - 1];
    assert(copy_count == s->v7.map_count && copy_count > 0);
-   return add_copy_job(cmd, c, copy, &info, sizeof(info), copy_count, 0, index);
+   return add_copy_job(cmd, c, copy, &info, sizeof(info), copy_count, dep, index);
 }

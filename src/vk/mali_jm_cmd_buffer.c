@@ -462,6 +462,7 @@ mali_jm_cmd_batch_close(struct mali_cmd_buffer *cmd)
    if (!cmd->jm.open)
       return;
 #if PAN_ARCH < 9
+   mali_v7_irange_close(cmd);
    mali_v7_link_tilers(cmd, 0);
 #endif
    cmd->jm.open = false;
@@ -731,6 +732,14 @@ mali_jm_cmd_barrier(struct mali_cmd_buffer *cmd, VkPipelineStageFlags2 src_stage
          req |= REQ_FRAG_AFTER_FRAG | (flush ? REQ_FRAG_FLUSH : 0);
    }
    cmd->jm.req |= req;
+#if PAN_ARCH < 9
+   /* Index reads after this barrier must not be in a group whose scan job
+    * went into the chain before the writes it orders them after: the next
+    * GPU-ranged draw starts a new group (mali_jm_irange_v7.c). */
+   if ((src_vtc || src_frag || src_frag_xfer) &&
+       (dst_stages & VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT))
+      mali_v7_irange_close(cmd);
+#endif
 }
 
 #if PAN_ARCH < 9
@@ -917,6 +926,7 @@ cmd_clear(struct mali_cmd_buffer *cmd)
    util_dynarray_clear(&cmd->jm.reset_data);
    cmd->jm.open = false;
 #if PAN_ARCH < 9
+   memset(&cmd->jm.irange, 0, sizeof(cmd->jm.irange));
    cmd->jm.pend_tilers = 0;
    cmd->jm.tiler_defer = false;
    cmd->jm.copy_tsd = 0;

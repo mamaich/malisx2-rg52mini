@@ -56,6 +56,8 @@ mali_jm_heap_finish(struct mali_jm_device *jd)
    for (unsigned i = 0; i < jd->heap.slots; i++) {
       if (jd->heap.bo[i].size)
          mali_kbase_free(jd->kb, &jd->heap.bo[i]);
+      if (jd->heap.vary[i].size)
+         mali_kbase_free(jd->kb, &jd->heap.vary[i]);
    }
    simple_mtx_destroy(&jd->heap.lock);
 }
@@ -88,6 +90,48 @@ slot_alloc(struct mali_jm_device *jd, struct mali_kbase_bo *bo)
    }
    return true;
 }
+
+#if PAN_ARCH < 9
+/*
+ * The varying heap of a slot (mali_jm_irange_v7.c): GPU-only and growable,
+ * like the slot's tiler heap, 2 MiB committed and 2 MiB more each time
+ * the GPU writes past the committed end. The shader cores write it and
+ * the tiler reads the positions in it during the same Indexed Vertex job,
+ * so it is COHERENT_LOCAL, as command memory, where the varyings were.
+ */
+bool
+mali_jm_vary_heap(struct mali_cmd_buffer *cmd, const struct mali_jm_batch *b, uint64_t *base,
+                  uint64_t *size)
+{
+   struct mali_jm_device *jd = cmd->dev->jm;
+   struct mali_jm_heap *h = &jd->heap;
+   assert(b->heap_slot >= 0 && (unsigned)b->heap_slot < h->slots);
+   simple_mtx_lock(&h->lock);
+   struct mali_kbase_bo *bo = &h->vary[b->heap_slot];
+   if (!bo->size) {
+      const struct mali_kbase_alloc_info ai = {
+         .size = MALI_V7_VARY_HEAP_SIZE,
+         .commit_size = MALI_JM_HEAP_CHUNK,
+         .extension_pages = MALI_JM_HEAP_CHUNK / KB_PAGE_SIZE,
+         .flags = MALI_KBASE_FLAGS_DEVICE_TRANSIENT | KB_MEM_GROW_ON_GPF,
+         .mem_class = MALI_KBASE_MEM_CLASS_DEVICE_TRANSIENT,
+      };
+      if (mali_kbase_alloc(jd->kb, &ai, bo) != MALI_KBASE_SUCCESS) {
+         memset(bo, 0, sizeof(*bo));
+         mesa_loge("malisx2: a varying heap region (%llu MiB of VA) could not be allocated",
+                   (unsigned long long)(MALI_V7_VARY_HEAP_SIZE >> 20));
+      }
+   }
+   *base = bo->gpu_va;
+   *size = bo->size;
+   simple_mtx_unlock(&h->lock);
+   if (!*size) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return false;
+   }
+   return true;
+}
+#endif
 
 bool
 mali_jm_heap_take(struct mali_cmd_buffer *cmd, struct mali_jm_batch *b)
