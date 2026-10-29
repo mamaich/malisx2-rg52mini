@@ -2085,7 +2085,7 @@ fp16_pick(struct mali_device *dev, const struct mali_shader_compile_info *info,
    const bool keep = fp16_wins(hs, fs);
    if (fp16_log())
       mesa_logi("malisx2 fp16 %08x: %s; FP16 %.2f cycles %u threads %u:%u spills, "
-                "FP32 %.2f cycles %u threads %u:%u spills; alu16 %d cvt %d saved %d cost %d; "
+                "FP32 %.2f cycles %u threads %u:%u spills; saved %d cost %d; "
                 "FP16 %u tuples %.2f arith %.2f tex %.2f var %u regs, "
                 "FP32 %u tuples %.2f arith %.2f tex %.2f var %u regs; "
                 "NIR32 alu %d tex %d var %d ldst %d, NIR16 alu %d tex %d var %d ldst %d; "
@@ -2093,10 +2093,10 @@ fp16_pick(struct mali_device *dev, const struct mali_shader_compile_info *info,
                 "FP32 %u clauses %u instrs %u preloads %.2f ldst",
                 src, keep ? "FP16" : "FP32",
                 hs->cycles, hs->threads, hs->spills, hs->fills, fs->cycles, fs->threads,
-                fs->spills, fs->fills, m[0], m[1], m[2], m[3],
+                fs->spills, fs->fills, m[0], m[1],
                 hs->tuples, hs->arith, hs->t, hs->v, hs->registers_used,
                 fs->tuples, fs->arith, fs->t, fs->v, fs->registers_used,
-                m[4], m[5], m[6], m[10], m[7], m[8], m[9], m[11],
+                m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9],
                 hs->clauses, hs->instrs, hs->preloads, hs->ldst,
                 fs->clauses, fs->instrs, fs->preloads, fs->ldst);
    if (keep) {
@@ -2129,7 +2129,7 @@ MALI_PER_ARCH(shader_compile)(struct mali_device *dev,
    nir_shader *fp32_nir = fp16 && (dev->v7_fp16 == 1 || dev->v7_fp16 == 3)
                              ? nir_shader_clone(NULL, nir) : NULL;
    bool fp16_changed = false;
-   int fp16_m[12] = {0};
+   int fp16_m[10] = {0};
 #endif
 
    struct mali_shader *s = shader_alloc(dev, stage, key, sizeof(blake3_hash));
@@ -2244,27 +2244,23 @@ MALI_PER_ARCH(shader_compile)(struct mali_device *dev,
        * outputs are gathered, so 16-bit colour stores make 16-bit
        * temporaries there. */
       if (fp16 && fp16_log())
-         mali_nir_fs_fp16_shape(nir, &fp16_m[4], &fp16_m[5], &fp16_m[6], &fp16_m[10]);
+         mali_nir_fs_fp16_shape(nir, &fp16_m[2], &fp16_m[3], &fp16_m[4], &fp16_m[5]);
       if (fp16)
          NIR_PASS(fp16_changed, nir, mali_nir_fs_fp16, state);
       if (fp16_changed && fp16_log()) {
-         mali_nir_fs_fp16_shape(nir, &fp16_m[7], &fp16_m[8], &fp16_m[9], &fp16_m[11]);
-         unsigned a16, cv;
-         mali_nir_fs_fp16_worth(nir, &a16, &cv);
-         fp16_m[0] = a16;
-         fp16_m[1] = cv;
-         mali_nir_fs_fp16_estimate(nir, &fp16_m[2], &fp16_m[3]);
+         mali_nir_fs_fp16_shape(nir, &fp16_m[6], &fp16_m[7], &fp16_m[8], &fp16_m[9]);
+         mali_nir_fs_fp16_estimate(nir, &fp16_m[0], &fp16_m[1]);
       }
       /* MALISX2_V7_FP16=1: a changed shader whose FP16 build is not worth
        * it compiles from the copy without the pass instead. */
       if (fp16_changed && dev->v7_fp16 == 1) {
-         unsigned alu16, cvt;
-         const bool keep = mali_nir_fs_fp16_worth(nir, &alu16, &cvt);
+         int saved, cost;
+         const bool keep = mali_nir_fs_fp16_worth(nir, &saved, &cost);
          if (fp16_log()) {
             const uint8_t *h8 = nir->info.source_blake3;
-            mesa_logi("malisx2 fp16 %02x%02x%02x%02x: %s by the counts; %u 16-bit float "
-                      "operations, %u conversions", h8[0], h8[1], h8[2], h8[3],
-                      keep ? "FP16" : "FP32", alu16, cvt);
+            mesa_logi("malisx2 fp16 %02x%02x%02x%02x: %s by the estimate; saves %d "
+                      "instructions, %d conversions", h8[0], h8[1], h8[2], h8[3],
+                      keep ? "FP16" : "FP32", saved, cost);
          }
          if (!keep) {
             struct mali_shader_compile_info alt = *info;

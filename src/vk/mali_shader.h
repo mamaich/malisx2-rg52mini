@@ -536,8 +536,8 @@ bool mali_nir_lower_input_attachment_loads(nir_shader *nir, unsigned arch,
  * colour outputs to targets FP16 holds become 16-bit stores. */
 bool mali_nir_fs_fp16(nir_shader *nir, const struct vk_graphics_pipeline_state *state);
 /* MALISX2_V7_FP16=1: keep the FP16 build of a shader the pass changed
- * (counts of 16-bit float operations and conversions it decided on). */
-bool mali_nir_fs_fp16_worth(nir_shader *nir, unsigned *alu16, unsigned *cvt);
+ * (the estimate it decided on: instructions saved, conversions). */
+bool mali_nir_fs_fp16_worth(nir_shader *nir, int *saved, int *cost);
 /* Instructions the FP16 build should save and its conversions cost, per
  * component (MALISX2_V7_FP16_LOG). */
 void mali_nir_fs_fp16_estimate(nir_shader *nir, int *saved, int *cost);
