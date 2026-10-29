@@ -245,8 +245,16 @@ copy_read_format(const struct mali_image *img, unsigned plane)
 #if PAN_ARCH < 9
    /* v7 decompresses by the texture's format: an AFBC plane is read in its
     * own (linear) format and converted to bits in the shader. */
-   if (mali_image_is_afbc(img))
-      return f == PIPE_FORMAT_Z32_FLOAT ? PIPE_FORMAT_R8G8B8A8_UNORM : util_format_linear(f);
+   if (mali_image_is_afbc(img)) {
+      /* D32 and B8G8R8A8 planes hold R8G8B8A8 blocks, B5G6R5 ones R5G6B5
+       * blocks (v7_copy_fmt); read that way, the bits come in their
+       * stored order. */
+      if (f == PIPE_FORMAT_Z32_FLOAT || util_format_linear(f) == PIPE_FORMAT_B8G8R8A8_UNORM)
+         return PIPE_FORMAT_R8G8B8A8_UNORM;
+      if (f == PIPE_FORMAT_B5G6R5_UNORM)
+         return PIPE_FORMAT_R5G6B5_UNORM;
+      return util_format_linear(f);
+   }
 #endif
    if (f == PIPE_FORMAT_S8_UINT)
       return f;
@@ -266,6 +274,12 @@ v7_copy_fmt(const struct mali_image *img, unsigned plane)
    /* A D32 plane compresses with the 32-bit colour mode (pan_afbc.h), so
     * its blocks copy as RGBA8 (mali_image.c v7_afbc_depth). */
    case PIPE_FORMAT_Z32_FLOAT: return MALI_META_COPY_FMT_R8G8B8A8;
+   /* The BGR orders (MALISX2_V7_AFBC_FMT): a render pass stores blue in
+    * the block's first component, and a copy moves the bits as they are,
+    * in the RGB twin. */
+   case PIPE_FORMAT_B8G8R8A8_UNORM: return MALI_META_COPY_FMT_R8G8B8A8;
+   case PIPE_FORMAT_R5G6B5_UNORM:
+   case PIPE_FORMAT_B5G6R5_UNORM: return MALI_META_COPY_FMT_R5G6B5;
    default:
       /* v7_afbc_format (mali_image.c) admits no other format. */
       UNREACHABLE("no v7 AFBC copy format");

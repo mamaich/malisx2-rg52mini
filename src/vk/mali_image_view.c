@@ -451,13 +451,38 @@ pack_texture(const struct view_src *src, const unsigned char swizzle[4],
    if (src->dim == MALI_TEXTURE_DIMENSION_CUBE)
       array_size /= 6;
 
+   enum pipe_format format = src->format;
+   unsigned char swz[4];
+   memcpy(swz, swizzle, sizeof(swz));
+#if PAN_ARCH < 9
+   /* v7 decompresses AFBC only in the RGB component orders: a BGR plane
+    * (B8G8R8A8, B5G6R5) is read in its RGB twin with red and blue swapped
+    * back by the swizzle (pan_texture_afbc_reswizzle). */
+   enum pipe_format rgb = PIPE_FORMAT_NONE;
+   if (mali_image_is_afbc(image)) {
+      if (format == PIPE_FORMAT_B8G8R8A8_UNORM)
+         rgb = PIPE_FORMAT_R8G8B8A8_UNORM;
+      else if (format == PIPE_FORMAT_B8G8R8A8_SRGB)
+         rgb = PIPE_FORMAT_R8G8B8A8_SRGB;
+      else if (format == PIPE_FORMAT_B5G6R5_UNORM)
+         rgb = PIPE_FORMAT_R5G6B5_UNORM;
+   }
+   if (rgb != PIPE_FORMAT_NONE) {
+      static const unsigned char zyxw[4] = {
+         PIPE_SWIZZLE_Z, PIPE_SWIZZLE_Y, PIPE_SWIZZLE_X, PIPE_SWIZZLE_W,
+      };
+      format = rgb;
+      util_format_compose_swizzles(zyxw, swizzle, swz);
+   }
+#endif
+
    unsigned sw = 0;
    for (unsigned i = 0; i < 4; i++)
-      sw |= swizzle[i] << (3 * i);
+      sw |= swz[i] << (3 * i);
 
    pan_cast_and_pack(out, TEXTURE, cfg) {
       cfg.dimension = src->dim;
-      cfg.format = GENX(pan_format_from_pipe_format)(src->format)->hw;
+      cfg.format = GENX(pan_format_from_pipe_format)(format)->hw;
       cfg.width = e.width;
       cfg.height = e.height;
       if (src->dim == MALI_TEXTURE_DIMENSION_3D)

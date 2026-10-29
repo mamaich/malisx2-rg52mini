@@ -274,6 +274,12 @@ struct mali_device {
    /* v7: D32 depth attachments are AFBC (mali_image.c v7_can_use_afbc;
     * MALISX2_V7_AFBC_DEPTH=0 keeps them uncompressed). */
    bool v7_afbc_depth;
+   /* v7: AFBC also for images with mip levels or array layers
+    * (v7_can_use_afbc; MALISX2_V7_AFBC_LEVELS=1, off by default). */
+   bool v7_afbc_levels;
+   /* v7: AFBC also for these formats (v7_afbc_format; MALISX2_V7_AFBC_FMT,
+    * 0 by default): 1 B8G8R8A8, 2 RGB565 in both orders. */
+   unsigned v7_afbc_fmts;
    /* v7: vertex shaders are split for Index-Driven Vertex Shading and a
     * draw is one Indexed Vertex job (mali_shader.c, mali_jm_cmd_draw_v7.c;
     * MALISX2_V7_IDVS=0 keeps the Vertex and Tiler job pair). */
