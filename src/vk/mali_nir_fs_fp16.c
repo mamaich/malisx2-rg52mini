@@ -396,6 +396,130 @@ mali_nir_fs_fp16_worth(nir_shader *nir, unsigned *alu16, unsigned *cvt)
    return *alu16 >= 8 && *alu16 >= 3 * *cvt;
 }
 
+/* 16-bit operations pair up, two to an instruction (bi_vectorize_filter). */
+static uint8_t
+vectorize16(const nir_instr *instr, const void *data)
+{
+   if (instr->type != nir_instr_type_alu)
+      return 0;
+   return nir_instr_as_alu(instr)->def.bit_size == 16 ? 2 : 1;
+}
+
+/* Instructions the counted kinds of operation take in a shader. */
+static void
+fp16_count(nir_shader *nir, int *ops16, int *cvt)
+{
+   *ops16 = *cvt = 0;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_alu)
+               continue;
+            nir_alu_instr *alu = nir_instr_as_alu(instr);
+            if (alu->op == nir_op_f2f16 || alu->op == nir_op_f2fmp) {
+               const nir_instr *src = nir_def_instr(alu->src[0].src.ssa);
+               if (src->type == nir_instr_type_load_const)
+                  continue;
+               if (src->type == nir_instr_type_intrinsic) {
+                  const nir_intrinsic_op op = nir_instr_as_intrinsic(src)->intrinsic;
+                  if (op == nir_intrinsic_load_interpolated_input || op == nir_intrinsic_load_input)
+                     continue;
+               }
+               (*cvt)++;
+            } else if (alu->op == nir_op_f2f32) {
+               *cvt += alu->def.num_components;
+            } else if (alu->def.bit_size == 16 &&
+                       nir_alu_type_get_base_type(nir_op_infos[alu->op].output_type) == nir_type_float &&
+                       alu->op != nir_op_mov && !nir_op_is_vec(alu->op)) {
+               (*ops16)++;
+            }
+         }
+      }
+   }
+}
+
+/*
+ * The instructions the FP16 build should save and what its conversions
+ * cost. The shader is scalar here (Bifrost scalarizes early); the backend
+ * pairs 16-bit operations later (bi_vectorize_filter), so a copy gets the
+ * same pairing and the 16-bit operations that merged are the saving. The
+ * conversions, counted after the pairing: 32 to 16 bits one instruction
+ * per pair (V2F32_TO_V2F16), none after a varying load (fused into LD_VAR)
+ * or on a constant; 16 to 32 bits one per component (F16_TO_F32).
+ */
+void
+mali_nir_fs_fp16_estimate(nir_shader *nir, int *saved, int *cost)
+{
+   int before, cvt_before, after;
+   fp16_count(nir, &before, &cvt_before);
+   nir_shader *copy = nir_shader_clone(NULL, nir);
+   NIR_PASS(_, copy, nir_opt_vectorize, vectorize16, NULL);
+   NIR_PASS(_, copy, nir_opt_copy_prop);
+   NIR_PASS(_, copy, nir_opt_dce);
+   fp16_count(copy, &after, cost);
+   ralloc_free(copy);
+   *saved = before - after;
+}
+
+/* Whether every use of a varying load is a conversion to 16 bits, which
+ * the backend folds into a 16-bit LD_VAR. */
+static bool
+loaded_as_16(const nir_intrinsic_instr *intr)
+{
+   if (intr->def.bit_size == 16)
+      return true;
+   nir_foreach_use_including_if(use, &intr->def) {
+      if (nir_src_is_if(use))
+         return false;
+      const nir_instr *u = nir_src_use_instr(use);
+      if (u->type != nir_instr_type_alu)
+         return false;
+      const nir_op op = nir_instr_as_alu(u)->op;
+      if (op != nir_op_f2f16 && op != nir_op_f2fmp)
+         return false;
+   }
+   return true;
+}
+
+/*
+ * What bounds a fragment shader in the compiler's estimate, counted on
+ * the NIR: ALU components (not moves or vectors), texture instructions,
+ * varying components in halves (two for a 32-bit component, one for a
+ * 16-bit one), the units of bi_count_tuple_stats, and memory accesses.
+ */
+void
+mali_nir_fs_fp16_shape(nir_shader *nir, int *alu, int *tex, int *var, int *ldst)
+{
+   *alu = *tex = *var = *ldst = 0;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_tex) {
+               (*tex)++;
+            } else if (instr->type == nir_instr_type_alu) {
+               const nir_alu_instr *a = nir_instr_as_alu(instr);
+               if (a->op != nir_op_mov && !nir_op_is_vec(a->op))
+                  *alu += a->def.num_components;
+            } else if (instr->type == nir_instr_type_intrinsic) {
+               const nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               if (intr->intrinsic == nir_intrinsic_load_interpolated_input ||
+                   intr->intrinsic == nir_intrinsic_load_input)
+                  *var += intr->def.num_components * (loaded_as_16(intr) ? 1 : 2);
+               else if (intr->intrinsic == nir_intrinsic_load_ubo ||
+                        intr->intrinsic == nir_intrinsic_load_ssbo ||
+                        intr->intrinsic == nir_intrinsic_load_global ||
+                        intr->intrinsic == nir_intrinsic_load_global_constant ||
+                        intr->intrinsic == nir_intrinsic_store_ssbo ||
+                        intr->intrinsic == nir_intrinsic_store_global ||
+                        (intr->intrinsic == nir_intrinsic_load_push_constant &&
+                         !nir_src_is_const(intr->src[0])))
+                  (*ldst)++;
+            }
+         }
+      }
+   }
+}
+
 bool
 mali_nir_fs_fp16(nir_shader *nir, const struct vk_graphics_pipeline_state *state)
 {

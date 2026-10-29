@@ -538,5 +538,11 @@ bool mali_nir_fs_fp16(nir_shader *nir, const struct vk_graphics_pipeline_state *
 /* MALISX2_V7_FP16=1: keep the FP16 build of a shader the pass changed
  * (counts of 16-bit float operations and conversions it decided on). */
 bool mali_nir_fs_fp16_worth(nir_shader *nir, unsigned *alu16, unsigned *cvt);
+/* Instructions the FP16 build should save and its conversions cost, per
+ * component (MALISX2_V7_FP16_LOG). */
+void mali_nir_fs_fp16_estimate(nir_shader *nir, int *saved, int *cost);
+/* ALU components, texture instructions, varying halves and memory
+ * accesses of a fragment shader (MALISX2_V7_FP16_LOG). */
+void mali_nir_fs_fp16_shape(nir_shader *nir, int *alu, int *tex, int *var, int *ldst);
 
 #endif
