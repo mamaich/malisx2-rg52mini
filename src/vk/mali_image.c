@@ -164,7 +164,7 @@ v7_afbc_format(enum pipe_format f, bool depth)
  */
 static bool
 v7_can_use_afbc(const struct mali_image *image, const enum pipe_format *formats,
-                const VkImageCreateInfo *info, bool textures, bool depth_afbc)
+                const VkImageCreateInfo *info, bool textures, bool depth_afbc, bool levels)
 {
    const VkImageUsageFlags usage = image->vk.usage | image->vk.stencil_usage;
    const VkImageUsageFlags rt_or_tex =
@@ -191,14 +191,28 @@ v7_can_use_afbc(const struct mali_image *image, const enum pipe_format *formats,
         VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT |
         VK_IMAGE_CREATE_SPARSE_ALIASED_BIT))
       return false;
+   /* MALISX2_V7_AFBC_LEVELS=1: mip levels and array layers too, as panvk
+    * allows (Azahar's textures have mip levels). */
    if (image->vk.tiling != VK_IMAGE_TILING_OPTIMAL ||
        image->vk.image_type != VK_IMAGE_TYPE_2D || image->vk.samples != 1 ||
-       image->vk.mip_levels != 1 || image->vk.array_layers != 1)
+       (!levels && (image->vk.mip_levels != 1 || image->vk.array_layers != 1)))
       return false;
    if (external_memory(info))
       return false;
    const unsigned min = mali_afbc_min_extent(formats[0]);
    return image->vk.extent.width >= min && image->vk.extent.height >= min;
+}
+
+/* MALISX2_LOG_IMAGES=1 (mali_CreateImage). */
+static bool
+log_images(void)
+{
+   static int v = -1;
+   if (v < 0) {
+      const char *e = getenv("MALISX2_LOG_IMAGES");
+      v = e && !strcmp(e, "1");
+   }
+   return v;
 }
 
 /*
@@ -219,14 +233,14 @@ v7_can_use_afbc(const struct mali_image *image, const enum pipe_format *formats,
  */
 static uint64_t
 choose_modifier(const struct mali_image *image, const enum pipe_format *formats, unsigned arch,
-                const VkImageCreateInfo *info, bool v7_textures, bool v7_depth)
+                const VkImageCreateInfo *info, bool v7_textures, bool v7_depth, bool v7_levels)
 {
    /* A scanout buffer (a VK_KHR_display swapchain image): the kernel and
     * the GPU have to agree on the layout, and only linear (or a DRM
     * modifier the display's plane lists) qualifies. */
    if (image->wsi_scanout || image->vk.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT)
       return DRM_FORMAT_MOD_LINEAR;
-   if (arch == 7 ? v7_can_use_afbc(image, formats, info, v7_textures, v7_depth)
+   if (arch == 7 ? v7_can_use_afbc(image, formats, info, v7_textures, v7_depth, v7_levels)
                  : can_use_afbc(image, formats, arch))
       return mali_afbc_can_ytr(formats[0]) ? MALI_MOD_AFBC_YTR : MALI_MOD_AFBC;
    if (image->vk.tiling == VK_IMAGE_TILING_LINEAR ||
@@ -340,7 +354,18 @@ mali_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
    const unsigned arch = mali_device_physical(dev)->arch;
    image->vk.drm_format_mod =
       choose_modifier(image, formats, arch, pCreateInfo, dev->v7_afbc_textures,
-                      dev->v7_afbc_depth);
+                      dev->v7_afbc_depth, dev->v7_afbc_levels);
+   /* MALISX2_LOG_IMAGES=1: every image and the layout it got. */
+   if (log_images())
+      mesa_logi("malisx2 image %s %ux%ux%u, %u levels, %u layers, %u samples, usage 0x%x, "
+                "flags 0x%x, tiling %d: %s", util_format_short_name(formats[0]),
+                image->vk.extent.width, image->vk.extent.height, image->vk.extent.depth,
+                image->vk.mip_levels, image->vk.array_layers, image->vk.samples,
+                (unsigned)image->vk.usage, image->vk.create_flags, image->vk.tiling,
+                (image->vk.drm_format_mod == MALI_MOD_AFBC ||
+                 image->vk.drm_format_mod == MALI_MOD_AFBC_YTR) ? "AFBC"
+                : image->vk.drm_format_mod == DRM_FORMAT_MOD_LINEAR ? "linear"
+                                                                    : "u-interleaved");
    /* No CRC on v7 and v9 yet: the job manager cannot update the seed from the
     * GPU, and the CPU-side seed it needs is not written yet. */
    const bool crc = !mali_arch_is_jm(arch) &&
