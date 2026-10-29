@@ -1334,7 +1334,7 @@ MALI_PER_ARCH(device_init)(struct mali_device *dev)
    dev->v7_afbc_levels =
       knob_uint("MALISX2_V7_AFBC_LEVELS", "debug.malisx2.v7_afbc_levels", 0, 1, 0);
    dev->v7_afbc_fmts =
-      knob_uint("MALISX2_V7_AFBC_FMT", "debug.malisx2.v7_afbc_fmt", 0, 3, 0);
+      knob_uint("MALISX2_V7_AFBC_FMT", "debug.malisx2.v7_afbc_fmt", 0, 3, 3);
    dev->v7_idvs = knob_uint("MALISX2_V7_IDVS", "debug.malisx2.v7_idvs", 0, 1, 1);
    dev->v7_fp16 = knob_uint("MALISX2_V7_FP16", "debug.malisx2.v7_fp16", 0, 3, 0);
 #if PAN_ARCH < 9

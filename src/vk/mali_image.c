@@ -124,8 +124,9 @@ can_use_afbc(const struct mali_image *image, const enum pipe_format *formats, un
  * The plane formats v7 AFBC takes here: 8-bit UNORM R, RG and RGBA (sRGB
  * as a flag on RGBA8), whose component order the v7 texture unit accepts
  * with AFBC as it is. MALISX2_V7_AFBC_FMT adds B8G8R8A8 (1) and RGB565 in
- * both orders (2). The texture unit reads the BGR orders in their RGB twin
- * with red and blue swapped in the swizzle (mali_image_view.c
+ * both orders (2), both by default (3); 0 leaves them uncompressed. The
+ * texture unit reads the BGR orders in their RGB twin with red and blue
+ * swapped in the swizzle (mali_image_view.c
  * pack_texture, as pan_texture_afbc_reswizzle); render targets write them
  * in their own format, and copies move their blocks in the RGB twin
  * (mali_cmd_image.c v7_copy_fmt). Azahar presents through a BGRA8 frame
