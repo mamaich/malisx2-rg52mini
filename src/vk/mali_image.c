@@ -77,6 +77,8 @@ afbc_mode_on_arch(enum mali_afbc_mode mode, unsigned arch)
 {
    switch (mode) {
    case MALI_AFBC_NONE:
+   /* v7 only (v7_afbc_format). */
+   case MALI_AFBC_R5G6B5:
       return false;
    case MALI_AFBC_R16:
    case MALI_AFBC_R16G16:
@@ -107,6 +109,9 @@ can_use_afbc(const struct mali_image *image, const enum pipe_format *formats, un
        image->vk.mip_levels != 1 || image->vk.array_layers != 1)
       return false;
    for (unsigned p = 0; p < image->plane_count; p++) {
+      /* B8G8R8A8 compresses on v7 only (v7_afbc_format), as before. */
+      if (util_format_linear(formats[p]) == PIPE_FORMAT_B8G8R8A8_UNORM)
+         return false;
       const unsigned min = mali_afbc_min_extent(formats[p]);
       if (!afbc_mode_on_arch(mali_afbc_mode(formats[p]), arch) ||
           image->vk.extent.width < min || image->vk.extent.height < min)
@@ -118,13 +123,19 @@ can_use_afbc(const struct mali_image *image, const enum pipe_format *formats, un
 /*
  * The plane formats v7 AFBC takes here: 8-bit UNORM R, RG and RGBA (sRGB
  * as a flag on RGBA8), whose component order the v7 texture unit accepts
- * with AFBC as it is. pan_afbc_format at PAN_ARCH 7 accepts more (RGB565,
- * RGB5A1, RGBA4, RGB10A2, the BGR orders); those are left uncompressed
- * here. The BGR orders also need pan_texture_afbc_reswizzle, with the
- * sampler border colours swizzled to match (panvk_vX_sampler.c).
+ * with AFBC as it is. MALISX2_V7_AFBC_FMT adds B8G8R8A8 (1) and RGB565 in
+ * both orders (2). The texture unit reads the BGR orders in their RGB twin
+ * with red and blue swapped in the swizzle (mali_image_view.c
+ * pack_texture, as pan_texture_afbc_reswizzle); render targets write them
+ * in their own format, and copies move their blocks in the RGB twin
+ * (mali_cmd_image.c v7_copy_fmt). Azahar presents through a BGRA8 frame
+ * the size of the screen and keeps the 3DS screens in RGB565. Only the
+ * standard border colours are advertised, and those read the same with
+ * red and blue swapped. pan_afbc_format at PAN_ARCH 7 accepts more
+ * (RGB5A1, RGBA4, RGB10A2); those are left uncompressed here.
  */
 static bool
-v7_afbc_format(enum pipe_format f, bool depth)
+v7_afbc_format(enum pipe_format f, bool depth, unsigned fmts)
 {
    switch (f) {
    case PIPE_FORMAT_R8_UNORM:
@@ -132,6 +143,12 @@ v7_afbc_format(enum pipe_format f, bool depth)
    case PIPE_FORMAT_R8G8B8A8_UNORM:
    case PIPE_FORMAT_R8G8B8A8_SRGB:
       return true;
+   case PIPE_FORMAT_B8G8R8A8_UNORM:
+   case PIPE_FORMAT_B8G8R8A8_SRGB:
+      return fmts & 1;
+   case PIPE_FORMAT_R5G6B5_UNORM:
+   case PIPE_FORMAT_B5G6R5_UNORM:
+      return fmts & 2;
    case PIPE_FORMAT_Z32_FLOAT:
       return depth;
    default:
@@ -164,7 +181,8 @@ v7_afbc_format(enum pipe_format f, bool depth)
  */
 static bool
 v7_can_use_afbc(const struct mali_image *image, const enum pipe_format *formats,
-                const VkImageCreateInfo *info, bool textures, bool depth_afbc, bool levels)
+                const VkImageCreateInfo *info, bool textures, bool depth_afbc, bool levels,
+                unsigned fmts)
 {
    const VkImageUsageFlags usage = image->vk.usage | image->vk.stencil_usage;
    const VkImageUsageFlags rt_or_tex =
@@ -183,7 +201,7 @@ v7_can_use_afbc(const struct mali_image *image, const enum pipe_format *formats,
       return false;
    }
    if (image->plane_count != 1 || (!depth && vk_format_is_depth_or_stencil(image->vk.format)) ||
-       !v7_afbc_format(formats[0], depth))
+       !v7_afbc_format(formats[0], depth, fmts))
       return false;
    if (image->vk.create_flags &
        (VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT |
@@ -233,14 +251,16 @@ log_images(void)
  */
 static uint64_t
 choose_modifier(const struct mali_image *image, const enum pipe_format *formats, unsigned arch,
-                const VkImageCreateInfo *info, bool v7_textures, bool v7_depth, bool v7_levels)
+                const VkImageCreateInfo *info, bool v7_textures, bool v7_depth, bool v7_levels,
+                unsigned v7_fmts)
 {
    /* A scanout buffer (a VK_KHR_display swapchain image): the kernel and
     * the GPU have to agree on the layout, and only linear (or a DRM
     * modifier the display's plane lists) qualifies. */
    if (image->wsi_scanout || image->vk.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT)
       return DRM_FORMAT_MOD_LINEAR;
-   if (arch == 7 ? v7_can_use_afbc(image, formats, info, v7_textures, v7_depth, v7_levels)
+   if (arch == 7 ? v7_can_use_afbc(image, formats, info, v7_textures, v7_depth, v7_levels,
+                                   v7_fmts)
                  : can_use_afbc(image, formats, arch))
       return mali_afbc_can_ytr(formats[0]) ? MALI_MOD_AFBC_YTR : MALI_MOD_AFBC;
    if (image->vk.tiling == VK_IMAGE_TILING_LINEAR ||
@@ -354,7 +374,7 @@ mali_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
    const unsigned arch = mali_device_physical(dev)->arch;
    image->vk.drm_format_mod =
       choose_modifier(image, formats, arch, pCreateInfo, dev->v7_afbc_textures,
-                      dev->v7_afbc_depth, dev->v7_afbc_levels);
+                      dev->v7_afbc_depth, dev->v7_afbc_levels, dev->v7_afbc_fmts);
    /* MALISX2_LOG_IMAGES=1: every image and the layout it got. */
    if (log_images())
       mesa_logi("malisx2 image %s %ux%ux%u, %u levels, %u layers, %u samples, usage 0x%x, "

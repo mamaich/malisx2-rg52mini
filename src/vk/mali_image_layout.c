@@ -64,7 +64,13 @@ mali_afbc_mode(enum pipe_format format)
    case PIPE_FORMAT_R8G8B8A8_UINT:
    case PIPE_FORMAT_R8G8B8A8_SINT:
    case PIPE_FORMAT_Z32_FLOAT:
+   /* v7 only (mali_image.c v7_afbc_format): the same bytes, BGR order. */
+   case PIPE_FORMAT_B8G8R8A8_UNORM:
       return MALI_AFBC_R8G8B8A8;
+   /* v7 only, both orders. */
+   case PIPE_FORMAT_R5G6B5_UNORM:
+   case PIPE_FORMAT_B5G6R5_UNORM:
+      return MALI_AFBC_R5G6B5;
    case PIPE_FORMAT_R10G10B10A2_UNORM:
    case PIPE_FORMAT_R10G10B10A2_UINT:
       return MALI_AFBC_R10G10B10A2;

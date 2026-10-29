@@ -552,6 +552,7 @@ enum mali_meta_copy_fmt {
    MALI_META_COPY_FMT_R8,
    MALI_META_COPY_FMT_R8G8,
    MALI_META_COPY_FMT_R8G8B8A8,
+   MALI_META_COPY_FMT_R5G6B5,
    MALI_META_COPY_FMT_COUNT,
 };
 
@@ -563,6 +564,7 @@ mali_meta_copy_fmt_pipe(enum mali_meta_copy_fmt f)
    case MALI_META_COPY_FMT_R8: return PIPE_FORMAT_R8_UNORM;
    case MALI_META_COPY_FMT_R8G8: return PIPE_FORMAT_R8G8_UNORM;
    case MALI_META_COPY_FMT_R8G8B8A8: return PIPE_FORMAT_R8G8B8A8_UNORM;
+   case MALI_META_COPY_FMT_R5G6B5: return PIPE_FORMAT_R5G6B5_UNORM;
    default: return PIPE_FORMAT_NONE;
    }
 }
