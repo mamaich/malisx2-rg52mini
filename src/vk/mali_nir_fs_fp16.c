@@ -363,6 +363,39 @@ fold_tex16(nir_function_impl *impl)
    return progress;
 }
 
+/*
+ * MALISX2_V7_FP16=1: whether to keep the FP16 build, decided from the
+ * shader after the pass, with no second compile: 16-bit float operations
+ * against the conversions left between the widths. Fitted on 587 choices
+ * of the two-build comparison (MALISX2_V7_FP16=3) in God of War, Jak and
+ * Daxter, Castlevania and Super Mario 3D Land: keeping FP16 when there are
+ * at least 8 such operations and three times as many as conversions came
+ * within 1 % of the comparison's cycles in every game (God of War -7.8 %
+ * against -8.6 %, Jak -9.2 % against -9.8 %), never chose a build with
+ * fewer threads or more spills, and drops the second compile that made
+ * Castlevania's 415-pipeline preload take 17.0 s instead of 9.6 s.
+ */
+bool
+mali_nir_fs_fp16_worth(nir_shader *nir, unsigned *alu16, unsigned *cvt)
+{
+   *alu16 = *cvt = 0;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_alu)
+               continue;
+            const nir_alu_instr *alu = nir_instr_as_alu(instr);
+            if (alu->op == nir_op_f2f16 || alu->op == nir_op_f2fmp || alu->op == nir_op_f2f32)
+               (*cvt)++;
+            else if (alu->def.bit_size == 16 &&
+                     nir_alu_type_get_base_type(nir_op_infos[alu->op].output_type) == nir_type_float)
+               (*alu16)++;
+         }
+      }
+   }
+   return *alu16 >= 8 && *alu16 >= 3 * *cvt;
+}
+
 bool
 mali_nir_fs_fp16(nir_shader *nir, const struct vk_graphics_pipeline_state *state)
 {

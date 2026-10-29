@@ -535,5 +535,8 @@ bool mali_nir_lower_input_attachment_loads(nir_shader *nir, unsigned arch,
  * nothing needs 32 bits (mali_nir_fs_fp16.c). Before pan_nir_lower_fs_outputs:
  * colour outputs to targets FP16 holds become 16-bit stores. */
 bool mali_nir_fs_fp16(nir_shader *nir, const struct vk_graphics_pipeline_state *state);
+/* MALISX2_V7_FP16=1: keep the FP16 build of a shader the pass changed
+ * (counts of 16-bit float operations and conversions it decided on). */
+bool mali_nir_fs_fp16_worth(nir_shader *nir, unsigned *alu16, unsigned *cvt);
 
 #endif

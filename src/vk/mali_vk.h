@@ -280,8 +280,10 @@ struct mali_device {
    bool v7_idvs;
    /* v7: fragment shader arithmetic in FP16 where nothing needs 32 bits
     * (mali_nir_fs_fp16.c). MALISX2_V7_FP16=1: a shader the pass changes
-    * compiles both ways and the faster build is kept; 2: always the FP16
-    * build; 0 (the default): never. */
+    * keeps the FP16 build when mali_nir_fs_fp16_worth says so, else
+    * compiles without the pass, one compile either way; 2: always the
+    * FP16 build; 3: both builds compiled and the faster kept (fp16_pick);
+    * 0 (the default): never. */
    uint8_t v7_fp16;
    /* The tiler hierarchy mask to use outright (mali_jm_cmd_render.c
     * hierarchy_mask; MALISX2_JM_HIER_MASK), 0 for the rule there. */

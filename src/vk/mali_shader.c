@@ -2029,7 +2029,7 @@ MALI_PER_ARCH(shader_unref)(struct mali_device *dev, struct mali_shader *s)
 
 #if PAN_ARCH < 9
 /*
- * MALISX2_V7_FP16=1. FP16 is not faster for every shader: values needed
+ * MALISX2_V7_FP16=3. FP16 is not faster for every shader: values needed
  * at both widths cost conversions, and 16-bit and 32-bit copies live at
  * once can push a shader past 32 registers (one thread instead of two)
  * or into spilling (a God of War post-processing shader with 21 texture
@@ -2037,7 +2037,9 @@ MALI_PER_ARCH(shader_unref)(struct mali_device *dev, struct mali_shader *s)
  * pass changed also compiles without it, and the build the compiler's own
  * estimate prefers is kept: more threads, then fewer spills and fills,
  * then fewer cycles; the FP16 build only when strictly better.
- * MALISX2_V7_FP16_LOG=1 logs each choice.
+ * MALISX2_V7_FP16_LOG=1 logs each choice. MALISX2_V7_FP16=1 decides the
+ * same from the shader alone, with no second compile
+ * (mali_nir_fs_fp16_worth), which this comparison was used to fit.
  */
 static bool
 fp16_wins(const struct bifrost_stats *h, const struct bifrost_stats *f)
@@ -2109,10 +2111,12 @@ MALI_PER_ARCH(shader_compile)(struct mali_device *dev,
    *out = NULL;
 
 #if PAN_ARCH < 9
-   /* MALISX2_V7_FP16 (mali_nir_fs_fp16.c). Under 1, a copy of the shader
-    * as it came, for the 32-bit build fp16_pick compares with. */
+   /* MALISX2_V7_FP16 (mali_nir_fs_fp16.c). Under 1 and 3, a copy of the
+    * shader as it came: the build without the pass that 1 falls back to
+    * and 3 compares with (fp16_pick). */
    const bool fp16 = stage == MESA_SHADER_FRAGMENT && dev->v7_fp16 && !info->no_fp16;
-   nir_shader *fp32_nir = fp16 && dev->v7_fp16 == 1 ? nir_shader_clone(NULL, nir) : NULL;
+   nir_shader *fp32_nir = fp16 && (dev->v7_fp16 == 1 || dev->v7_fp16 == 3)
+                             ? nir_shader_clone(NULL, nir) : NULL;
    bool fp16_changed = false;
 #endif
 
@@ -2229,6 +2233,26 @@ MALI_PER_ARCH(shader_compile)(struct mali_device *dev,
        * temporaries there. */
       if (fp16)
          NIR_PASS(fp16_changed, nir, mali_nir_fs_fp16, state);
+      /* MALISX2_V7_FP16=1: a changed shader whose FP16 build is not worth
+       * it compiles from the copy without the pass instead. */
+      if (fp16_changed && dev->v7_fp16 == 1) {
+         unsigned alu16, cvt;
+         const bool keep = mali_nir_fs_fp16_worth(nir, &alu16, &cvt);
+         if (fp16_log()) {
+            const uint8_t *h8 = nir->info.source_blake3;
+            mesa_logi("malisx2 fp16 %02x%02x%02x%02x: %s by the counts; %u 16-bit float "
+                      "operations, %u conversions", h8[0], h8[1], h8[2], h8[3],
+                      keep ? "FP16" : "FP32", alu16, cvt);
+         }
+         if (!keep) {
+            struct mali_shader_compile_info alt = *info;
+            alt.nir = fp32_nir;
+            alt.no_fp16 = true;
+            ralloc_free(nir);
+            shader_destroy(dev, s);
+            return MALI_PER_ARCH(shader_compile)(dev, &alt, key, out);
+         }
+      }
 #endif
       /* "if (c) discard;" (ARMSX2's alpha and destination-alpha tests)
        * as demote_if(c): kraid emits one conditional DISCARD instead of a
@@ -2316,8 +2340,10 @@ MALI_PER_ARCH(shader_compile)(struct mali_device *dev,
 
    *out = s;
 #if PAN_ARCH < 9
-   if (fp32_nir)
+   if (fp32_nir && dev->v7_fp16 == 3)
       fp16_pick(dev, info, key, fp16_changed, fp32_nir, out);
+   else
+      ralloc_free(fp32_nir);
 #endif
    return VK_SUCCESS;
 
