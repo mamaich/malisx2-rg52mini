@@ -12,7 +12,7 @@
 | `MALISX2_V7_GPU_DESC_COPY=1` | v7: таблицы дескрипторов без images заполняет задание, а не CPU |
 | `MALISX2_V7_AFBC_TEX=0` | v7: текстуры (образы без COLOR_ATTACHMENT) без AFBC, как раньше |
 | `MALISX2_V7_AFBC_DEPTH=0` | v7: вложения глубины D32 без AFBC, как раньше |
-| `MALISX2_V7_AFBC_FMT=<0–3>` | v7: AFBC и для форматов в порядке BGR, маска: 1 — B8G8R8A8, 2 — RGB565 (R5G6B5 и B5G6R5); 0 (по умолчанию) — без них. У Azahar сжимает кадр 1280×720 и экраны 3DS |
+| `MALISX2_V7_AFBC_FMT=<0–3>` | v7: AFBC и для форматов в порядке BGR, маска: 1 — B8G8R8A8, 2 — RGB565 (R5G6B5 и B5G6R5); 3 (по умолчанию) — оба, 0 — без них, как раньше. У Azahar сжимает кадр 1280×720 и экраны 3DS, у ARMSX2 — его кадр 1280×720 |
 | `MALISX2_V7_AFBC_LEVELS=1` | v7: AFBC и для образов с mip-уровнями и слоями (опыт; на Azahar выигрыша нет) |
 | `MALISX2_LOG_IMAGES=1` | в лог — каждый созданный образ: формат, размер, уровни, слои, сэмплы, usage, флаги и раскладка (AFBC, u-interleaved, linear) |
 | `MALISX2_NO_PIPELINE_CACHE=1` | кэш конвейеров приложения не используется, каждая стадия компилируется заново — для дампов шейдеров (`BIFROST_MESA_DEBUG=shaders`, `MALISX2_MEASURE=shaders`) |
