@@ -50,13 +50,15 @@ add_languages('rust', required : true, native : true)
 rustc = meson.get_compiler('rust')
 rust = import('rust')
 
-# Mesa: branch malisx2 of github.com/bmdhacks/armsx2-turnip (upstream Mesa
-# plus our kraid changes) at this commit, checked out (or symlinked) at
-# mesa/. Only the sources are used; Mesa's own build is not run.
-mesa_commit = '2b9a7e936fd40969c650c26ed10f1a4078b8f246'
+# Mesa: branch rg52mini-ra of github.com/mamaich/armsx2-turnip-rg52mini
+# (branch malisx2 of github.com/bmdhacks/armsx2-turnip, i.e. upstream Mesa
+# plus the kraid changes, plus our compiler fixes) at this commit, checked
+# out (or symlinked) at mesa/. Only the sources are used; Mesa's own build
+# is not run.
+mesa_commit = 'f125984618a490afa0aa4a764721e501a12e825e'
 if not fs.is_dir('mesa' / 'src' / 'panfrost')
   error('''Mesa is missing. Fetch it with:
-  git init mesa && git -C mesa fetch --depth 1 https://github.com/bmdhacks/armsx2-turnip.git @0@ && git -C mesa checkout FETCH_HEAD'''.format(mesa_commit))
+  git init mesa && git -C mesa fetch --depth 1 https://github.com/mamaich/armsx2-turnip-rg52mini.git @0@ && git -C mesa checkout FETCH_HEAD'''.format(mesa_commit))
 endif
 _mesa_head = run_command('git', '-C', meson.project_source_root() / 'mesa',
                          'rev-parse', 'HEAD', check : false)

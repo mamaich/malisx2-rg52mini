@@ -25,12 +25,14 @@
 
 ## Исходники Mesa
 
-Ветка `malisx2` форка [bmdhacks/armsx2-turnip](https://github.com/bmdhacks/armsx2-turnip)
-на коммите из `meson.build` (`mesa_commit`):
+Ветка `rg52mini-ra` форка
+[mamaich/armsx2-turnip-rg52mini](https://github.com/mamaich/armsx2-turnip-rg52mini) —
+ветка `malisx2` [bmdhacks/armsx2-turnip](https://github.com/bmdhacks/armsx2-turnip) и
+наши правки компилятора — на коммите из `meson.build` (`mesa_commit`):
 
     MESA_COMMIT=$(sed -n "s/^mesa_commit = '\([0-9a-f]*\)'.*/\1/p" meson.build)
     git init mesa
-    git -C mesa fetch --depth 1 https://github.com/bmdhacks/armsx2-turnip.git "$MESA_COMMIT"
+    git -C mesa fetch --depth 1 https://github.com/mamaich/armsx2-turnip-rg52mini.git "$MESA_COMMIT"
     git -C mesa checkout FETCH_HEAD
 
 Если `mesa/` на другом коммите, `meson setup` предупредит.
