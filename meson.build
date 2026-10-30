@@ -55,7 +55,7 @@ rust = import('rust')
 # plus the kraid changes, plus our compiler fixes) at this commit, checked
 # out (or symlinked) at mesa/. Only the sources are used; Mesa's own build
 # is not run.
-mesa_commit = '0c3cb9bb0c0f2133ecf23bc73c030de9301b957b'
+mesa_commit = 'e07f62eb92d928ef8cea0a2844c26793779cd822'
 if not fs.is_dir('mesa' / 'src' / 'panfrost')
   error('''Mesa is missing. Fetch it with:
   git init mesa && git -C mesa fetch --depth 1 https://github.com/mamaich/armsx2-turnip-rg52mini.git @0@ && git -C mesa checkout FETCH_HEAD'''.format(mesa_commit))
