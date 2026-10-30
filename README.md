@@ -78,12 +78,14 @@ SETTINGS → система → VULKAN DRIVER); по умолчанию стои
 
 ## Сборка
 
-Нужны исходники Mesa в каталоге `mesa/`: ветка `malisx2` форка
-[bmdhacks/armsx2-turnip](https://github.com/bmdhacks/armsx2-turnip) на
-коммите, который закреплён в `meson.build` (`mesa_commit`):
+Нужны исходники Mesa в каталоге `mesa/`: ветка `rg52mini-ra` форка
+[mamaich/armsx2-turnip-rg52mini](https://github.com/mamaich/armsx2-turnip-rg52mini)
+(ветка `malisx2` [bmdhacks/armsx2-turnip](https://github.com/bmdhacks/armsx2-turnip)
+и наши правки компилятора) на коммите, который закреплён в `meson.build`
+(`mesa_commit`):
 
     git init mesa
-    git -C mesa fetch --depth 1 https://github.com/bmdhacks/armsx2-turnip.git <mesa_commit>
+    git -C mesa fetch --depth 1 https://github.com/mamaich/armsx2-turnip-rg52mini.git <mesa_commit>
     git -C mesa checkout FETCH_HEAD
 
 Для dArkOS (Debian trixie, arm64) драйвер собирается кросс-компиляцией
