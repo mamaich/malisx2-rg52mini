@@ -5,14 +5,18 @@
 
 #include "mali_compiler.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "compiler/glsl_types.h"
 #include "compiler/nir/nir.h"
+#include "compiler/nir/nir_serialize.h"
 #include "panfrost/compiler/kraid/kraid.h"
 #include "panfrost/model/pan_model.h"
 #include "util/bitset.h"
+#include "util/blob.h"
 #include "util/log.h"
 #include "util/u_atomic.h"
 #include "util/u_call_once.h"
@@ -198,12 +202,66 @@ mali_kraid_guard_refusals(void)
    return p_atomic_read(&guard_refusals);
 }
 
+/*
+ * MALISX2_NIR_DUMP=<dir> writes each shader pan_shader_compile() gets, with
+ * its compile inputs, to <dir>/<pid>-<n>.mxnir, so that the compiler can be
+ * rerun on the shader off the device. The file: struct mali_nir_dump, then
+ * the inputs, the model, the varying layout (if any), the shader info as
+ * the driver filled it, and nir_serialize()'s blob, each `*_size` bytes.
+ */
+struct mali_nir_dump {
+   char magic[8];
+   uint32_t inputs_size, model_size, layout_size, info_size, nir_size;
+};
+
+static void
+dump_nir(const char *dir, const nir_shader *nir,
+         const struct pan_compile_inputs *inputs, const struct pan_shader_info *info)
+{
+   static unsigned seq;
+   char path[512];
+   snprintf(path, sizeof(path), "%s/%d-%04u.mxnir", dir, (int)getpid(),
+            p_atomic_inc_return(&seq));
+
+   struct blob blob;
+   blob_init(&blob);
+   nir_serialize(&blob, nir, false);
+
+   const struct mali_nir_dump hdr = {
+      .magic = "MXNIR01",
+      .inputs_size = sizeof(*inputs),
+      .model_size = inputs->model ? sizeof(*inputs->model) : 0,
+      .layout_size = inputs->varying_layout ? sizeof(*inputs->varying_layout) : 0,
+      .info_size = sizeof(*info),
+      .nir_size = blob.size,
+   };
+   FILE *f = blob.out_of_memory ? NULL : fopen(path, "wb");
+   if (f) {
+      fwrite(&hdr, sizeof(hdr), 1, f);
+      fwrite(inputs, hdr.inputs_size, 1, f);
+      if (hdr.model_size)
+         fwrite(inputs->model, hdr.model_size, 1, f);
+      if (hdr.layout_size)
+         fwrite(inputs->varying_layout, hdr.layout_size, 1, f);
+      fwrite(info, hdr.info_size, 1, f);
+      fwrite(blob.data, blob.size, 1, f);
+      fclose(f);
+   } else {
+      mesa_loge("MALISX2_NIR_DUMP: cannot write %s", path);
+   }
+   blob_finish(&blob);
+}
+
 enum mali_compile_status
 mali_compile_nir(nir_shader *nir, struct pan_compile_inputs *inputs,
                  struct util_dynarray *binary, struct pan_shader_info *info,
                  char *why, size_t why_size)
 {
    struct kraid_guard guard = {0};
+
+   const char *dump_dir = getenv("MALISX2_NIR_DUMP");
+   if (dump_dir && *dump_dir)
+      dump_nir(dump_dir, nir, inputs, info);
 
    tls_guard = &guard;
    pan_shader_compile(nir, inputs, binary, info);
