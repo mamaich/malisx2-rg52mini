@@ -158,6 +158,9 @@ enum mali_meta_shader {
    MALI_META_COPY_1,
    MALI_META_FILL_16,
    MALI_META_FILL_4,
+   MALI_META_QUERY_COPY,  /* vkCmdCopyQueryPoolResults, one invocation per query */
+   MALI_META_QUERY_COPY_SUM, /* the same for pools whose query is a sum of
+                              * counters (v7 occlusion: one per shader core) */
    MALI_META_COUNT,
 };
 
@@ -251,9 +254,6 @@ struct mali_device {
    struct {
       uint32_t slow_waits;          /* host or submit waits over 1 s */
       uint32_t sync_file_errors;    /* sync-file import/export failures */
-      /* Occlusion query pools created, which this driver accepts without
-       * counting (mali_jm_query.c): the first one says so in the log. */
-      uint32_t occlusion_stub;
    } diag;
 
    /* Command-stream state specific to the device's frontend: struct
@@ -312,9 +312,19 @@ struct mali_device {
       uint32_t shaders_compiled;
       uint32_t shader_cache_hits;
    } pipeline_stats;
+
+   /* VkEvent words (mali_event.h), host-visible. Command-stream frontend
+    * (v11) only; set up by mali_event_pool_init. */
+   struct mali_bo_pool event_pool;
 };
 
 VK_DEFINE_HANDLE_CASTS(mali_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
+
+/* The event pool (mali_event.c, v11 only): set up after the kbase context
+ * exists, torn down before it goes. Slabs are allocated by the first
+ * event. */
+void mali_event_pool_init(struct mali_device *dev);
+void mali_event_pool_finish(struct mali_device *dev);
 
 /*
  * The job-manager back half (v7 and v9), as code built once (mali_device.c,
@@ -338,6 +348,12 @@ extern const struct vk_command_buffer_ops mali_v9_cmd_buffer_ops;
 extern const struct vk_sync_type mali_v7_sync_type;
 extern const struct vk_sync_type mali_v9_sync_type;
 extern const struct vk_sync_type mali_v11_sync_type;
+
+/* Each arch's sync types, binary first and then the timeline semaphore type
+ * wrapped around it (mali_sync.c); the physical device picks by arch. */
+const struct vk_sync_type *const *mali_v7_sync_types(void);
+const struct vk_sync_type *const *mali_v9_sync_types(void);
+const struct vk_sync_type *const *mali_v11_sync_types(void);
 
 static inline struct mali_physical_device *
 mali_device_physical(struct mali_device *dev)

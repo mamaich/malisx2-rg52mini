@@ -104,6 +104,11 @@ struct mali_gfx_baked {
    uint32_t zsd[8];               /* Depth/stencil descriptor; v7: words 4 to
                                    * 11 of the fragment Renderer State
                                    * Descriptor (pack_rsd_state) */
+   uint32_t rsd_props_oq;         /* v7 only: zsd[0], the RSD's properties
+                                   * word, with the pixel kill and ZS update
+                                   * operations chosen for draws inside an
+                                   * occlusion query. Equal to zsd[0] when
+                                   * the query changes neither. */
 
    uint8_t rt_count;
    uint8_t rt_written;            /* colour attachments the fragment shader writes */
@@ -156,6 +161,7 @@ struct mali_gfx_bind {
                                    * on v7 */
    uint32_t tiler_flags;
    uint32_t dcd0, dcd1, dcd2;
+   uint32_t dcd0_oq;              /* dcd0 for draws inside an occlusion query */
    uint32_t vary_size;            /* VARY_SIZE */
    uint32_t tls_size;
    uint32_t noperspective;        /* the fragment shader's noperspective mask */

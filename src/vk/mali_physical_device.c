@@ -93,10 +93,9 @@ driver_version_for_arch(uint32_t arch)
 #error "MALI_PAN_ARCH must be defined"
 #endif
 
-/* VkFence and binary VkSemaphore (mali_sync.c, built once per arch). */
-static const struct vk_sync_type *const mali_v11_sync_types[] = { &mali_v11_sync_type, NULL };
-static const struct vk_sync_type *const mali_v9_sync_types[] = { &mali_v9_sync_type, NULL };
-static const struct vk_sync_type *const mali_v7_sync_types[] = { &mali_v7_sync_type, NULL };
+/* VkFence and binary VkSemaphore, then the timeline semaphore type built on
+ * them (mali_sync.c, built once per arch; MALI_PER_ARCH(sync_types)() also
+ * fills in the point type both share). */
 
 void
 mali_kbase_log_to_vk(void *user, const char *msg)
@@ -163,19 +162,27 @@ v9_device_name(const struct mali_kbase_gpu_props *p, char *buf, size_t size)
 }
 
 /*
- * Arch 7 (Bifrost, job manager): product major 2 is the Mali-G52, accepted
- * at any arch minor and revision. Mesa's model table names arch minor 2
- * "G52" and 4 "G52 r1"; the two differ in tile buffer size
- * (tilebuf_budget). The other arch 7 parts (G51, G76, G31) are not
- * supported, and physical_device_create skips them.
+ * Arch 7 (Bifrost, job manager): the accepted parts are keyed by the
+ * (arch major, arch minor, product major) fields of the kbase product id.
+ * The Mali-G52 is product major 2, accepted at any arch minor and revision;
+ * Mesa's model table names arch minor 2 "G52" and 4 "G52 r1"; the two differ
+ * in tile buffer size (tilebuf_budget). The Mali-G76 measures as product id
+ * 0x7211, matching Mesa's PAN_PROD_ID(7, 2, 1), and is accepted at any
+ * revision. The other arch 7 parts (G51, G31) are not supported, and
+ * physical_device_create skips them.
  */
 static bool
 v7_device_name(const struct mali_kbase_gpu_props *p, char *buf, size_t size)
 {
-   if ((p->product_id & 0xf00f) != 0x7002)
-      return false;
-   snprintf(buf, size, "Mali-G52");
-   return true;
+   if ((p->product_id & 0xf00f) == 0x7002) {
+      snprintf(buf, size, "Mali-G52");
+      return true;
+   }
+   if ((p->product_id & 0xff0f) == 0x7201) {
+      snprintf(buf, size, "Mali-G76");
+      return true;
+   }
+   return false;
 }
 
 bool
@@ -388,6 +395,20 @@ static const struct vk_device_extension_table mali_device_extensions = {
     * descriptor set per draw; every arch shares the same descriptor-set
     * code (mali_descriptor_set.c), so this needs no per-arch gate. */
    .KHR_push_descriptor = true,
+
+   /* The timeline semaphore type is Mesa's emulated one over our binary
+    * sync (mali_sync.c), so the device runs in Mesa's emulated timeline
+    * mode. */
+   .KHR_timeline_semaphore = true,
+
+   /* Dynamic rendering, and the two extensions the Vulkan 1.1 form of it
+    * depends on. The driver implements vkCmdBeginRendering /
+    * vkCmdEndRendering on every arch; the render pass object API
+    * (vkCreateRenderPass2, vkCmdBeginRenderPass2, ...) is Mesa's common
+    * one (vk_render_pass.c), which lowers each subpass to those two. */
+   .KHR_dynamic_rendering = true,
+   .KHR_depth_stencil_resolve = true,
+   .KHR_create_renderpass2 = true,
 };
 
 static struct vk_device_extension_table
@@ -449,13 +470,15 @@ get_features(struct vk_features *f, uint32_t arch)
       .drawIndirectFirstInstance = false,
       .depthClamp = true,
       .depthBiasClamp = true,
-      /* v7 only: clip distances are varyings the fragment shader tests
-       * and discards on (mali_shader.c, "Clip distances"). The test is
-       * per pixel, at the pixel centre, so under multisampling the
-       * clipped edge is not antialiased; and with a fragment shader that
-       * forces early fragment tests, clipped fragments still write depth
-       * and stencil. */
-      .shaderClipDistance = arch == 7,
+      /* v7 and v11 (not v9): clip distances are varyings the fragment
+       * shader tests and discards on (mali_shader.c, "Clip distances").
+       * The test is per pixel, at the pixel centre, so under
+       * multisampling the clipped edge is not antialiased; and with a
+       * fragment shader that forces early fragment tests and also
+       * discards or writes memory, depth or stencil, clipped fragments
+       * still write depth and stencil. Cull distances are not
+       * supported. */
+      .shaderClipDistance = arch == 7 || arch == 11,
       .fillModeNonSolid = false,
       .depthBounds = false,
       .wideLines = false,
@@ -516,12 +539,35 @@ get_features(struct vk_features *f, uint32_t arch)
 
       /* VK_KHR_push_descriptor */
       .pushDescriptor = true,
+
+      /* VK_KHR_timeline_semaphore. The binary sync type wrapped by Mesa's
+       * vk_sync_timeline (mali_sync.c): each signalled value is a point
+       * sync the queue submits like a binary semaphore. ARMSX2 does not use
+       * it; hakuX's GPU clock is one timeline semaphore (frame completion,
+       * readbacks, slot reuse and present) and a floor feature there. */
+      .timelineSemaphore = true,
+
+      /* VK_KHR_dynamic_rendering, and the two extensions it needs below
+       * Vulkan 1.2 (KHR_depth_stencil_resolve and KHR_create_renderpass2).
+       * Begin and end rendering and the pipeline's dynamic rendering state
+       * are what malisx2 has always used (mali_fb.c); the render pass object
+       * API behind those two extensions is Mesa's common one, which lowers
+       * render passes to them (vk_render_pass.c). Advertised for hakuX,
+       * whose only rendering path on a 1.1 device is vkCmdBeginRendering
+       * and which requires all three names. */
+      .dynamicRendering = true,
    };
 }
 
+/* The sample counts we report. Rendering is single-sampled (mali_fb.c) and
+ * vkCmdResolveImage does nothing, so only 1 is offered. That is below the
+ * minimum Vulkan requires (1|4 for the framebuffer and sampledImage limits).
+ * Back to 1|4 when multisampled rendering and resolve exist. */
+#define MALI_SUPPORTED_SAMPLE_COUNTS VK_SAMPLE_COUNT_1_BIT
+
 /* Sample counts for a format of the given bytes per pixel: 1 and 4
  * samples when bytes x 512 fits the tile buffer, 8 at bytes x 1024, 16 at
- * bytes x 2048. */
+ * bytes x 2048, limited to MALI_SUPPORTED_SAMPLE_COUNTS. */
 static VkSampleCountFlags
 sample_counts(unsigned bytes_per_pixel, unsigned tilebuf_bytes)
 {
@@ -532,7 +578,7 @@ sample_counts(unsigned bytes_per_pixel, unsigned tilebuf_bytes)
       s |= VK_SAMPLE_COUNT_8_BIT;
    if (bytes_per_pixel * 2048 <= tilebuf_bytes)
       s |= VK_SAMPLE_COUNT_16_BIT;
-   return s;
+   return s & MALI_SUPPORTED_SAMPLE_COUNTS;
 }
 
 /*
@@ -766,9 +812,23 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       .maxPerSetDescriptors = UINT16_MAX,
       .maxMemoryAllocationSize = max_alloc,
 
+      /* VK_KHR_timeline_semaphore: Mesa's emulated timelines
+       * (vk_sync_timeline) keep 64-bit values with no limit on the gap. */
+      .maxTimelineSemaphoreValueDifference = UINT64_MAX,
+
       /* VK_KHR_driver_properties */
       .driverID = VK_DRIVER_ID_ARM_PROPRIETARY,
       .conformanceVersion = { 0, 0, 0, 0 },
+
+      /* VK_KHR_depth_stencil_resolve (advertised with
+       * VK_KHR_dynamic_rendering, which depends on it below Vulkan 1.2).
+       * Vulkan requires SAMPLE_ZERO in both sets; the arithmetic modes are
+       * not implemented, since rendering is single-sampled
+       * (MALI_SUPPORTED_SAMPLE_COUNTS). */
+      .supportedDepthResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT,
+      .supportedStencilResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT,
+      .independentResolveNone = false,
+      .independentResolve = false,
 
       /* VK_EXT_provoking_vertex: the hardware bit is per render pass, not
        * per pipeline (panvk reports the same). */
@@ -790,6 +850,10 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
     * 4096 16-byte entries (genxml v7.xml). Warps are 8 lanes
     * (pan_subgroup_size).
     */
+   if (p->arch_major == 11) {
+      props->maxClipDistances = MALI_V11_MAX_CLIP_DISTANCES;
+      props->maxCombinedClipAndCullDistances = MALI_V11_MAX_CLIP_DISTANCES;
+   }
    if (p->arch_major == 7) {
       props->maxClipDistances = MALI_V7_MAX_CLIP_DISTANCES;
       props->maxCombinedClipAndCullDistances = MALI_V7_MAX_CLIP_DISTANCES;
@@ -974,7 +1038,7 @@ physical_device_create(struct mali_instance *instance, const char *path,
    if (!arch_ok || !mali_device_name(&pdev->props, name, sizeof(name))) {
       mesa_logw("malisx2: skipping %s: GPU product 0x%04x (arch %u) is not "
                 "one this driver was built for (arch %u, arch 9, or the "
-                "Mali-G52 of arch 7)", path,
+                "Mali-G52 or Mali-G76 of arch 7)", path,
                 pdev->props.product_id, pdev->props.arch_major, MALI_PAN_ARCH);
       vk_free(&instance->vk.alloc, pdev);
       return VK_ERROR_INCOMPATIBLE_DRIVER;
@@ -1014,9 +1078,9 @@ physical_device_create(struct mali_instance *instance, const char *path,
    vk_physical_device_dispatch_table_from_entrypoints(
       &pdev->vk.dispatch_table, &mali_waist_physical_device_entrypoints, false);
 
-   pdev->vk.supported_sync_types = pdev->arch == 7 ? mali_v7_sync_types
-                                   : pdev->arch == 9 ? mali_v9_sync_types
-                                                     : mali_v11_sync_types;
+   pdev->vk.supported_sync_types = pdev->arch == 7 ? mali_v7_sync_types()
+                                   : pdev->arch == 9 ? mali_v9_sync_types()
+                                                     : mali_v11_sync_types();
 
    /* Compiled shaders are what pipeline caches hold. */
    pdev->vk.pipeline_cache_import_ops = pdev->arch == 7 ? mali_v7_pipeline_cache_import_ops

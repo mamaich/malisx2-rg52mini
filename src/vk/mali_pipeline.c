@@ -20,15 +20,18 @@
  *   fragment = BLAKE3("fs", stage, layout, vertex stage, the state the
  *              fragment lowering reads)
  *   compute  = BLAKE3("cs", stage, layout)
- * and on v7, for the fragment shader that only clips (clip_fs_compile),
- *   BLAKE3("mali-v7-clip-fs", the vertex shader's varying layout, the
- *          state the fragment lowering reads)
+ * and on v7 and v11, for the fragment shader that only clips
+ * (clip_fs_compile),
+ *   BLAKE3("mali-v7-clip-fs" or "mali-v11-clip-fs", the vertex shader's
+ *          varying layout, the state the fragment lowering reads)
  * "stage" is the runtime's hash of the stage create info (SPIR-V, entry
  * point, specialization, flags, robustness). The fragment shader is
  * compiled against the vertex shader's varying layout, so its key includes
- * the vertex stage. The vertex shader is not specialized on the fragment
- * shader: it reads the noperspective mask from a system value, so one
- * compiled vertex shader serves every pipeline that uses it.
+ * the vertex stage. The vertex shader is specialized on which generic
+ * varyings the fragment shader reads (strip_unused_outputs), so its key
+ * includes that mask; it reads the noperspective mask from a system value, so
+ * one compiled vertex shader serves every pipeline whose fragment shader reads
+ * the same varyings.
  */
 
 #ifndef PAN_ARCH
@@ -145,6 +148,9 @@ struct stage {
    struct mali_shader *shader;
    bool cache_hit;
    int64_t duration_ns;
+   /* Vertex stage: the generic varying slots the fragment stage reads (~0: all, for a
+    * pipeline whose fragment stage is unknown). */
+   uint64_t keep_outputs;
 };
 
 static struct vk_pipeline_cache *
@@ -160,6 +166,7 @@ stage_init(struct mali_device *dev, VkPipelineCreateFlags2KHR flags,
            struct stage *st)
 {
    memset(st, 0, sizeof(*st));
+   st->keep_outputs = ~0ull;
    st->info = info;
    vk_pipeline_robustness_state_fill(&dev->vk.robustness_state, &st->rs,
                                      pipeline_pNext, info->pNext);
@@ -318,6 +325,65 @@ stage_dump(const struct stage *st, const struct mali_shader *s)
    simple_mtx_unlock(&lock);
 }
 
+/* The varying slots a fragment shader reads, from its input variables and any lowered loads. */
+static uint64_t
+fs_input_mask(nir_shader *nir)
+{
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+   uint64_t m = nir->info.inputs_read;
+   nir_foreach_shader_in_variable(var, nir)
+      m |= BITFIELD64_RANGE(var->data.location,
+                            MAX2(glsl_count_vec4_slots(var->type, true, false), 1));
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            const nir_intrinsic_instr *i = nir_instr_as_intrinsic(instr);
+            if (i->intrinsic == nir_intrinsic_load_input ||
+                i->intrinsic == nir_intrinsic_load_interpolated_input ||
+                i->intrinsic == nir_intrinsic_load_per_vertex_input) {
+               const nir_io_semantics sem = nir_intrinsic_io_semantics(i);
+               m |= BITFIELD64_RANGE(sem.location, MAX2(sem.num_slots, 1));
+            }
+         }
+      }
+   }
+   return m;
+}
+
+/*
+ * The cross-stage dead-varying elimination panvk lacks: the generic vertex outputs
+ * (VARYING_SLOT_VAR0..31) that the fragment shader does not read become temporaries and
+ * their stores go, so the vertex shader writes, and the varying buffer holds, only what the
+ * fragment shader reads. Arm's driver does the same: hakuX's vertex shader writes nine
+ * outputs (144 bytes a vertex) and its fragment shaders read one or two; with all nine in
+ * the buffer a 224k-vertex pass took 0.25 ms longer a frame
+ * (docs/bringup/hakux-g615-gpu-2026-10-29.md).
+ */
+static void
+strip_unused_outputs(nir_shader *nir, uint64_t keep)
+{
+   bool progress = false;
+   nir_foreach_shader_out_variable_safe(var, nir) {
+      const int loc = var->data.location;
+      if (loc < VARYING_SLOT_VAR0 || loc > VARYING_SLOT_VAR31)
+         continue;
+      const unsigned slots = glsl_count_vec4_slots(var->type, false, false);
+      if (BITFIELD64_RANGE(loc, MAX2(slots, 1)) & keep)
+         continue;
+      var->data.mode = nir_var_shader_temp;
+      exec_node_remove(&var->node);
+      exec_list_push_tail(&nir->variables, &var->node);
+      progress = true;
+   }
+   if (!progress)
+      return;
+   nir_fixup_deref_modes(nir);
+   NIR_PASS(_, nir, nir_lower_global_vars_to_local);
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+}
+
 static VkResult
 stage_compile(struct mali_device *dev, struct vk_pipeline_cache *cache,
               VkPipelineCreateFlags2KHR flags, struct stage *st,
@@ -330,6 +396,8 @@ stage_compile(struct mali_device *dev, struct vk_pipeline_cache *cache,
    VkResult result = stage_to_nir(dev, flags, st);
    if (result != VK_SUCCESS)
       return result;
+   if (st->keep_outputs != ~0ull && st->nir->info.stage == MESA_SHADER_VERTEX)
+      strip_unused_outputs(st->nir, st->keep_outputs);
 
    const struct mali_shader_compile_info info = {
       .nir = st->nir,
@@ -524,6 +592,7 @@ fill_bind(struct mali_device *dev, struct mali_graphics_pipeline *p)
    bd->spd[2] = bk->fs_spd;
    bd->tiler_flags = bk->tiler_flags;
    bd->dcd0 = bk->dcd0[0];
+   bd->dcd0_oq = bk->dcd0[1];
    bd->dcd1 = bk->dcd1;
    bd->dcd2 = bk->dcd2;
    bd->vary_size = p->fs ? p->vs->info.varyings.formats.generic_size_B : 0;
@@ -615,13 +684,21 @@ fill_bind(struct mali_device *dev, struct mali_graphics_pipeline *p)
    return VK_SUCCESS;
 }
 
-#if PAN_ARCH < 9
+#if PAN_ARCH != 9
+#if PAN_ARCH == 7
+#define CLIP_FS_TAG "mali-v7-clip-fs"
+#define CLIP_FS_NAME "mali_v7_clip_fs"
+#else
+#define CLIP_FS_TAG "mali-v11-clip-fs"
+#define CLIP_FS_NAME "mali_v11_clip_fs"
+#endif
+
 /*
- * v7 clips in the fragment shader (mali_shader.c, "Clip distances"), so a
- * pipeline whose vertex shader writes clip distances and that has no
- * fragment shader gets one that only clips: an empty fragment shader, to
- * which the fragment compile adds the clip discard. Like no fragment
- * shader, it writes no colour (every colour target stays off,
+ * v7 and v11 clip in the fragment shader (mali_shader.c, "Clip
+ * distances"), so a pipeline whose vertex shader writes clip distances and
+ * that has no fragment shader gets one that only clips: an empty fragment
+ * shader, to which the fragment compile adds the clip discard. Like no
+ * fragment shader, it writes no colour (every colour target stays off,
  * mali_pipeline_state.c pack_blend); its discard makes the depth/stencil
  * update late, so a clipped fragment writes no depth or stencil.
  */
@@ -645,7 +722,7 @@ clip_fs_key(const struct mali_device *dev, const struct vk_graphics_pipeline_sta
 
    struct mesa_blake3 h;
    _mesa_blake3_init(&h);
-   _mesa_blake3_update(&h, "mali-v7-clip-fs", 15);
+   _mesa_blake3_update(&h, CLIP_FS_TAG, sizeof(CLIP_FS_TAG) - 1);
    _mesa_blake3_update(&h, &vl, sizeof(vl));
    hash_fs_state(&h, dev, state);
    _mesa_blake3_final(&h, key);
@@ -659,7 +736,7 @@ clip_fs_compile(struct mali_device *dev, struct vk_pipeline_cache *cache,
    const int64_t start = os_time_get_nano();
    nir_builder b = nir_builder_init_simple_shader(
       MESA_SHADER_FRAGMENT, MALI_PER_ARCH(shader_nir_options)(dev, MESA_SHADER_FRAGMENT),
-      "mali_v7_clip_fs");
+      CLIP_FS_NAME);
    MALI_PER_ARCH(shader_preprocess)(dev, b.shader);
 
    /* The shader reads no buffer or image. */
@@ -691,7 +768,7 @@ clip_fs_compile(struct mali_device *dev, struct vk_pipeline_cache *cache,
    st->duration_ns = os_time_get_nano() - start;
    return VK_SUCCESS;
 }
-#endif /* PAN_ARCH < 9 */
+#endif /* PAN_ARCH != 9 */
 
 static VkResult
 create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
@@ -704,7 +781,7 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
    struct vk_pipeline_cache *cache = pick_cache(dev, cache_handle);
    struct stage stages[2];
    struct stage *vs = NULL, *fs = NULL;
-#if PAN_ARCH < 9
+#if PAN_ARCH != 9
    /* The fragment shader that only clips (clip_fs_compile), if needed. */
    struct stage clip = {0};
 #endif
@@ -746,6 +823,19 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
    if (result != VK_SUCCESS)
       return result;
 
+   /* The vertex shader is specialized on which generic varyings the fragment shader reads (a
+    * vertex shader without a fragment stage writes none). The fragment stage's NIR is kept
+    * for its own compile. */
+   if (fs) {
+      result = stage_to_nir(dev, flags, fs);
+      if (result != VK_SUCCESS)
+         goto out;
+      const uint64_t reads = fs_input_mask(fs->nir);
+      vs->keep_outputs = reads ? reads : ~0ull;   /* found none: keep every output */
+   } else {
+      vs->keep_outputs = 0;
+   }
+
    /* Keys. */
    struct mesa_blake3 h;
    const uint32_t view_mask = state.mv ? state.mv->view_mask : 0;
@@ -755,6 +845,7 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
    _mesa_blake3_update(&h, vs->stage_hash, sizeof(vs->stage_hash));
    hash_layout(&h, layout);
    _mesa_blake3_update(&h, &view_mask, sizeof(view_mask));
+   _mesa_blake3_update(&h, &vs->keep_outputs, sizeof(vs->keep_outputs));
    _mesa_blake3_final(&h, vs->key);
 
    if (fs) {
@@ -788,7 +879,7 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
       if (result != VK_SUCCESS)
          goto out;
    }
-#if PAN_ARCH < 9
+#if PAN_ARCH != 9
    if (!fs && vs_writes_clip_distances(vs->shader)) {
       clip_fs_key(dev, &state, vs->shader, clip.key);
       if (!stage_lookup(dev, cache, &clip)) {
@@ -822,7 +913,7 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
       p->fs = fs->shader;
       fs->shader = NULL;
    }
-#if PAN_ARCH < 9
+#if PAN_ARCH != 9
    if (clip.shader) {
       p->fs = clip.shader;
       clip.shader = NULL;
@@ -866,7 +957,7 @@ out:
                   os_time_get_nano() - start);
    for (uint32_t i = 0; i < stage_count; i++)
       stage_finish(dev, &stages[i]);
-#if PAN_ARCH < 9
+#if PAN_ARCH != 9
    stage_finish(dev, &clip);
 #endif
    return result;

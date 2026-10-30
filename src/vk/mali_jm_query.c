@@ -4,143 +4,46 @@
  */
 
 /*
- * Queries on the job manager (v7 and v9): vkCreateQueryPool,
- * vkDestroyQueryPool, vkCmdResetQueryPool, vkCmdWriteTimestamp,
- * vkCmdBeginQuery, vkCmdEndQuery, vkGetQueryPoolResults. ARMSX2 turns
- * GPU timing on for any device whose name is not "Mali-G615", so the
- * G57 and G52 builds need these; the G615 build does not (they stay
- * waist stubs there, mali_v11_device_entrypoints never gets them -- see
- * the file comment in mali_jm.h).
+ * Query commands on the job manager (v7 and v9): vkCmdResetQueryPool,
+ * vkCmdWriteTimestamp, and the occlusion queries' vkCmdBeginQuery and
+ * vkCmdEndQuery. The pool object and the host reads are in mali_query.c.
+ * ARMSX2 turns GPU timing on for any device whose name is not
+ * "Mali-G615", so the G57 and G52 builds need the timestamp commands; the
+ * G615 build has its own (mali_cmd_query.c).
  *
- * Two query types, and only one of them counts anything. ARMSX2's third
- * use (OSD GPU stats, VK_QUERY_TYPE_PIPELINE_STATISTICS) is gated on
- * the pipelineStatisticsQuery feature, which mali_physical_device.c
- * reports false (the counters it would need are deferred), so that pool
- * is never created and is refused here.
- *
- *  - TIMESTAMP, implemented. Each query is 16 bytes of host-visible,
- *    uncached device memory: the value System Timestamp writes at +0, an
- *    Immediate 64 availability flag at +8 (our own layout; nothing reads
- *    it but our own vkGetQueryPoolResults). Both words are Write Value
- *    jobs with the header Barrier bit (the blob's own query and
- *    timestamp jobs are the same two types, same bit).
- *    mali_jm_measure_begin/end (timing_jm.c) use the identical pair for
- *    MALISX2_MEASURE's timing regions; this file does not share code
- *    with them beyond mali_jm_cmd_write_value, because a query's two
- *    jobs are not a "region" (no CSV row, no handle to end later from a
- *    different call).
- *
- *  - OCCLUSION, accepted but not counted: the pool is created,
- *    vkCmdBeginQuery and vkCmdEndQuery record nothing, and every result
- *    reads back as zero samples, available. Occlusion queries are
- *    mandatory in Vulkan with no feature bit to turn them off, and
- *    Dolphin's video backend creates a 512-entry occlusion pool at
- *    startup and throws the whole backend away if the pool is refused
- *    ("Failed to create query pool"), which is why refusing them kept
- *    Dolphin off this driver entirely. Zero samples is what Dolphin's
- *    own dummy PerfQuery reports when a backend has no query support,
- *    so a game that reads the PE performance metrics behaves as it does
- *    with PerfQueries off; a program that culls on occlusion results
- *    would draw nothing.
- *
- *    The hardware can do this properly and doing it is the next step.
- *    The Tiler job's Draw descriptor has an Occlusion query mode
- *    (Predicate or Counter) and an Occlusion address, and the Fragment
- *    job increments the counter there, per shader core -- so a pool
- *    needs one report per core id (pan_query_core_id_range; the G52 in
- *    the RG52 Mini has one core) and the CPU sums them. Counting
- *    correctly also needs: a fragment Renderer State Descriptor whose
- *    depth/stencil update is late while a query counts
- *    (mali_pipeline_state.c earlyzs_get takes writes_zs_or_oq for
- *    exactly this, and the v9 bake already keeps both variants in
- *    mali_gfx_baked::dcd0); the draw's Tiler job kept even under
- *    rasterizerDiscardEnable; the counter zeroed at vkCmdBeginQuery, for
- *    which the vtc chain is the right place (the pass's Fragment job
- *    runs after the whole vtc atom); and the availability flag written
- *    after that Fragment job, which is what writes the counter -- so
- *    that write belongs on the fragment chain at the end of the pass,
- *    not in the vtc chain, where it would run too early. panvk's
- *    jm/panvk_vX_cmd_query.c and panvk_vX_query_pool.c are the model.
+ * A query is 16 bytes of host-visible, uncached device memory: the value
+ * System Timestamp writes at +0, an Immediate 64 availability flag at +8
+ * (our own layout; nothing reads it but our own vkGetQueryPoolResults).
+ * An occlusion query on v7 has one counter per shader core ID before its
+ * availability flag (mali_query.h).
+ * Both words are Write Value jobs with the header Barrier bit (the blob's
+ * own query and timestamp jobs are the same two types, same bit).
+ * mali_jm_measure_begin/end (timing_jm.c) use the identical pair for
+ * MALISX2_MEASURE's timing regions; this file does not share code with
+ * them beyond mali_jm_cmd_write_value, because a query's two jobs are not
+ * a "region" (no CSV row, no handle to end later from a different call).
  */
 
 #include "mali_cmd_state.h"
 
 #include <string.h>
 
-#include "util/log.h"
-#include "util/os_time.h"
-#include "vk_alloc.h"
 #include "vk_log.h"
-#include "vk_query_pool.h"
 
-struct mali_query_pool {
-   struct vk_query_pool vk;
-   struct mali_kbase_bo bo; /* vk.query_count * MALI_QUERY_SLOT_SIZE bytes,
-                              * CPU+GPU read/write, uncached */
-};
+#include "mali_query.h"
 
-VK_DEFINE_NONDISP_HANDLE_CASTS(mali_query_pool, vk.base, VkQueryPool, VK_OBJECT_TYPE_QUERY_POOL)
-
-#define MALI_QUERY_SLOT_SIZE 16u /* value (+0), availability (+8) */
-
-VKAPI_ATTR VkResult VKAPI_CALL
-MALI_PER_ARCH(CreateQueryPool)(VkDevice _device, const VkQueryPoolCreateInfo *pCreateInfo,
-                               const VkAllocationCallbacks *pAllocator, VkQueryPool *pQueryPool)
+void
+MALI_PER_ARCH(cmd_query_fence)(struct mali_cmd_buffer *cmd, bool before)
 {
-   VK_FROM_HANDLE(mali_device, dev, _device);
-
-   switch (pCreateInfo->queryType) {
-   case VK_QUERY_TYPE_TIMESTAMP:
-      break;
-   case VK_QUERY_TYPE_OCCLUSION:
-      /* Accepted, never counted (file comment). Said once per device, so
-       * that a program drawing nothing because it culls on the results
-       * has a line in its log saying why. */
-      if (__atomic_fetch_add(&dev->diag.occlusion_stub, 1, __ATOMIC_RELAXED) == 0)
-         mesa_logi("malisx2: occlusion query pools are accepted but not counted: "
-                   "every result reads back as 0 samples");
-      break;
-   default:
-      return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
-                       "only timestamp and occlusion query pools are supported");
-   }
-
-   struct mali_query_pool *pool =
-      vk_query_pool_create(&dev->vk, pCreateInfo, pAllocator, sizeof(*pool));
-   if (!pool)
-      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
-
-   const struct mali_kbase_alloc_info ai = {
-      .size = (uint64_t)pCreateInfo->queryCount * MALI_QUERY_SLOT_SIZE,
-      .flags = mali_kbase_mem_same_va_policy(MALI_KBASE_FLAGS_DEVICE_UNCACHED),
-      .mem_class = MALI_KBASE_MEM_CLASS_DESCRIPTOR_POOL,
-   };
-   if (mali_kbase_alloc(dev->kbase, &ai, &pool->bo) != MALI_KBASE_SUCCESS) {
-      vk_query_pool_destroy(&dev->vk, pAllocator, &pool->vk);
-      return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
-   }
-   memset(pool->bo.cpu, 0, ai.size);
-
-   *pQueryPool = mali_query_pool_to_handle(pool);
-   return VK_SUCCESS;
-}
-
-VKAPI_ATTR void VKAPI_CALL
-MALI_PER_ARCH(DestroyQueryPool)(VkDevice _device, VkQueryPool _pool,
-                                const VkAllocationCallbacks *pAllocator)
-{
-   VK_FROM_HANDLE(mali_device, dev, _device);
-   VK_FROM_HANDLE(mali_query_pool, pool, _pool);
-   if (!pool)
-      return;
-   mali_kbase_free(dev->kbase, &pool->bo);
-   vk_query_pool_destroy(&dev->vk, pAllocator, &pool->vk);
-}
-
-static inline uint64_t
-query_addr(const struct mali_query_pool *pool, uint32_t query)
-{
-   return pool->bo.gpu_va + (uint64_t)query * MALI_QUERY_SLOT_SIZE;
+   /* The dispatches are transfers on the vtc slot. */
+   if (before)
+      mali_jm_cmd_barrier(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                          VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT,
+                          VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
+   else
+      mali_jm_cmd_barrier(cmd, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                          VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                          VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -150,20 +53,37 @@ MALI_PER_ARCH(CmdResetQueryPool)(VkCommandBuffer commandBuffer, VkQueryPool _poo
    VK_FROM_HANDLE(mali_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(mali_query_pool, pool, _pool);
 
-   /* An occlusion pool holds nothing to reset (file comment). */
-   if (pool->vk.query_type == VK_QUERY_TYPE_OCCLUSION)
+   if (!queryCount)
       return;
 
-   /* Not valid inside a render pass instance (Vulkan). */
-   struct mali_jm_chain *c = mali_jm_cmd_vtc(cmd);
-   if (!c)
-      return;
-   for (uint32_t i = 0; i < queryCount; i++) {
-      const uint64_t addr = query_addr(pool, firstQuery + i);
-      if (!mali_jm_cmd_write_value(cmd, c, MALI_WRITE_VALUE_TYPE_ZERO, addr, 0, true) ||
-          !mali_jm_cmd_write_value(cmd, c, MALI_WRITE_VALUE_TYPE_ZERO, addr + 8, 0, true))
+   /* A few queries (ARMSX2 resets two at a time): Write Value jobs, one per
+    * counter and one for the availability word. */
+   if ((uint64_t)queryCount * (pool->val_count + 1) <= 2 * MALI_QUERY_RESET_JOBS_MAX) {
+      /* Not valid inside a render pass instance (Vulkan). */
+      struct mali_jm_chain *c = mali_jm_cmd_vtc(cmd);
+      if (!c)
          return;
+      for (uint32_t i = 0; i < queryCount; i++) {
+         for (uint32_t k = 0; k < pool->val_count; k++) {
+            const uint64_t addr = mali_query_val_va(pool, firstQuery + i) + (uint64_t)k * 8;
+            if (!mali_jm_cmd_write_value(cmd, c, MALI_WRITE_VALUE_TYPE_ZERO, addr, 0, true))
+               return;
+         }
+         if (!mali_jm_cmd_write_value(cmd, c, MALI_WRITE_VALUE_TYPE_ZERO,
+                                      mali_query_avail_va(pool, firstQuery + i), 0, true))
+            return;
+      }
+      return;
    }
+
+   /* Many (a pool of thousands is reset whole): one fill over the slots
+    * (counters, availability word and padding alike: val_stride is the
+    * slot), after whatever earlier work wrote them and before whatever uses
+    * them next. */
+   MALI_PER_ARCH(cmd_query_fence)(cmd, true);
+   MALI_PER_ARCH(cmd_fill_addr)(cmd, mali_query_val_va(pool, firstQuery),
+                                (uint64_t)queryCount * pool->val_stride, 0);
+   MALI_PER_ARCH(cmd_query_fence)(cmd, false);
 }
 
 /* Which job chain a timestamp of pipelineStage waits for: the vtc chain
@@ -199,79 +119,117 @@ MALI_PER_ARCH(CmdWriteTimestamp)(VkCommandBuffer commandBuffer, VkPipelineStageF
                                 : mali_jm_cmd_frag(cmd, false);
    if (!c)
       return;
-   const uint64_t addr = query_addr(pool, query);
-   if (!mali_jm_cmd_write_value(cmd, c, MALI_WRITE_VALUE_TYPE_SYSTEM_TIMESTAMP, addr, 0, true))
+   if (!mali_jm_cmd_write_value(cmd, c, MALI_WRITE_VALUE_TYPE_SYSTEM_TIMESTAMP,
+                                mali_query_val_va(pool, query), 0, true))
       return;
-   mali_jm_cmd_write_value(cmd, c, MALI_WRITE_VALUE_TYPE_IMMEDIATE_64, addr + 8, 1, true);
+   mali_jm_cmd_write_value(cmd, c, MALI_WRITE_VALUE_TYPE_IMMEDIATE_64,
+                           mali_query_avail_va(pool, query), 1, true);
 }
 
+/* ---------------------------------------------------------------------- */
+/* Occlusion queries                                                       */
+
 /*
- * An occlusion query's begin and end, which record nothing (file
- * comment). They are entry points rather than waist stubs so that the
- * calls are not counted as skipped work: a skipped vkCmd* call means the
- * command buffer is missing something it was asked to do, and here
- * nothing is missing -- the results are zero by design. The only other
- * pool type, TIMESTAMP, is not valid on these.
+ * The hardware counts. A draw's Draw descriptor names a counter (the
+ * Occlusion pointer) and a mode (DCD Flags 0 on v9, the Draw descriptor's
+ * Occlusion Query field on v7); the fragment job adds the samples that
+ * passed to it, tile by tile, so the count is only final when the fragment
+ * jobs of every pass that drew into the query have finished. On v7 the
+ * hardware adds into the entry of the shader core that shaded the tile, so
+ * a query has one counter per core ID and its result is their sum.
+ *
+ *  - Begin: Write Value jobs zero the counters (one job each), in the open
+ *    batch's vtc chain. The batch's fragment atom starts after its vtc
+ *    atom, so the counters are zero before any fragment job can add to
+ *    them. The draws that follow carry the counters (MALI_GFX_DIRTY_OQ).
+ *  - End: the draws stop carrying them, and the availability word is set by
+ *    a Write Value job with the Barrier bit on the fragment chain, behind
+ *    the fragment jobs recorded so far: the barrier makes it start when
+ *    they are done, and it is in the same atom as they are or in a later
+ *    one of the fragment slot, which runs after them. The counters and the
+ *    availability word are in one slot (one cache line with one counter,
+ *    mali_query.h), and the cache clean at the end of the atom publishes
+ *    them all together.
+ *
+ *    When the query ends inside a render pass, the pass's fragment jobs
+ *    do not exist yet (the pass writes them when it ends), so the word is
+ *    set at the end of the pass (cmd_oq_pass_end), after them. A query
+ *    that ends outside a pass is set at once, behind the fragment jobs of
+ *    the passes it spanned.
  */
+
+void
+MALI_PER_ARCH(cmd_oq_pass_end)(struct mali_cmd_buffer *cmd)
+{
+   if (likely(!util_dynarray_num_elements(&cmd->jm.oq_done, uint64_t)))
+      return;
+   struct mali_jm_chain *c = mali_jm_cmd_frag(cmd, false);
+   if (c) {
+      util_dynarray_foreach(&cmd->jm.oq_done, uint64_t, addr) {
+         if (!mali_jm_cmd_write_value(cmd, c, MALI_WRITE_VALUE_TYPE_IMMEDIATE_64, *addr, 1, true))
+            break;
+      }
+   }
+   util_dynarray_clear(&cmd->jm.oq_done);
+}
+
 VKAPI_ATTR void VKAPI_CALL
 MALI_PER_ARCH(CmdBeginQuery)(VkCommandBuffer commandBuffer, VkQueryPool _pool, uint32_t query,
                              VkQueryControlFlags flags)
 {
+   VK_FROM_HANDLE(mali_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(mali_query_pool, pool, _pool);
+   struct mali_gfx_draw_state *d = &cmd->gfx.draw;
+
+   if (pool->vk.query_type != VK_QUERY_TYPE_OCCLUSION)
+      return;
+
+   /* The pass's vtc chain once it tiles (the batch may not close inside
+    * it), else the open batch's. */
+   const uint64_t counter = mali_query_val_va(pool, query);
+   struct mali_jm_chain *c = cmd->gfx.render.active && cmd->gfx.render.tiler
+                                ? mali_jm_cmd_pass_vtc(cmd)
+                                : mali_jm_cmd_vtc(cmd);
+   if (!c)
+      return;
+   /* No Barrier bit: nothing in the chain reads or writes the counter, and
+    * a barrier here would hold the pass's tiling back until every draw
+    * before it was done. One job per counter (one on v9, one per shader
+    * core ID on v7). */
+   for (uint32_t k = 0; k < pool->val_count; k++) {
+      if (!mali_jm_cmd_write_value(cmd, c, MALI_WRITE_VALUE_TYPE_ZERO, counter + (uint64_t)k * 8, 0,
+                                   false))
+         return;
+   }
+
+   d->oq_addr = counter;
+   d->oq_precise = flags & VK_QUERY_CONTROL_PRECISE_BIT;
+   d->dirty |= MALI_GFX_DIRTY_OQ;
 }
 
 VKAPI_ATTR void VKAPI_CALL
 MALI_PER_ARCH(CmdEndQuery)(VkCommandBuffer commandBuffer, VkQueryPool _pool, uint32_t query)
 {
-}
-
-VKAPI_ATTR VkResult VKAPI_CALL
-MALI_PER_ARCH(GetQueryPoolResults)(VkDevice _device, VkQueryPool _pool, uint32_t firstQuery,
-                                   uint32_t queryCount, size_t dataSize, void *pData,
-                                   VkDeviceSize stride, VkQueryResultFlags flags)
-{
-   VK_FROM_HANDLE(mali_device, dev, _device);
+   VK_FROM_HANDLE(mali_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(mali_query_pool, pool, _pool);
-   const uint64_t *slots = pool->bo.cpu;
-   /* An occlusion pool's results are zero and always available (file
-    * comment). Nothing writes its memory, so the wait below must not
-    * read it: the availability flag would never come up and a wait would
-    * spin to the device timeout. */
-   const bool stub = pool->vk.query_type == VK_QUERY_TYPE_OCCLUSION;
-   VkResult result = VK_SUCCESS;
+   struct mali_gfx_draw_state *d = &cmd->gfx.draw;
 
-   for (uint32_t i = 0; i < queryCount; i++) {
-      const uint32_t q = firstQuery + i;
-      uint8_t *out = (uint8_t *)pData + i * stride;
-      uint64_t avail = 1;
+   if (pool->vk.query_type != VK_QUERY_TYPE_OCCLUSION)
+      return;
 
-      while (!stub) {
-         avail = slots[(uint64_t)q * 2 + 1];
-         if (avail || !(flags & VK_QUERY_RESULT_WAIT_BIT) || !dev->jm)
-            break;
-         pthread_mutex_lock(&dev->lock);
-         mali_jm_wait_locked(dev, os_time_get_nano() + 5 * 1000 * 1000);
-         pthread_mutex_unlock(&dev->lock);
-         if (dev->lost)
-            return vk_error(dev, VK_ERROR_DEVICE_LOST);
-      }
+   d->oq_addr = 0;
+   d->dirty |= MALI_GFX_DIRTY_OQ;
 
-      if (avail || (flags & VK_QUERY_RESULT_PARTIAL_BIT)) {
-         const uint64_t value = stub ? 0 : slots[(uint64_t)q * 2];
-         if (flags & VK_QUERY_RESULT_64_BIT)
-            *(uint64_t *)out = value;
-         else
-            *(uint32_t *)out = (uint32_t)value;
-      } else {
-         result = VK_NOT_READY;
-      }
-
-      if (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) {
-         void *out_avail = out + (flags & VK_QUERY_RESULT_64_BIT ? 8 : 4);
-         if (flags & VK_QUERY_RESULT_64_BIT)
-            *(uint64_t *)out_avail = avail ? 1 : 0;
-         else
-            *(uint32_t *)out_avail = avail ? 1 : 0;
-      }
+   const uint64_t avail = mali_query_avail_va(pool, query);
+   if (cmd->gfx.render.active) {
+      uint64_t *slot = util_dynarray_grow(&cmd->jm.oq_done, uint64_t, 1);
+      if (slot)
+         *slot = avail;
+      else
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return;
    }
-   return result;
+   struct mali_jm_chain *c = mali_jm_cmd_frag(cmd, false);
+   if (c)
+      mali_jm_cmd_write_value(cmd, c, MALI_WRITE_VALUE_TYPE_IMMEDIATE_64, avail, 1, true);
 }

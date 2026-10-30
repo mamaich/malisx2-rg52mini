@@ -25,7 +25,7 @@
 
 ## Исходники Mesa
 
-Ветка `rg52mini-ra` форка
+Ветка `rg52mini-20261031` форка
 [mamaich/armsx2-turnip-rg52mini](https://github.com/mamaich/armsx2-turnip-rg52mini) —
 ветка `malisx2` [bmdhacks/armsx2-turnip](https://github.com/bmdhacks/armsx2-turnip) и
 наши правки компилятора — на коммите из `meson.build` (`mesa_commit`):

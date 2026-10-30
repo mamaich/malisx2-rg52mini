@@ -449,6 +449,11 @@ struct mali_jm_cmd {
    struct mali_measure_cmd *measure;
 
    struct mali_jm_cmd_stats stats;
+
+   /* Occlusion queries that ended inside the open render pass: the GPU
+    * addresses (uint64_t) of their availability words, set by Write Value
+    * jobs behind the pass's fragment jobs (mali_jm_query.c). */
+   struct util_dynarray oq_done;
 #if PAN_ARCH < 9
    /* Tiler jobs written and waiting to be linked into the open batch's
     * vtc chain (mali_v7_link_tilers). Each goes in behind the Vertex job
@@ -1280,6 +1285,14 @@ struct mali_sync {
 };
 
 extern const struct vk_sync_type MALI_PER_ARCH(sync_type);
+
+/* The device's sync types, binary first and then the timeline semaphore
+ * type wrapped around it (mali_sync.c): what vk_physical_device_init gets. */
+const struct vk_sync_type *const *MALI_PER_ARCH(sync_types)(void);
+
+/* Whether sync is one value of a timeline semaphore (a point sync): the
+ * queue does not consume those when it waits on them. */
+bool MALI_PER_ARCH(sync_is_timeline_point)(const struct vk_sync *sync);
 
 void MALI_PER_ARCH(sync_clear)(struct mali_sync *s);
 

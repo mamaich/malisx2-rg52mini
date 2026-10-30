@@ -109,9 +109,6 @@ can_use_afbc(const struct mali_image *image, const enum pipe_format *formats, un
        image->vk.mip_levels != 1 || image->vk.array_layers != 1)
       return false;
    for (unsigned p = 0; p < image->plane_count; p++) {
-      /* B8G8R8A8 compresses on v7 only (v7_afbc_format), as before. */
-      if (util_format_linear(formats[p]) == PIPE_FORMAT_B8G8R8A8_UNORM)
-         return false;
       const unsigned min = mali_afbc_min_extent(formats[p]);
       if (!afbc_mode_on_arch(mali_afbc_mode(formats[p]), arch) ||
           image->vk.extent.width < min || image->vk.extent.height < min)
@@ -382,7 +379,7 @@ mali_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
                 "flags 0x%x, tiling %d: %s", util_format_short_name(formats[0]),
                 image->vk.extent.width, image->vk.extent.height, image->vk.extent.depth,
                 image->vk.mip_levels, image->vk.array_layers, image->vk.samples,
-                (unsigned)image->vk.usage, image->vk.create_flags, image->vk.tiling,
+                (unsigned)image->vk.usage, (unsigned)image->vk.create_flags, image->vk.tiling,
                 (image->vk.drm_format_mod == MALI_MOD_AFBC ||
                  image->vk.drm_format_mod == MALI_MOD_AFBC_YTR) ? "AFBC"
                 : image->vk.drm_format_mod == DRM_FORMAT_MOD_LINEAR ? "linear"

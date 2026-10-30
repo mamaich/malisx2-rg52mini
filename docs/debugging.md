@@ -51,9 +51,7 @@ UBO, из-за смены сетов; сколько пересборок FAU п
 ## Сообщения, которые не означают ошибку
 
 - dmesg: «Stride 72 passed to job_submit isn't supported by the kernel»;
-- лог: «context without a JIT zone: the kernel refused MEM_JIT_INIT»;
-- лог: «occlusion query pools are accepted but not counted» — заглушка
-  occlusion-запросов (см. [decisions.md](decisions.md)).
+- лог: «context without a JIT zone: the kernel refused MEM_JIT_INIT».
 
 ## Как искать причину потери устройства
 

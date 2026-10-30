@@ -34,6 +34,7 @@
 #include "util/list.h"
 
 #include "mali_arch.h"
+#include "mali_cover.h"
 #include "mali_descriptor_set.h"
 #include "mali_pipeline.h"
 
@@ -206,6 +207,22 @@ struct mali_render_desc {
    const struct mali_render_blit *blit;
 };
 
+/*
+ * Whether a pass's depth preload may be laid out as Arm's driver does it
+ * (frame shader slot 0, mode Early ZS Always; mali_fb.c
+ * build_frame_shaders). Measured on the Mali-G57 only, where a pass that
+ * preloads colour and depth over a 2560x2112 target takes 1.7 ms instead of
+ * 3.7 ms. Other arches keep the colour-first, Intersect layout their output
+ * was checked with.
+ */
+#define MALI_PRELOAD_ZS_EARLY (PAN_ARCH == 9)
+
+/* The fewest vertices a pass has to draw for Early ZS Always (summed over its
+ * draws, instances and indices counted): a pass with little geometry is made
+ * slower by it (it preloads every tile), and most of ARMSX2's passes draw a
+ * few hundred to a few thousand vertices in one to four draws. */
+#define MALI_PRELOAD_EARLY_MIN_VERTICES 10000
+
 struct mali_render_state {
    bool active;
    /* A draw of the pass copied uniform-buffer words into a FAU block with
@@ -224,6 +241,11 @@ struct mali_render_state {
     * area leaves tiles partly covered. */
    uint32_t minx, miny, maxx, maxy;
    bool partial_tiles;
+
+   /* The part of the bounding box the pass's draws can reach (their
+    * scissor boxes), for the depth preload's frame-shader mode
+    * (mali_fb.c). Only kept where MALI_PRELOAD_ZS_EARLY. */
+   struct mali_cover cover;
 
    /* Transaction elimination: the colour target whose CRCs the pass
     * keeps (-1: none) and the low word of its CRC Clear Color without the
@@ -247,6 +269,8 @@ struct mali_render_state {
    void *tsd_cpu;
    uint32_t tls_size;               /* largest per-thread TLS of the pass */
    uint32_t draws;                  /* RUN_IDVS + RUN_FULLSCREEN in the pass */
+   /* Vertices (index counts) of the pass's draws, where MALI_PRELOAD_ZS_EARLY. */
+   uint64_t verts;
    /* Timing regions of the pass, 0 when not timed. */
    uint32_t measure_vt, measure_frag;
 };
@@ -263,12 +287,20 @@ enum mali_gfx_dirty {
    MALI_GFX_DIRTY_VIEWPORT = 1u << 7,   /* scissor box, depth clamps */
    MALI_GFX_DIRTY_INDEX    = 1u << 8,
    MALI_GFX_DIRTY_PASS     = 1u << 9,   /* TILER_CTX, TSD */
-   MALI_GFX_DIRTY_ALL      = (1u << 10) - 1,
+   MALI_GFX_DIRTY_OQ       = 1u << 10,  /* the occlusion query the draws count into */
+   MALI_GFX_DIRTY_ALL      = (1u << 11) - 1,
 };
 
 struct mali_gfx_draw_state {
    struct mali_graphics_pipeline *pipeline;
    uint32_t dirty;
+
+   /* The occlusion query active (vkCmdBeginQuery) and not ended yet: the
+    * GPU address of its counter, 0 when there is none, and whether it
+    * counts samples (VK_QUERY_CONTROL_PRECISE_BIT) or only whether any
+    * passed. Draws recorded meanwhile carry them (MALI_GFX_DIRTY_OQ). */
+   uint64_t oq_addr;
+   bool oq_precise;
 
    struct {
       uint64_t addr;

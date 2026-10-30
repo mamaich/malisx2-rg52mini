@@ -10,8 +10,9 @@
   512 occlusion-запросов и при отказе бросает весь бэкенд: «Failed to create
   query pool» → «Failed to initialize video backend!». Сами запросы Dolphin
   выдаёт, только когда игра пишет регистры счётчиков пикселей GameCube (PE
-  performance metrics, настройка PerfQueries). У malisx2 — заглушка: пул
-  создаётся, результаты 0 (`0488ddb`).
+  performance metrics, настройка PerfQueries). У malisx2 с 26.10 была
+  заглушка (пул есть, результаты 0, `0488ddb`), с 31.10 — настоящий подсчёт
+  апстрима (`db09fea`).
 - **Развёртка линий и точек в вершинном шейдере.** Без `geometryShader` и
   `wideLines` (у malisx2 их нет, Dolphin пишет «Missing both geometryShader
   and wideLines features») Dolphin рисует линию квадом из четырёх углов, а

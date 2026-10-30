@@ -14,7 +14,7 @@
 project(
   'malisx2',
   ['c', 'cpp'],
-  version : '0.2.3',
+  version : '0.3.1',
   license : 'MIT',
   meson_version : '>= 1.7.0',
   default_options : [
@@ -50,12 +50,12 @@ add_languages('rust', required : true, native : true)
 rustc = meson.get_compiler('rust')
 rust = import('rust')
 
-# Mesa: branch rg52mini-ra of github.com/mamaich/armsx2-turnip-rg52mini
+# Mesa: branch rg52mini-20261031 of github.com/mamaich/armsx2-turnip-rg52mini
 # (branch malisx2 of github.com/bmdhacks/armsx2-turnip, i.e. upstream Mesa
 # plus the kraid changes, plus our compiler fixes) at this commit, checked
 # out (or symlinked) at mesa/. Only the sources are used; Mesa's own build
 # is not run.
-mesa_commit = '17d9d334c7ae8275ab8d08bc254cd6c02d563fce'
+mesa_commit = '0c3cb9bb0c0f2133ecf23bc73c030de9301b957b'
 if not fs.is_dir('mesa' / 'src' / 'panfrost')
   error('''Mesa is missing. Fetch it with:
   git init mesa && git -C mesa fetch --depth 1 https://github.com/mamaich/armsx2-turnip-rg52mini.git @0@ && git -C mesa checkout FETCH_HEAD'''.format(mesa_commit))

@@ -488,6 +488,10 @@ struct earlyzs {
    enum mali_pixel_kill update, kill;
 };
 
+/* Arches that take the weak-early kill below. v9 only so far: measured on
+ * the Mali-G57, and not on the arches ARMSX2's output was checked on. */
+#define MALI_WEAK_KILL_WITH_LATE_UPDATE (PAN_ARCH == 9)
+
 /*
  * When depth/stencil testing and the pixel kill happen relative to the
  * shader (pan_earlyzs.c: from arch 11 the update can never be weak-early;
@@ -521,11 +525,33 @@ earlyzs_get(const struct pan_shader_info *s, bool writes_zs_or_oq,
 #define EARLY(force) \
    ((zs_always_passes && !(force)) ? MALI_PIXEL_KILL_WEAK_EARLY \
                                    : MALI_PIXEL_KILL_FORCE_EARLY)
-   return (struct earlyzs){
+   struct earlyzs ezs = {
       .update = late_update ? MALI_PIXEL_KILL_FORCE_LATE : EARLY(force_early_update),
       .kill = late_kill ? MALI_PIXEL_KILL_FORCE_LATE : EARLY(force_early_kill),
    };
 #undef EARLY
+
+#if MALI_WEAK_KILL_WITH_LATE_UPDATE
+   /*
+    * A force-early kill tests against the depth and stencil values of every
+    * older fragment of the pixel. When the update is late, those values are
+    * not final until the older fragments' shaders have run, so the early
+    * test waits for them. Weak early lets the hardware test early only when
+    * that costs no wait. Arm's driver picks it for every draw without
+    * early_fragment_tests; on a shader that discards and writes depth it
+    * is 1.1 to 1.4 times as fast as force early here.
+    *
+    * The Vulkan rules allow it: when the kill is not already late, the
+    * shader has no side effects and does not export depth or stencil, so
+    * running it for a fragment that fails the test changes nothing; the
+    * update, which does change the images, is still late. A shader with
+    * early_fragment_tests has no late update, and one that reads the
+    * depth/stencil tile buffer keeps its mode.
+    */
+   if (late_update && !late_kill && !force_early_kill && zs_read == ZS_NOT_READ)
+      ezs.kill = MALI_PIXEL_KILL_WEAK_EARLY;
+#endif
+   return ezs;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -767,9 +793,11 @@ pack_flags(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
     * v7 has no DCD flag words: their early-ZS, multisample and pixel-kill
     * state is in the fragment RSD (pack_rsd_state). dcd0 is the low half
     * of the Tiler job's Draw word 0: culling, front face and flat-shading
-    * vertex (panvk_emit_tiler_dcd), alike for both occlusion variants (no
-    * occlusion queries on v7). The per-draw instance sizes in the upper
-    * half are packed as 1 (the padded encoding has no zero) and masked off.
+    * vertex (panvk_emit_tiler_dcd), alike for both occlusion variants: a
+    * draw inside a query sets the Occlusion Query mode and pointer itself
+    * (mali_jm_cmd_draw_v7.c) and takes its early-ZS operations from
+    * rsd_props_oq. The per-draw instance sizes in the upper half are packed
+    * as 1 (the padded encoding has no zero) and masked off.
     */
    {
       const bool polygon = reduced == MESA_PRIM_TRIANGLES;
@@ -850,6 +878,22 @@ pack_flags(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
          cfg.multisample_enable = msaa;
          cfg.occlusion_query = oq ? MALI_OCCLUSION_MODE_COUNTER : MALI_OCCLUSION_MODE_DISABLED;
          cfg.alpha_to_coverage = a2c;
+         /* Allow primitive reorder: the tiler may then sort a draw's own
+          * primitives by depth, which saves shading where a draw overdraws
+          * itself. Arm's driver sets exactly this bit on its depth-tested,
+          * depth-writing draws whose destination it does not read (captured
+          * v9 draw state, 2026-10-29); the decompilation of the same choice
+          * on the G615 adds a Less/Lequal/Greater/Gequal depth function, no
+          * stencil test and no occlusion query. Nothing observes the order
+          * when no target blends against the destination and the depth test
+          * picks the winner. */
+         cfg.allow_primitive_reorder =
+            has_depth(in->rp) && dyn->ds.depth.test_enable && dyn->ds.depth.write_enable &&
+            (dyn->ds.depth.compare_op == VK_COMPARE_OP_LESS ||
+             dyn->ds.depth.compare_op == VK_COMPARE_OP_LESS_OR_EQUAL ||
+             dyn->ds.depth.compare_op == VK_COMPARE_OP_GREATER ||
+             dyn->ds.depth.compare_op == VK_COMPARE_OP_GREATER_OR_EQUAL) &&
+            !dyn->ds.stencil.test_enable && !oq && !out->any_dest_read;
          cfg.scissor_to_bounding_box = true;
 #if PAN_ARCH >= 10
          cfg.conservative_rast_mode =
@@ -956,14 +1000,38 @@ pack_flags(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
 
 #if PAN_ARCH < 9
 /*
- * v7: words 4 to 11 of the fragment Renderer State Descriptor (properties,
- * depth bias, multisample misc, stencil), packed into out->zsd as
- * panvk_draw_prepare_fs_rsd packs them at draw time. The draw overlays
- * them on the shader half (mali_rsd_v7.h); the properties word also takes
- * the shader's fields here, so it is complete.
+ * v7: the fragment shader's pixel kill and ZS update operations, for a draw
+ * outside (oq false) or inside an occlusion query. The counter counts the
+ * samples that pass the depth and stencil tests, so inside a query they are
+ * chosen as if the draw wrote depth (Mesa's gallium driver and panvk pass
+ * `writes_zs || oq` to pan_earlyzs_get; on v9 and v11 the same is the DCD
+ * Flags 0 variant for draws inside a query). That differs from the draw's
+ * own choice only for a fragment shader that can discard or writes coverage
+ * and does not force early fragment tests.
+ */
+static struct earlyzs
+rsd_earlyzs(const struct mali_gfx_pack_input *in, bool oq)
+{
+   const struct vk_dynamic_graphics_state *dyn = in->dyn;
+   const struct mali_shader *fs = in->fs;
+   const bool writes_zs = writes_depth(in) || writes_stencil(in);
+   const bool zs_read = attachment_read(fs, dyn->ial.depth_att) ||
+                        attachment_read(fs, dyn->ial.stencil_att) ||
+                        (dyn->rasterization_order_access &
+                         (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT));
+   return earlyzs_get(&fs->info, writes_zs || oq, dyn->ms.alpha_to_coverage_enable,
+                      zs_test_always_passes(in), zs_read ? ZS_READ : ZS_NOT_READ);
+}
+
+/*
+ * The state half of the fragment Renderer State Descriptor (properties,
+ * depth bias, multisample misc, stencil), as panvk_draw_prepare_fs_rsd
+ * packs it at draw time, with the early-ZS operations ezs (the fragment
+ * shader's, when there is one).
  */
 static void
-pack_rsd_state(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
+pack_rsd(const struct mali_gfx_pack_input *in, const struct mali_gfx_baked *out,
+         const struct earlyzs *ezs_in, struct mali_renderer_state_packed *rsd_out)
 {
    const struct vk_dynamic_graphics_state *dyn = in->dyn;
    const struct vk_depth_stencil_state *ds = &dyn->ds;
@@ -972,7 +1040,6 @@ pack_rsd_state(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
    const bool test_s = has_stencil(in->rp) && ds->stencil.test_enable;
    const bool test_z = has_depth(in->rp) && ds->depth.test_enable;
    const bool writes_z = writes_depth(in);
-   const bool writes_zs = writes_z || writes_stencil(in);
    const bool a2c = dyn->ms.alpha_to_coverage_enable;
    const uint8_t rt_mask = in->rp->attachments & MESA_VK_RP_ATTACHMENT_ANY_COLOR_BITS;
    const enum mesa_prim prim = vk_topology_to_mesa(dyn->ia.primitive_topology);
@@ -981,15 +1048,10 @@ pack_rsd_state(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
    /* Bresenham lines are rasterized at pixel centres. */
    const bool msaa = dyn->ms.rasterization_samples > 1 && !bresenham;
 
-   struct mali_renderer_state_packed rsd;
-   pan_pack(&rsd, RENDERER_STATE, cfg) {
+   pan_pack(rsd_out, RENDERER_STATE, cfg) {
       if (fs) {
          mali_v7_rsd_shader(&fs->info, 0, &cfg);
 
-         const bool zs_read = attachment_read(fs, dyn->ial.depth_att) ||
-                              attachment_read(fs, dyn->ial.stencil_att) ||
-                              (dyn->rasterization_order_access &
-                               (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT));
          /* Rasterization order colour access orders a draw's reads of the
           * colour attachments after the earlier fragments' writes. A draw
           * that reads none of them (no input attachment, no blending with
@@ -1009,8 +1071,7 @@ pack_rsd_state(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
          /* The hardware does the early ZS check for FPK on v7 (panvk). */
          cfg.properties.allow_forward_pixel_to_be_killed = !fs->info.writes_global;
 
-         struct earlyzs ezs = earlyzs_get(&fs->info, writes_zs, a2c, zs_test_always_passes(in),
-                                          zs_read ? ZS_READ : ZS_NOT_READ);
+         const struct earlyzs ezs = *ezs_in;
          cfg.properties.pixel_kill_operation = ezs.kill;
          cfg.properties.zs_update_operation = ezs.update;
          if (fs->fs.no_atest) {
@@ -1073,9 +1134,40 @@ pack_rsd_state(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
          cfg.stencil_back.depth_pass = stencil_op(ds->stencil.back.op.pass);
       }
    }
+}
+
+/*
+ * Words 4 to 11 of the fragment Renderer State Descriptor, packed into
+ * out->zsd. The draw overlays them on the shader half (mali_rsd_v7.h); the
+ * properties word also takes the shader's fields here, so it is complete.
+ * out->rsd_props_oq: the properties word of a draw inside an occlusion
+ * query, which differs from zsd[0] only when the early-ZS choice does
+ * (rsd_earlyzs); the other words are the same.
+ */
+static void
+pack_rsd_state(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
+{
+   const struct mali_shader *fs = in->fs;
+   struct earlyzs ezs = {0};
+   if (fs)
+      ezs = rsd_earlyzs(in, false);
+
+   struct mali_renderer_state_packed rsd;
+   pack_rsd(in, out, &ezs, &rsd);
 
    STATIC_ASSERT(sizeof(out->zsd) == MALI_V7_RSD_STATE_WORDS * sizeof(uint32_t));
    memcpy(out->zsd, &rsd.opaque[MALI_V7_RSD_STATE_WORD_FIRST], sizeof(out->zsd));
+
+   /* A second pack only for a shader a query changes something for. */
+   out->rsd_props_oq = out->zsd[0];
+   if (fs && !fs->fs.no_atest) {
+      const struct earlyzs with_oq = rsd_earlyzs(in, true);
+      if (with_oq.update != ezs.update || with_oq.kill != ezs.kill) {
+         struct mali_renderer_state_packed rsd_oq;
+         pack_rsd(in, out, &with_oq, &rsd_oq);
+         out->rsd_props_oq = rsd_oq.opaque[MALI_V7_RSD_STATE_WORD_FIRST];
+      }
+   }
 }
 #endif /* PAN_ARCH < 9 */
 
