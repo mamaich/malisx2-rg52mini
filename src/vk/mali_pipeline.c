@@ -187,6 +187,9 @@ stage_init(struct mali_device *dev, VkPipelineCreateFlags2KHR flags,
     * (ND Demo, at its first EFB draw). So a vertex shader's storage buffer
     * accesses are bounds-checked whatever the pipeline's robustness: such a
     * read returns zeros, which go out with the vertex that nothing draws.
+    * An Indexed Vertex job (IDVS) shades only the vertices the indices
+    * name, but whether a shader is split is up to the compiler
+    * (bi_should_idvs), so the check stays on every vertex shader.
     * Before the stage hash, so the cache key follows.
     */
    if (info->stage == VK_SHADER_STAGE_VERTEX_BIT &&

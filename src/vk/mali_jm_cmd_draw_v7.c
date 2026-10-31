@@ -4,11 +4,16 @@
  */
 
 /*
- * Draws on the job manager (v7): vkCmdDraw and vkCmdDrawIndexed as a
- * 192-byte Vertex job, which runs the vertex shader once per vertex of the
- * range, and a 256-byte Tiler job that depends on it, in the open batch's
- * vtc chain. There is no IDVS job: the vertex shader writes its outputs
- * into varying buffers the draw allocates (position, point size and the
+ * Draws on the job manager (v7): vkCmdDraw and vkCmdDrawIndexed in the open
+ * batch's vtc chain. When the compiler split the vertex shader into a
+ * position and a varying shader (IDVS), a draw is one Indexed Vertex job:
+ * the tiler runs the first for the vertices the indices name and the
+ * second for those of the primitives it keeps. Otherwise (a shader that
+ * writes gl_PointSize, which bi_should_idvs keeps whole, or any under
+ * MALISX2_V7_IDVS=0) it is a 192-byte Vertex job, which runs the vertex
+ * shader once per vertex of the range, and a 256-byte Tiler job that
+ * depends on it. Either way the vertex shader writes its outputs into
+ * varying buffers the draw allocates (position, point size and the
  * generic varyings, one Attribute Buffer each), and the tiler reads them
  * back.
  *
@@ -25,10 +30,12 @@
  *    dirty;
  *  - the vertex attributes and the varying buffers are rebuilt every draw,
  *    as panvk does: they depend on the vertex and instance counts;
- *  - indexed draws: Bifrost shades the vertex range [min, max] of the
- *    indices, which the jobs carry. panvk finds it on the GPU (libpan
- *    draw_helper.cl); here the CPU reads the indices from the index
- *    buffer's mapping (mali_cmd_state.c) when the draw is recorded, so they
+ *  - indexed draws: the jobs carry the vertex range [min, max] of the
+ *    indices (a Vertex job shades all of it, an Indexed Vertex job sizes
+ *    the varying buffers by it). For a one-instance Indexed Vertex draw the
+ *    GPU finds it when the pass runs (gpu_range_fits, mali_jm_irange_v7.c);
+ *    otherwise the CPU reads the indices from the index buffer's mapping
+ *    (mali_cmd_state.c) when the draw is recorded, so they
  *    must be in place by then and stay unchanged until the draw has run
  *    (index_range lists the writes it cannot see). Not supported, each
  *    logged once with the draw skipped: an index buffer without a CPU
@@ -54,7 +61,10 @@
  * whose FAU block holds uniform buffer words gets a job that copies them
  * in, also in front of the Vertex job. The Vertex job's Dependency 1 is
  * the vertex shader's last copy job, the Tiler job's Dependency 1 the
- * Vertex job and its Dependency 2 the previous tiler-side job. A pending
+ * Vertex job and its Dependency 2 the previous tiler-side job. An Indexed
+ * Vertex job is a tiler-side job in the Vertex job's place: Dependency 1
+ * the vertex shader's last copy job (or the index range group's patch
+ * job), Dependency 2 the previous tiler-side job. A pending
  * barrier goes to the draw's first job, and to the Vertex job as well
  * when that first job is a fragment shader's copy.
  */
