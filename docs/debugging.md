@@ -28,9 +28,14 @@
 
 На Android вместо переменных — свойства `debug.malisx2.measure`,
 `debug.malisx2.stats`, `debug.malisx2.jm_batch_passes`,
-`debug.malisx2.jm_heap_slots`, `debug.malisx2.v7_gpu_ubo_copy`,
-`debug.malisx2.v7_gpu_desc_copy`, `debug.malisx2.v7_fpk_roa`,
-`debug.malisx2.v7_afbc_tex`.
+`debug.malisx2.jm_heap_slots`, `debug.malisx2.jm_hier_mask`,
+`debug.malisx2.v7_gpu_ubo_copy`, `debug.malisx2.v7_gpu_desc_copy`,
+`debug.malisx2.v7_fpk_roa`, `debug.malisx2.v7_afbc_tex`,
+`debug.malisx2.v7_afbc_depth`, `debug.malisx2.v7_afbc_levels`,
+`debug.malisx2.v7_afbc_fmt`, `debug.malisx2.v7_idvs`, `debug.malisx2.v7_fp16`,
+`debug.malisx2.v7_gpu_index_range`. Остальные ручки (`MALISX2_V7_FP16_LOG`,
+`MALISX2_LOG_IMAGES`, `MALISX2_NO_PIPELINE_CACHE`, `MALISX2_NIR_DUMP`) — только
+переменные окружения.
 
 Чтобы понять, **почему** таблицы и FAU пересобираются, вне репозитория
 хранится временная отладка `debug-v7-why.patch` (накладывается поверх

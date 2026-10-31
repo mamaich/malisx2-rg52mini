@@ -7,13 +7,13 @@
 ## Что нужно
 
 - исходники Mesa в `mesa/` (ниже);
-- **meson не старше 1.12**: meson 1.7.0 из Debian trixie падает на Rust-крейте,
+- **meson 1.12 и новее**: meson 1.7.0 из Debian trixie падает на Rust-крейте,
   который Mesa собирает из сгенерированных исходников («'CustomTargetIndex'
   object has no attribute 'subdir'»); 1.12.1 собирает. Его можно запускать
   прямо из распакованного архива (`python3 meson.py`) или поставить в venv;
 - ninja;
 - clang и lld 19, llvm 19 (`llvm-ar`, `llvm-strip`, `llvm-profdata`);
-- rustc не старше 1.85; bindgen не младше 0.71.1, но не 0.72.0, 0.73.0 и
+- rustc 1.85 и новее; bindgen 0.71.1 и новее, но не 0.72.0, 0.73.0 и
   0.73.1; с libclang 22 bindgen 0.71.x даёт сломанные привязки — тогда 0.72.1.
   Rust нужен для kraid (компилятора Valhall): G52 он не нужен, но без него
   Mesa не собирается;

@@ -45,7 +45,8 @@ Anbernic RG52 Mini в прошивке [dArkOS](https://github.com/mamaich/dArkO
 
 В dArkOS malisx2 — второй драйвер рядом со штатным libmali. Он выбирается
 для каждой программы и для каждой системы EmulationStation (EMULATOR
-SETTINGS → система → VULKAN DRIVER); по умолчанию стоит libmali. Выбор есть у
+SETTINGS → система → VULKAN DRIVER); по умолчанию стоит libmali, кроме
+ARMSX2: с dArkOS 1.4 он идёт на malisx2. Выбор есть у
 систем, эмуляторы которых рисуют через Vulkan:
 
 | система | эмулятор |
@@ -95,8 +96,8 @@ clang и lld 19 с sysroot arm64:
     ninja -C build
 
 Результат: `build/src/libvulkan_malisx2.so`. Это быстрая сборка для отладки;
-образ dArkOS собирается с **LTO и PGO**, и у этого есть нюансы (meson не
-старше 1.12, профиль PGO привязан к пути дерева `/home/ark/malisx2`, флаги
+образ dArkOS собирается с **LTO и PGO**, и у этого есть нюансы (meson 1.12 и
+новее, профиль PGO привязан к пути дерева `/home/ark/malisx2`, флаги
 `-fprofile-use` нужны и при линковке, снятие профиля на устройстве). Всё
 это, пример кросс-файла и требования к инструментам — в
 [docs/building.md](docs/building.md).

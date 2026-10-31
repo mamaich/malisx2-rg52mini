@@ -71,7 +71,8 @@ Daxter (вступление).
   (God of War — 0,48 вызова на отрисовку). Раньше malisx2 пересобирал на это
   FAU обеих стадий; теперь — только вершинной (`3896846`). Шейдеры развёртки
   читают storage-буфер, поэтому на них действует проверка границ из
-  `80994d9`; её цена по замеру сессии dArkOS — в пределах шума.
+  `80994d9`; её цена по замеру сессии dArkOS (26.10, Jak and Daxter и God of
+  War, по 3 круга) — в пределах шума.
 - **Смены пайплайна — главный источник лишних заданий** (`MALISX2_STATS` и
   отладка «why», 26.10.2026). God of War меняет пайплайн на 88 % отрисовок,
   Jak and Daxter — на 29 %. Фрагментный шейдер при этом меняется всегда, но у
@@ -87,13 +88,15 @@ Daxter (вступление).
 ## Azahar (3DS)
 
 В dArkOS — ядро RetroArch `azahar_libretro`. Тестовые игры: Castlevania Mirror
-of Fate, Luigi's Mansion, Super Mario 3D Land.
+of Fate, Luigi's Mansion, Luigi's Mansion 2, Super Mario 3D Land.
 
 - **Компиляция пайплайнов** — главное преимущество malisx2: Luigi's Mansion,
   390 пайплайнов за 3,8 с против 24–25 с у libmali (замер сессии dArkOS,
   25.10.2026). Первый запуск игр почти не подтормаживает.
 - **Отрисовка медленнее libmali:** Castlevania — 64 мс на кадр против 50
-  (разбор по слотам — в [plans.md](plans.md)). Профиль PGO для образа
+  (25.10; разбор по слотам — в [plans.md](plans.md)), на 31.10 — около 56 мс
+  (17,8 к/с) против 47–51 (19,7–21,1 к/с). Luigi's Mansion 2 — 3,5–3,9 к/с
+  против 11,8–12,6. Профиль PGO для образа
   снимается на Super Mario 3D Land и Luigi's Mansion; Castlevania в
   тренировку не входит, на ней меряют результат.
 - **Память:** пик RetroArch 1067 МБ против 1132 на libmali.
@@ -101,4 +104,9 @@ of Fate, Luigi's Mansion, Super Mario 3D Land.
 ## Остальные
 
 PPSSPP, DuckStation/SwanStation, Flycast и порты на malisx2 систематически не
-проверялись — это в [plans.md](plans.md).
+проверялись — это в [plans.md](plans.md). Проверка сессии dArkOS на `4c91f3c`
+(31.10): PPSSPP — 60 к/с, Flycast — 60 (KOV7 — 30, как раньше), ошибок GPU нет.
+**RetroArch с ядром DuckStation** на видеодрайвере Vulkan падает (SIGSEGV)
+до первого кадра — и на `da1e3a2`, на libmali работает; разбирается. По
+умолчанию RetroArch рисует через GL, так что задевает только тех, кто сам
+переключил его на Vulkan.
