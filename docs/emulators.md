@@ -106,7 +106,8 @@ of Fate, Luigi's Mansion, Luigi's Mansion 2, Super Mario 3D Land.
 PPSSPP, DuckStation/SwanStation, Flycast и порты на malisx2 систематически не
 проверялись — это в [plans.md](plans.md). Проверка сессии dArkOS на `4c91f3c`
 (31.10): PPSSPP — 60 к/с, Flycast — 60 (KOV7 — 30, как раньше), ошибок GPU нет.
-**RetroArch с ядром DuckStation** на видеодрайвере Vulkan падает (SIGSEGV)
-до первого кадра — и на `da1e3a2`, на libmali работает; разбирается. По
-умолчанию RetroArch рисует через GL, так что задевает только тех, кто сам
-переключил его на Vulkan.
+**RetroArch с ядром DuckStation** на видеодрайвере Vulkan падал (SIGSEGV) до
+первого кадра, и на `da1e3a2` тоже: текстура 0×0 и уничтожение swapchain при
+незавершённом перевороте страницы. Исправлено (`6405617`, Mesa `37083d3`),
+подробно — в [changes.md](changes.md). По умолчанию RetroArch рисует через
+GL; падение задевало тех, кто сам переключил его на Vulkan.
