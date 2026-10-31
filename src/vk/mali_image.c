@@ -401,12 +401,18 @@ mali_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
     * exporter put it. */
    uint64_t offset = mod_explicit ? mod_explicit->pPlaneLayouts[0].offset : 0;
    for (unsigned p = 0; p < image->plane_count; p++) {
+      /* An extent of 0 is invalid usage, but RetroArch's Vulkan driver
+       * creates a 0x0 texture for the frame of a core that has not
+       * given one yet (DuckStation), does not check the result, and asks
+       * for the memory requirements of the VK_NULL_HANDLE a failure
+       * leaves. Arm's driver accepts such an image; lay it out as 1x1
+       * so that it exists. */
       const struct mali_image_layout_info info = {
          .format = formats[p],
          .modifier = image->vk.drm_format_mod,
-         .width = image->vk.extent.width,
-         .height = image->vk.extent.height,
-         .depth = image->vk.extent.depth,
+         .width = MAX2(image->vk.extent.width, 1),
+         .height = MAX2(image->vk.extent.height, 1),
+         .depth = MAX2(image->vk.extent.depth, 1),
          .samples = image->vk.samples,
          .levels = image->vk.mip_levels,
          .layers = image->vk.array_layers,
