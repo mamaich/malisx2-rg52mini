@@ -31,7 +31,9 @@
  * varyings the fragment shader reads (strip_unused_outputs), so its key
  * includes that mask; it reads the noperspective mask from a system value, so
  * one compiled vertex shader serves every pipeline whose fragment shader reads
- * the same varyings.
+ * the same varyings. The mask is cached too, as raw data under
+ *   BLAKE3("fs-reads", fragment stage)
+ * (fs_reads_lookup).
  */
 
 #ifndef PAN_ARCH
@@ -350,6 +352,59 @@ fs_input_mask(nir_shader *nir)
       }
    }
    return m;
+}
+
+/*
+ * The vertex stage's keep_outputs for the fragment stage fs: the generic varyings it reads,
+ * or ~0 when it reads none. The mask needs the fragment stage's NIR, and a pipeline whose
+ * two shaders are cached needs no NIR otherwise, so the mask is kept in the cache by the
+ * fragment stage's hash: without it, Luigi's Mansion 2's 74 pipelines took 987 ms to come
+ * out of a warm cache on the A55 instead of none, and an emulator that creates pipelines
+ * as a game goes paid the SPIR-V front end for each one.
+ */
+static VkResult
+fs_reads_lookup(struct mali_device *dev, struct vk_pipeline_cache *cache,
+                VkPipelineCreateFlags2KHR flags, struct stage *fs, uint64_t *keep)
+{
+   blake3_hash key;
+   struct mesa_blake3 h;
+   _mesa_blake3_init(&h);
+   _mesa_blake3_update(&h, "fs-reads", 8);
+   _mesa_blake3_update(&h, fs->stage_hash, sizeof(fs->stage_hash));
+   _mesa_blake3_final(&h, key);
+
+   const bool use_cache = cache && !no_pipeline_cache();
+   if (use_cache) {
+      struct vk_pipeline_cache_object *obj =
+         vk_pipeline_cache_lookup_object(cache, key, sizeof(key),
+                                         &vk_raw_data_cache_object_ops, NULL);
+      if (obj) {
+         const struct vk_raw_data_cache_object *raw =
+            container_of(obj, struct vk_raw_data_cache_object, base);
+         const bool found = raw->data_size == sizeof(*keep);
+         if (found)
+            memcpy(keep, raw->data, sizeof(*keep));
+         vk_pipeline_cache_object_unref(&dev->vk, obj);
+         if (found)
+            return VK_SUCCESS;
+      }
+   }
+
+   VkResult result = stage_to_nir(dev, flags, fs);
+   if (result != VK_SUCCESS)
+      return result;
+   const uint64_t reads = fs_input_mask(fs->nir);
+   *keep = reads ? reads : ~0ull;   /* found none: keep every output */
+
+   if (use_cache) {
+      struct vk_pipeline_cache_object *obj =
+         vk_pipeline_cache_create_and_insert_object(cache, key, sizeof(key), keep,
+                                                    sizeof(*keep),
+                                                    &vk_raw_data_cache_object_ops);
+      if (obj)
+         vk_pipeline_cache_object_unref(&dev->vk, obj);
+   }
+   return VK_SUCCESS;
 }
 
 /*
@@ -824,14 +879,12 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
       return result;
 
    /* The vertex shader is specialized on which generic varyings the fragment shader reads (a
-    * vertex shader without a fragment stage writes none). The fragment stage's NIR is kept
-    * for its own compile. */
+    * vertex shader without a fragment stage writes none). The fragment stage's NIR, if the
+    * mask needed it, is kept for its own compile. */
    if (fs) {
-      result = stage_to_nir(dev, flags, fs);
+      result = fs_reads_lookup(dev, cache, flags, fs, &vs->keep_outputs);
       if (result != VK_SUCCESS)
          goto out;
-      const uint64_t reads = fs_input_mask(fs->nir);
-      vs->keep_outputs = reads ? reads : ~0ull;   /* found none: keep every output */
    } else {
       vs->keep_outputs = 0;
    }
