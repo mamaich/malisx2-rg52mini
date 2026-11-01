@@ -1180,6 +1180,11 @@ struct mali_jm_device {
     * (MALI_JM_IMAGE_BARRIER_NARROW, mali_jm_cmd_buffer.c); off with the
     * debug switch "vtcwait". */
    bool v7_image_barrier_narrow;
+   /* In-pass by-region barriers between attachment writes and input
+    * attachment reads draw nothing: the tile-buffer reads are pixel
+    * ordered (mali_jm_cmd_buffer.c tile_ordered_barrier). Off with the
+    * debug switch "fbbarrier". */
+   bool v7_tile_ordered_fb_barrier;
    /* How many of mali_device::free_slabs are 1 MiB slabs for large blocks
     * (mali_jm_cmd_buffer.c); under mali_device::slab_lock. */
    unsigned free_big_slabs;

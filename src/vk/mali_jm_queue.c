@@ -1476,6 +1476,7 @@ MALI_PER_ARCH(device_init)(struct mali_device *dev)
    jd->stats_interval_ns = stats_interval();
 #if PAN_ARCH < 9
    jd->v7_image_barrier_narrow = !mali_debug_flag("vtcwait");
+   jd->v7_tile_ordered_fb_barrier = !mali_debug_flag("fbbarrier");
 #endif
 
    dev->jm = jd;
