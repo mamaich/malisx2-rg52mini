@@ -609,9 +609,10 @@ get_features(struct vk_features *f, uint32_t arch)
       f->extendedDynamicState2PatchControlPoints = false;
       f->vertexInputDynamicState = true;
       /* Descriptor indexing (VK_EXT_descriptor_indexing), the part hakuX uses.
-       * v7 copies a stage's descriptors from the sets into its tables by
-       * a copy job when the draw runs, so writes after the bind are what
-       * it copies; unwritten descriptors are copied but not read; non-
+       * v7 copies the descriptors of update-after-bind sets into a
+       * stage's tables by a copy job when the draw runs (the others are
+       * copied on the CPU at recording, mali_jm_desc_v7.c), so writes
+       * after the bind are what it copies; unwritten descriptors are copied but not read; non-
        * uniform indices are lowered to loops (mali_shader.c). The update-
        * after-bind limits are the ordinary ones (get_properties), which
        * on v7 are far below a bindless table. */

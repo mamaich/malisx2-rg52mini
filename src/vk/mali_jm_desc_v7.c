@@ -275,6 +275,9 @@ mali_v7_desc_prepare(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
       out->sets[i] = set ? set->gpu : 0;
       out->set_desc_counts[i] = set ? set->layout->desc_count : 0;
       out->sets_cpu[i] = set ? set->cpu : NULL;
+      if (set && (s->desc.used_set_mask & BITFIELD_BIT(i)) &&
+          (set->layout->flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT))
+         out->update_after_bind = true;
    }
 
    for (unsigned t = 0; t < MALI_V7_DESC_TABLE_COUNT; t++) {
@@ -1001,7 +1004,10 @@ mali_v7_desc_copy(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
    assert(t->shader == s);
    if (!s->v7.map_count)
       return true;
-   if (!s->v7.count[MALI_V7_DESC_TABLE_IMG] && cmd->dev->jm->desc_cpu_copy) {
+   /* Not for update-after-bind sets (mali_v7_desc_tables): the CPU copy
+    * reads them as they are while the draw records. */
+   if (!s->v7.count[MALI_V7_DESC_TABLE_IMG] && cmd->dev->jm->desc_cpu_copy &&
+       !t->update_after_bind) {
       bool ok = true;
       for (unsigned tab = 0; tab < MALI_V7_DESC_TABLE_COUNT; tab++)
          ok &= !s->v7.count[tab] || t->tables_cpu[tab];

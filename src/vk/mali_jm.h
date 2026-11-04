@@ -310,6 +310,10 @@ struct mali_v7_desc_tables {
     * the draw that built the tables records. */
    void *tables_cpu[MALI_V7_DESC_TABLE_COUNT];
    const void *sets_cpu[MALI_MAX_SETS];
+   /* A set the shader reads is of an update-after-bind layout: the
+    * application may write it until the submit, after the draw
+    * records, so the copy runs on the GPU when the draw does. */
+   bool update_after_bind;
    /* The shader the tables were built for (their layout is its own). */
    const struct mali_shader *shader;
    /* The dynamic buffers they were built with, one per entry of the

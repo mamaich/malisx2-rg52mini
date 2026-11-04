@@ -937,7 +937,9 @@ tile_ordered_barrier(VkPipelineStageFlags2 src, VkAccessFlags2 srca, VkPipelineS
    dst = vk_expand_dst_stage_flags2(dst);
    srca = vk_filter_src_access_flags2(src, srca);
    dsta = vk_filter_dst_access_flags2(dst, dsta);
-   return !(srca & ~TILE_SRC_ACCESS) && !(dsta & ~TILE_DST_ACCESS);
+   /* An execution-only barrier (no source access) keeps its draw: it may
+    * order storage reads before writes, which the tile order does not. */
+   return srca && !(srca & ~TILE_SRC_ACCESS) && !(dsta & ~TILE_DST_ACCESS);
 #else
    (void)src;
    (void)srca;

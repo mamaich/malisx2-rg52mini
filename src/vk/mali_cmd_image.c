@@ -72,6 +72,7 @@
 
 #include "mali_arch.h"
 #include "mali_image.h"
+#include "mali_memory.h"
 #if PAN_ARCH >= 10
 #include "mali_queue.h"
 #endif
@@ -612,8 +613,11 @@ MALI_PER_ARCH(CmdCopyBufferToImage2)(VkCommandBuffer commandBuffer, const VkCopy
     * skip the image-only barriers' requirements, which are about other
     * images (mali_jm_cmd_buffer.c vtc_chain). hakuX gives every texture
     * it redefines a new image of its own memory; the copy then no longer
-    * waits for all the fragment work before it. */
-   cmd->jm.xfer_fresh = img->fresh && !mali_image_is_afbc(img);
+    * waits for all the fragment work before it. Only while the image is
+    * still the one resource of its memory: one bound later may alias it,
+    * and an image barrier would order its writes before this copy. */
+   cmd->jm.xfer_fresh =
+      img->fresh && img->mem && img->mem->binds == 1 && !mali_image_is_afbc(img);
 #endif
    img->fresh = false;
 
