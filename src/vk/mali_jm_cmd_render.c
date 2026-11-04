@@ -107,8 +107,10 @@ MALI_PER_ARCH(cmd_render_begin)(struct mali_cmd_buffer *cmd, const struct mali_r
        * batch's tiling runs while it shades: one pass a batch overlaps the
        * two the most. With image barriers narrowed, render-to-texture
        * passes no longer end their batch at the barrier between them, so
-       * the limit does it, which keeps the atoms hakuX's passes had. */
-      if (cmd->dev->jm->v7_image_barrier_narrow)
+       * the limit does it, which keeps the atoms hakuX's passes had. Only
+       * with the debug switch onepass: on ARMSX2 (God of War) one pass a
+       * batch costs 5 to 10 %, and its passes overlap as before. */
+      if (cmd->dev->jm->v7_image_barrier_narrow && cmd->dev->jm->v7_one_pass_batches)
          max_passes = 1;
 #endif
       if (b->passes >= max_passes || b->vtc.jobs >= MALI_JM_BATCH_MAX_JOBS ||

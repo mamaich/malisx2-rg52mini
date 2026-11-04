@@ -1180,6 +1180,8 @@ struct mali_jm_device {
     * (MALI_JM_IMAGE_BARRIER_NARROW, mali_jm_cmd_buffer.c); off with the
     * debug switch "vtcwait". */
    bool v7_image_barrier_narrow;
+   /* One pass a batch with narrowed image barriers (debug switch onepass). */
+   bool v7_one_pass_batches;
    /* In-pass by-region barriers between attachment writes and input
     * attachment reads draw nothing: the tile-buffer reads are pixel
     * ordered (mali_jm_cmd_buffer.c tile_ordered_barrier). Off with the
