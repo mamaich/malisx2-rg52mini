@@ -291,6 +291,10 @@ struct mali_device {
     * FP16 build; 3: both builds compiled and the faster kept (fp16_pick);
     * 0 (the default): never. */
    uint8_t v7_fp16;
+   /* v7: UBO loads with a computed offset in small ifs of vertex shaders
+    * are guarded and the ifs flattened (mali_shader.c flatten_vs_ubo_ifs;
+    * MALISX2_V7_VS_UBO_IF=0 keeps the ifs). */
+   bool v7_vs_ubo_if;
    /* The tiler hierarchy mask to use outright (mali_jm_cmd_render.c
     * hierarchy_mask; MALISX2_JM_HIER_MASK), 0 for the rule there. */
    uint8_t jm_hierarchy_mask;

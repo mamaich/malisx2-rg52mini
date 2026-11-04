@@ -912,6 +912,11 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
    hash_layout(&h, layout);
    _mesa_blake3_update(&h, &view_mask, sizeof(view_mask));
    _mesa_blake3_update(&h, &vs->keep_outputs, sizeof(vs->keep_outputs));
+   /* MALISX2_V7_VS_UBO_IF=0 compiles vertex shaders differently
+    * (mali_shader.c flatten_vs_ubo_ifs). Nothing is added with it on, the
+    * default. */
+   if (!dev->v7_vs_ubo_if)
+      _mesa_blake3_update(&h, "noubo-if", 8);
    _mesa_blake3_final(&h, vs->key);
 
    if (fs) {

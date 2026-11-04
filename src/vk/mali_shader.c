@@ -1625,6 +1625,136 @@ lower_clip_distance_fs(nir_shader *nir, const struct pan_varying_layout *vs_layo
 /* ---------------------------------------------------------------------- */
 /* Backend compile                                                         */
 
+#if PAN_ARCH < 9
+/*
+ * v7 vertex shaders: UBO loads with a computed offset inside small ifs.
+ * Azahar's PICA vertex shaders read every relatively addressed uniform as
+ * "if (index < 96) v = c[index]", hundreds of times in the large shaders
+ * of Luigi's Mansion 2. Each such if is a branch, a clause boundary and the
+ * end of a block, and the backend schedules and allocates registers block
+ * by block: values wait in registers across a chain of tiny blocks, and
+ * the shader spills.
+ *
+ * guard_ubo_loads gives such a load the offset bcsel(condition, offset, 0)
+ * (the other way round in an else branch): its own offset wherever the
+ * branch runs, so nothing changes there, and 0 otherwise, which is in
+ * bounds of any bound UBO. The load can then run whatever the condition
+ * and is marked speculatable, and nir_opt_peephole_select flattens the if
+ * into selects; a load moved into an enclosing if is guarded again for
+ * that one in the next round. Only loads from a UBO named by a constant
+ * index: a computed index could itself be what the condition guards.
+ *
+ * Offline on the dumps of 31.10 (tools/nirc): the vertex shaders of LM2
+ * 13 % fewer static cycles and 16 % fewer spills, Castlevania's and Super
+ * Mario 3D Land's 8 % fewer cycles; nothing else has these ifs.
+ */
+static bool
+guard_ubo_loads(nir_shader *nir)
+{
+   bool progress = false;
+   nir_foreach_function_impl(impl, nir) {
+      bool impl_progress = false;
+      nir_builder b = nir_builder_create(impl);
+      nir_foreach_block(block, impl) {
+         nir_cf_node *parent = block->cf_node.parent;
+         if (!parent || parent->type != nir_cf_node_if)
+            continue;
+         nir_if *nif = nir_cf_node_as_if(parent);
+         const bool then_side =
+            block == nir_if_first_then_block(nif) && block == nir_if_last_then_block(nif);
+         const bool else_side =
+            block == nir_if_first_else_block(nif) && block == nir_if_last_else_block(nif);
+         if (!then_side && !else_side)
+            continue;
+         nir_def *cond = nif->condition.ssa;
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_load_ubo || !nir_src_is_const(intr->src[0]) ||
+                nir_src_is_const(intr->src[1]))
+               continue;
+            nir_instr *g = nir_def_instr(intr->src[1].ssa);
+            const bool guarded = g->type == nir_instr_type_alu &&
+                                 nir_instr_as_alu(g)->op == nir_op_bcsel &&
+                                 nir_instr_as_alu(g)->src[0].src.ssa == cond;
+            if (!guarded) {
+               b.cursor = nir_before_instr(instr);
+               nir_def *off = intr->src[1].ssa;
+               nir_def *zero = nir_imm_intN_t(&b, 0, off->bit_size);
+               nir_src_rewrite(&intr->src[1], then_side ? nir_bcsel(&b, cond, off, zero)
+                                                        : nir_bcsel(&b, cond, zero, off));
+               impl_progress = true;
+            }
+            nir_intrinsic_set_access(intr, nir_intrinsic_access(intr) | ACCESS_CAN_SPECULATE);
+         }
+      }
+      progress |= nir_progress(impl_progress, impl, nir_metadata_control_flow);
+   }
+   return progress;
+}
+
+/* nir_opt_peephole_select with indirect_load_ok also flattens ifs around
+ * other loads with a computed offset that it takes as safe to run early.
+ * The pass runs only on a shader that has none of those. */
+static bool
+other_indirect_loads(nir_shader *nir)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            switch (intr->intrinsic) {
+            case nir_intrinsic_load_deref:
+               return true;
+            case nir_intrinsic_load_ubo_vec4:
+            case nir_intrinsic_load_interpolated_input:
+            case nir_intrinsic_load_per_vertex_input:
+            case nir_intrinsic_load_input_vertex:
+               if (!nir_src_is_const(intr->src[1]))
+                  return true;
+               break;
+            case nir_intrinsic_load_global_constant:
+            case nir_intrinsic_load_input:
+            case nir_intrinsic_load_constant:
+               if (!nir_src_is_const(intr->src[0]))
+                  return true;
+               break;
+            default:
+               break;
+            }
+         }
+      }
+   }
+   return false;
+}
+
+static void
+flatten_vs_ubo_ifs(nir_shader *nir)
+{
+   if (other_indirect_loads(nir))
+      return;
+   const nir_opt_peephole_select_options opts = {
+      .limit = 64,
+      .indirect_load_ok = true,
+      .expensive_alu_ok = true,
+   };
+   bool progress = true;
+   while (progress) {
+      progress = false;
+      NIR_PASS(progress, nir, guard_ubo_loads);
+      NIR_PASS(progress, nir, nir_opt_peephole_select, &opts);
+      NIR_PASS(progress, nir, nir_opt_copy_prop);
+      NIR_PASS(progress, nir, nir_opt_dce);
+      NIR_PASS(progress, nir, nir_opt_cse);
+      NIR_PASS(progress, nir, nir_opt_constant_folding);
+      NIR_PASS(progress, nir, nir_opt_dead_cf);
+   }
+}
+#endif
+
 static VkResult
 compile_nir(struct mali_device *dev, nir_shader *nir,
             const struct pan_compile_inputs *compile_inputs,
@@ -1650,6 +1780,12 @@ compile_nir(struct mali_device *dev, nir_shader *nir,
             nir_metadata_control_flow, s);
    lower_load_push_consts(nir, s);
    lower_ubo_push(nir, s);
+#if PAN_ARCH < 9
+   /* After lower_ubo_push: what it leaves as load_ubo has a computed
+    * offset. */
+   if (nir->info.stage == MESA_SHADER_VERTEX && dev->v7_vs_ubo_if)
+      flatten_vs_ubo_ifs(nir);
+#endif
 
    /* The driver's words come first; the backend may put promoted
     * constants after them. */

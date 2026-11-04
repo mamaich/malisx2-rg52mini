@@ -1466,6 +1466,8 @@ MALI_PER_ARCH(device_init)(struct mali_device *dev)
       knob_uint("MALISX2_V7_AFBC_FMT", "debug.malisx2.v7_afbc_fmt", 0, 3, 3);
    dev->v7_idvs = knob_uint("MALISX2_V7_IDVS", "debug.malisx2.v7_idvs", 0, 1, 1);
    dev->v7_fp16 = knob_uint("MALISX2_V7_FP16", "debug.malisx2.v7_fp16", 0, 3, 0);
+   dev->v7_vs_ubo_if =
+      knob_uint("MALISX2_V7_VS_UBO_IF", "debug.malisx2.v7_vs_ubo_if", 0, 1, 1);
 #if PAN_ARCH < 9
    jd->gpu_index_range =
       knob_uint("MALISX2_V7_GPU_INDEX_RANGE", "debug.malisx2.v7_gpu_index_range", 0, 1, 1);
