@@ -78,6 +78,7 @@
 #include "panfrost/compiler/pan_nir.h"
 #include "util/blend.h"
 #include "util/log.h"
+#include "util/os_time.h"
 #include "vk_log.h"
 
 #include "mali_rsd_v7.h"
@@ -1400,7 +1401,32 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
    const bool idvs = p->vs->info.vs.idvs;
    if (di->indexed) {
       dd.indices = d->ib.addr + (uint64_t)di->first_index * d->ib.index_size;
-      if (gpu_range_fits(cmd, p, di, &dd.gpu_count)) {
+      const bool hinted = cmd->jm.idx_hint.set && cmd->jm.idx_hint.ib == d->ib.addr &&
+                          cmd->jm.idx_hint.first == di->first_index &&
+                          cmd->jm.idx_hint.count == di->count;
+      cmd->jm.idx_hint.set = false;
+      uint32_t min, max;
+      if (hinted) {
+         /* vkCmdSetIndexRangeMALISX2: the application's range. */
+         min = cmd->jm.idx_hint.min;
+         max = cmd->jm.idx_hint.max;
+         /* Debug switch idxcheck: the indices scanned anyway, a range the
+          * hint does not cover logged (the first 16). */
+         static int check = -1;
+         if (unlikely(check < 0))
+            check = mali_debug_flag("idxcheck");
+         if (unlikely(check)) {
+            uint32_t smin, smax;
+            bool sempty = false;
+            static unsigned logged;
+            if (index_range(cmd, di, st->ia.primitive_restart_enable, &smin, &smax, &sempty) &&
+                !sempty && (smin < min || smax > max) && logged++ < 16)
+               mesa_logw("malisx2 idxcheck: draw of %u indices from %u: indices %u..%u, "
+                         "hint %u..%u", di->count, di->first_index, smin, smax, min, max);
+         }
+         dd.vertex_range = max - min + 1;
+         dd.raw_vertex_offset = (int32_t)min + di->vertex_offset;
+      } else if (gpu_range_fits(cmd, p, di, &dd.gpu_count)) {
          /* The range comes from the GPU (mali_jm_irange_v7.c); a draw with
           * no index in the bound range is skipped as below. */
          if (!dd.gpu_count)
@@ -1410,9 +1436,12 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
          /* The vertex range, from the indices in the buffer at this point
           * of recording (index_range says what that needs); a draw whose
           * indices cannot be read here is skipped. */
-         uint32_t min, max;
-         bool empty;
-         if (!index_range(cmd, di, st->ia.primitive_restart_enable, &min, &max, &empty) || empty)
+         bool empty = false;
+         const uint64_t t_scan = unlikely(mali_cpuprof_on) ? os_time_get_nano() : 0;
+         const bool ok = index_range(cmd, di, st->ia.primitive_restart_enable, &min, &max, &empty);
+         if (unlikely(t_scan))
+            mali_cpuprof_part(MALI_CPUPROF_IDXSCAN, t_scan);
+         if (!ok || empty)
             return;
          dd.vertex_range = max - min + 1;
          dd.raw_vertex_offset = (int32_t)min + di->vertex_offset;
@@ -1426,7 +1455,11 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
          ? padded_vertex_count(idvs ? ALIGN_POT(dd.vertex_range, 4) : dd.vertex_range)
          : dd.vertex_range;
 
-   if (!prepare_draw(cmd, di, &dd)) {
+   const uint64_t t_prep = unlikely(mali_cpuprof_on) ? os_time_get_nano() : 0;
+   const bool prepared = prepare_draw(cmd, di, &dd);
+   if (unlikely(t_prep))
+      mali_cpuprof_part(MALI_CPUPROF_DRAWPREP, t_prep);
+   if (!prepared) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
       return;
    }
@@ -1737,4 +1770,34 @@ MALI_PER_ARCH(CmdDrawIndexed)(VkCommandBuffer commandBuffer, uint32_t indexCount
       .indexed = true,
    };
    draw(cmd, &di);
+}
+
+/*
+ * vkCmdSetIndexRangeMALISX2 (malisx2's own, from vkGetDeviceProcAddr):
+ * the application gives the index range of its next indexed draw, which
+ * it knows from building the indices, and the draw skips reading them
+ * back (index_range). The hint names the draw by the index buffer bound
+ * now, the first index and the count. Only the next indexed draw can take
+ * it: if that one is another draw (a layer's own), the hint is dropped,
+ * not taken for it, and the draw it named scans its indices as before.
+ *
+ * Every index of that draw must be in [minIndex, maxIndex], the
+ * primitive restart index left out as the scan leaves it out (0xFFFF or
+ * 0xFFFFFFFF, when restart is enabled). A wider range only shades more
+ * vertices. A narrower one is undefined: the tiler then reads varyings of
+ * vertices that were not shaded, which draws garbage or can fault the
+ * GPU. The debug switch idxcheck logs such hints.
+ */
+VKAPI_ATTR void VKAPI_CALL
+MALI_PER_ARCH(CmdSetIndexRangeMALISX2)(VkCommandBuffer commandBuffer, uint32_t firstIndex,
+                                       uint32_t indexCount, uint32_t minIndex,
+                                       uint32_t maxIndex)
+{
+   VK_FROM_HANDLE(mali_cmd_buffer, cmd, commandBuffer);
+   cmd->jm.idx_hint.set = minIndex <= maxIndex;
+   cmd->jm.idx_hint.ib = cmd->gfx.draw.ib.addr;
+   cmd->jm.idx_hint.first = firstIndex;
+   cmd->jm.idx_hint.count = indexCount;
+   cmd->jm.idx_hint.min = minIndex;
+   cmd->jm.idx_hint.max = maxIndex;
 }

@@ -11,7 +11,20 @@
 
 #include "mali_vk.h"
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <time.h>
+
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
+#define PROP_VALUE_MAX_ PROP_VALUE_MAX
+#else
+#define PROP_VALUE_MAX_ 92
+#endif
+
+#include "c11/threads.h"
+#include "util/log.h"
 
 #include "vk_alloc.h"
 #include "vk_util.h"
@@ -29,6 +42,43 @@
 #ifndef __ANDROID__
 #include "wsi_common.h"
 #endif
+
+/* ---------------------------------------------------------------------- */
+/* Debug switches (mali_vk.h)                                              */
+
+static char debug_flags[PROP_VALUE_MAX_ + 2];
+static once_flag debug_flags_once = ONCE_FLAG_INIT;
+
+static void
+debug_flags_read(void)
+{
+   /* Kept with a comma at each end, so a name matches as ",name,". */
+   const char *s = getenv("MALISX2_DEBUG");
+#ifdef __ANDROID__
+   char prop[PROP_VALUE_MAX];
+   if (!s || !*s) {
+      prop[0] = 0;
+      __system_property_get("debug.malisx2.debug", prop);
+      s = prop;
+   }
+#endif
+   snprintf(debug_flags, sizeof(debug_flags), ",%s,", s ? s : "");
+   for (char *p = debug_flags; *p; p++) {
+      if (*p == ' ')
+         *p = ',';
+   }
+   if (debug_flags[2])
+      mesa_logi("malisx2: debug switches \"%s\"", s);
+}
+
+bool
+mali_debug_flag(const char *name)
+{
+   call_once(&debug_flags_once, debug_flags_read);
+   char key[48];
+   snprintf(key, sizeof(key), ",%s,", name);
+   return strstr(debug_flags, key) != NULL;
+}
 
 /* ---------------------------------------------------------------------- */
 /* Interned keys (mali_pipeline.h), shared by every arch's pipelines      */
@@ -218,6 +268,19 @@ device_get_timestamp(struct vk_device *vk_dev, uint64_t *timestamp)
              VK_ERROR_DEVICE_LOST;
 }
 
+/* Mesa's lookup, and malisx2's own commands by name (mali_vk.h). */
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+mali_GetDeviceProcAddr(VkDevice _device, const char *pName)
+{
+   VK_FROM_HANDLE(vk_device, device, _device);
+   if (device && pName && !strcmp(pName, "vkCmdSetIndexRangeMALISX2")) {
+      const struct mali_physical_device *pdev =
+         container_of(device->physical, struct mali_physical_device, vk);
+      return pdev->arch == 7 ? (PFN_vkVoidFunction)mali_v7_CmdSetIndexRangeMALISX2 : NULL;
+   }
+   return vk_device_get_proc_addr(device, pName);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 mali_CreateDevice(VkPhysicalDevice physicalDevice,
                   const VkDeviceCreateInfo *pCreateInfo,
@@ -266,6 +329,7 @@ mali_CreateDevice(VkPhysicalDevice physicalDevice,
    }
    vk_device_dispatch_table_from_entrypoints(&dev->vk.dispatch_table,
                                              &mali_waist_device_entrypoints, false);
+   mali_cpuprof_install(&dev->vk.dispatch_table);
 
    /* The queue requests are checked before the kernel is touched. One
     * family, MALI_QUEUE_COUNT queues, no protected queues. */
