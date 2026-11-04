@@ -112,6 +112,7 @@ clang и lld 19 с sysroot arm64:
 | `MALISX2_MEASURE` | время GPU по проходам и отрисовкам, захват отправленных заданий, шейдеры |
 | `MALISX2_STATS=<сек>` | раз в несколько секунд — счётчики атомов, заданий и копий дескрипторов и uniform-слов на отрисовку |
 | `MALISX2_JM_BATCH_PASSES`, `MALISX2_JM_HEAP_SLOTS` | ручки для опытов с перекрытием слотов GPU |
+| `MALISX2_DEBUG=<имена>` | отладочные переключатели: `cpuprof` (время CPU в драйвере), `vtcwhy`, `idxcheck`, и выключатели правок — `vtcwait`, `onepass`, `fbbarrier`, `nobc` |
 
 ## Правила
 

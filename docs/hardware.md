@@ -57,9 +57,11 @@
   только тайлинг следующего батча. Отсюда мало перекрытия слотов (1,1 мс на
   кадр против 6,1 у libmali в Castlevania). Опыты — ручкой
   `MALISX2_JM_BATCH_PASSES`.
-- **Куча тайлера** — кольцо из 4 слотов (`MALISX2_JM_HEAP_SLOTS`), по 256 МиБ
-  адресов, 2 МиБ памяти сразу и рост по 2 МиБ. Батч занимает слот; следующий
-  батч на том же слоте ждёт фрагменты предыдущего.
+- **Куча тайлера** — кольцо слотов по 256 МиБ адресов, 2 МиБ памяти сразу и
+  рост по 2 МиБ. Батч занимает слот; следующий батч на том же слоте ждёт
+  фрагменты предыдущего. Сначала слотов 4 (`MALISX2_JM_HEAP_SLOTS`); с 0.3.2
+  кольцо растёт до 16, если submit'ы часто тайлят больше батчей, чем в нём
+  слотов (тогда батч ждёт фрагментов батча из того же submit'а).
 - **Номеров атомов — 255.** Когда они кончаются, отправка ждёт
   (`MALISX2_STATS` считает эти ожидания); чем мельче батчи, тем больше атомов.
   ARMSX2: около 290–360 атомов в секунду, ожиданий не было.
@@ -167,9 +169,12 @@ D32_SFLOAT и текстуры в u-interleaved. С AFBC для текстур (
 Vulkan 1.1 (libmali — 1.3). На 25.10 — 24 расширения устройства (у libmali —
 135); со слиянием апстрима 0.3.1 (31.10) добавились timeline-семафоры (эмуляция
 Mesa), dynamic rendering с depth_stencil_resolve и create_renderpass2 (по коду
-28 расширений), а ещё `VkEvent` и настоящие occlusion-запросы. Нет
-synchronization2, extended dynamic
-state, buffer device address, 8/16-битного storage, float16, robustness2,
+28 расширений), а ещё `VkEvent` и настоящие occlusion-запросы. С 04.11
+(`e596082`, из форка pjperez) на v7 есть synchronization2, extended
+dynamic state и _2, vertex input dynamic state, часть descriptor indexing,
+dynamic rendering local read — 37 расширений, и форматы BC1–BC7
+(`d196eda`). Команды `VkEvent` на v7 по-прежнему пропускаются. Нет
+buffer device address, 8/16-битного storage, float16, robustness2,
 custom border colors, transform feedback; нет геометрических и
 тесселяционных шейдеров, logicOp, wideLines, shaderInt64; 16 вершинных
 атрибутов и привязок вместо 32; одна очередь. Есть memory_budget и
