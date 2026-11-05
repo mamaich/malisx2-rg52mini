@@ -201,7 +201,13 @@ stage_init(struct mali_device *dev, VkPipelineCreateFlags2KHR flags,
 
 /* MALISX2_NO_PIPELINE_CACHE=1: every stage compiles anew, for shader dumps
  * (BIFROST_MESA_DEBUG=shaders, MALISX2_MEASURE=shaders) of an application
- * whose pipeline cache would otherwise serve the binaries. */
+ * whose pipeline cache would otherwise serve the binaries, and for compiler
+ * knobs the cache key does not cover. Nothing is looked up, and what is
+ * compiled is not added either: vk_pipeline_cache_add_object() hands back an
+ * object of the same key already in the cache, and the initial data of
+ * vkCreatePipelineCache is deserialized at once (our import ops), so the
+ * stage would run the binary an earlier run left in the application's cache
+ * file. */
 static bool
 no_pipeline_cache(void)
 {
@@ -483,7 +489,7 @@ stage_compile(struct mali_device *dev, struct vk_pipeline_cache *cache,
    p_atomic_inc(&dev->pipeline_stats.shaders_compiled);
    stage_dump(st, shader);
 
-   if (cache) {
+   if (cache && !no_pipeline_cache()) {
       struct vk_pipeline_cache_object *obj =
          vk_pipeline_cache_add_object(cache, &shader->base);
       shader = container_of(obj, struct mali_shader, base);
@@ -827,7 +833,7 @@ clip_fs_compile(struct mali_device *dev, struct vk_pipeline_cache *cache,
       return result;
    p_atomic_inc(&dev->pipeline_stats.shaders_compiled);
 
-   if (cache) {
+   if (cache && !no_pipeline_cache()) {
       struct vk_pipeline_cache_object *obj =
          vk_pipeline_cache_add_object(cache, &shader->base);
       shader = container_of(obj, struct mali_shader, base);
