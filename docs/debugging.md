@@ -22,9 +22,11 @@
 | `MALISX2_V7_FP16_LOG=1` | v7: в лог — решение по каждому изменённому фрагментному шейдеру (оценка сбережённых инструкций и преобразований; при 3 — ещё оценки компилятора обеих сборок и форма шейдера до и после прохода) |
 | `MALISX2_V7_GPU_INDEX_RANGE=0` | v7: диапазон индексов отрисовок с одним заданием Indexed Vertex ищет CPU при записи команд, а не compute-задания на GPU |
 | `MALISX2_V7_IDVS=0` | v7: вершинные шейдеры целиком и пара заданий Vertex + Tiler на отрисовку вместо IDVS (одно задание Indexed Vertex с разделённым шейдером); свой кэш конвейеров |
+| `MALISX2_V7_VS_UBO_IF=0` | v7: в вершинных шейдерах маленькие if вокруг чтений UBO с вычисленным смещением не сворачиваются в выбор (как до `f975c02`); свой кэш конвейеров |
 | `MALISX2_JM_HIER_MASK=<1–255>` | маска уровней иерархии тайлера вместо правила по числу уровней (десятичная: 10 = 0x0a — уровни 32 и 128 пикселей, 130 = 0x82 — 32 и 2048) |
 | `MALISX2_V7_FPK_ROA=0` | v7: forward pixel kill выключен у всех конвейеров с порядком растеризации для цвета, как в panvk |
 | `BIFROST_MESA_DEBUG=shaderdb` | статистика каждого шейдера v7 (инструкции, кортежи, клаузы, регистры) в stderr; `shaders` — ещё NIR и дизассемблер. Чтобы шейдеры действительно компилировались, нужны `VK_ENABLE_PIPELINE_CACHE=false MESA_SHADER_CACHE_DISABLE=true` |
+| `BIFROST_MESA_DEBUG=noattrremat` | v7: атрибуты, загруженные вне циклов вершинного шейдера, не загружаются заново в циклах, где они нужны (как до Mesa `cf9fe56`). Ключ кэша конвейеров от этой переменной не зависит: нужен `MALISX2_NO_PIPELINE_CACHE=1` |
 | `MESA_DEBUG=1`, `MESA_LOG_LEVEL=debug` | отладочный вывод Mesa |
 
 Переключатели `MALISX2_DEBUG` (на Android — свойство `debug.malisx2.debug`;
@@ -47,7 +49,7 @@
 `debug.malisx2.v7_fpk_roa`, `debug.malisx2.v7_afbc_tex`,
 `debug.malisx2.v7_afbc_depth`, `debug.malisx2.v7_afbc_levels`,
 `debug.malisx2.v7_afbc_fmt`, `debug.malisx2.v7_idvs`, `debug.malisx2.v7_fp16`,
-`debug.malisx2.v7_gpu_index_range`. Остальные ручки (`MALISX2_V7_FP16_LOG`,
+`debug.malisx2.v7_gpu_index_range`, `debug.malisx2.v7_vs_ubo_if`. Остальные ручки (`MALISX2_V7_FP16_LOG`,
 `MALISX2_LOG_IMAGES`, `MALISX2_NO_PIPELINE_CACHE`, `MALISX2_NIR_DUMP`) — только
 переменные окружения.
 
