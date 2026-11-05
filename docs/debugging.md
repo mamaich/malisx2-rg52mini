@@ -27,6 +27,9 @@
 | `MALISX2_V7_FPK_ROA=0` | v7: forward pixel kill выключен у всех конвейеров с порядком растеризации для цвета, как в panvk |
 | `BIFROST_MESA_DEBUG=shaderdb` | статистика каждого шейдера v7 (инструкции, кортежи, клаузы, регистры) в stderr; `shaders` — ещё NIR и дизассемблер. Чтобы шейдеры действительно компилировались, нужны `VK_ENABLE_PIPELINE_CACHE=false MESA_SHADER_CACHE_DISABLE=true` |
 | `BIFROST_MESA_DEBUG=noattrremat` | v7: атрибуты, загруженные вне циклов вершинного шейдера, не загружаются заново в циклах, где они нужны (как до Mesa `cf9fe56`). Ключ кэша конвейеров от этой переменной не зависит: нужен `MALISX2_NO_PIPELINE_CACHE=1` |
+| `BIFROST_MESA_DEBUG=notreeremat` | v7: дешёвые выражения одного значения не строятся заново в более поздних блоках вершинного шейдера, где они нужны (как до Mesa `f19e139`). Ключ кэша конвейеров от этой переменной не зависит: нужен `MALISX2_NO_PIPELINE_CACHE=1` |
+| `BIFROST_MESA_DEBUG=nofoldif` | Bifrost: использования условия `if` внутри его веток не получают известное значение (как до Mesa `a31b534`). Ключ кэша — как выше |
+| `BIFROST_MESA_DEBUG=noloopflags` | Bifrost: флаги цикла «счётчик == метка» переносятся фи заголовка, а не сравниваются заново от счётчика (как до Mesa `81f988c`). Ключ кэша — как выше |
 | `MESA_DEBUG=1`, `MESA_LOG_LEVEL=debug` | отладочный вывод Mesa |
 
 Переключатели `MALISX2_DEBUG` (на Android — свойство `debug.malisx2.debug`;
