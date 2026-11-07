@@ -63,10 +63,36 @@
  * that ran out of numbers. One thread at a time polls (the reader); the
  * others sleep on the device condition variable, which it broadcasts.
  *
+ * VkEvent commands (mali_jm_event.c) are batches without chains, each one
+ * soft atom (build_event):
+ *
+ *   set/reset: EVENT_SET or EVENT_RESET, joins slot 0's order
+ *            pre_dep[0] the previous atom in slot 0's order
+ *            pre_dep[1] the newest atom in slot 1's order
+ *            so it runs after everything submitted before it, later
+ *            fragment atoms and the submission's tracker follow it, and a
+ *            reset after a set (or a set after a wait) stays behind it;
+ *   wait:    EVENT_WAIT, joins the order of slot 1 when its destination
+ *            stages include vtc-slot stages, else slot 0's
+ *            pre_dep[0] the previous atom in that order
+ *            Later atoms of that order follow it. When the stages need both
+ *            slots it is in slot 1's order, and the next fragment atom
+ *            without a vtc atom of its own is told to wait for the newest
+ *            vtc atom (the carried MALI_JM_REQ_FRAG_AFTER_VTC); fragment
+ *            atoms with one follow their vtc atom. The kernel completes it
+ *            when the word is set (an EVENT_SET atom, or SOFT_EVENT_UPDATE
+ *            from vkSetEvent), and cancels it after its soft-job timeout if
+ *            that does not happen.
+ *
+ * Command buffers without events have no event batches: their atoms are
+ * the ones described above, unchanged.
+ *
  * Device loss: any event code other than DONE, except a FENCE_WAIT
  * cancelled because the waited fence signalled an error, makes the device
  * lost, sticky, reported at the next submit, wait or status query.
- * Nothing is masked, TERMINATED included; that may be revisited later.
+ * Nothing is masked, TERMINATED included; that may be revisited later. An
+ * EVENT_WAIT cancelled by the timeout is device loss too: the work behind
+ * it (DATA dependencies) did not run.
  */
 
 #ifndef _GNU_SOURCE
@@ -170,6 +196,8 @@ atom_kind_name(unsigned kind)
    case MALI_JM_ATOM_JOIN: return "dependency-only";
    case MALI_JM_ATOM_FENCE_WAIT: return "fence wait";
    case MALI_JM_ATOM_FENCE_TRIGGER: return "fence trigger";
+   case MALI_JM_ATOM_EVENT: return "event set/reset";
+   case MALI_JM_ATOM_EVENT_WAIT: return "event wait";
    default: return "unknown";
    }
 }
@@ -226,6 +254,16 @@ process_event(struct mali_device *dev, const struct kb_jm_event *ev)
          jd->stats.fence_wait_errors++;
          mesa_logw("malisx2: a waited sync file signalled an error (submission %llu); "
                    "continuing", (unsigned long long)ev->udata[0]);
+      } else if (kind == MALI_JM_ATOM_EVENT_WAIT &&
+                 ev->event_code == KB_JM_EVENT_JOB_CANCELLED) {
+         /* The kernel's soft-job timeout (3 s by default) ran out before
+          * the event was set; the work behind the wait failed with it. */
+         record_fault(dev, ev, "event wait timed out: the event was not set");
+         jm_set_fault(jd,
+                      "vkCmdWaitEvents (submission %llu, command buffer %u) waited longer "
+                      "than the kernel's soft-job timeout for an event that was not set; "
+                      "the work after it was cancelled",
+                      (unsigned long long)ev->udata[0], MALI_JM_UDATA_CMD(u));
       } else {
          char what[VK_MAX_DESCRIPTION_SIZE];
          snprintf(what, sizeof(what), "%s: %s atom %u (submission %llu)",
@@ -828,49 +866,54 @@ udata_of(unsigned cmd, unsigned batch)
    return ((uint64_t)(cmd & 0xffff) << 32) | ((uint64_t)(batch & 0xffff) << 16);
 }
 
-/* Extra core_req bits a chain needs: PERMON when it writes system
- * timestamps (queries, MALISX2_MEASURE), which keeps the GPU's timestamp
- * counter running while the atom is on the GPU, as the blob does for its
- * query chains. */
+/*
+ * Extra core_req bits a chain needs. PERMON asks the kernel to run the GPU's
+ * cycle counter while the atom is on the GPU (a reference-counted
+ * CYCLE_COUNT_START / STOP pair in kbase r40p0 and r44p1; it touches no
+ * other power state). A chain that writes system timestamps (queries,
+ * MALISX2_MEASURE) needs it, because the timestamp counter is stopped
+ * otherwise, as the blob does for its query chains.
+ *
+ * On v7 every atom asks for it. On the Unisoc T618's kernel hakuX lost the
+ * device to a GPU that stopped making progress and had to be reset, 2 races
+ * out of 2, about a minute in; with hakuX's per-pass timestamps, which put
+ * PERMON on nearly every atom, the same race ran for minutes. This was
+ * observed, not explained: the kernel code shows nothing that PERMON would
+ * change besides the counter, so the cause may lie in that vendor kernel or
+ * in the timing of the start/stop commands between atoms. v9 is unchanged.
+ */
 static inline uint32_t
 chain_req(const struct mali_jm_chain *c)
 {
+#if PAN_ARCH < 9
+   (void)c;
+   return KB_JM_REQ_PERMON;
+#else
    return c->timestamps ? KB_JM_REQ_PERMON : 0;
+#endif
 }
 
-/* Debug switch vtcwhy (mali_jm_queue::why): counts a vtc atom's
- * dependency on fragment atom r, for reason why, when r has not finished
- * as far as the events read so far tell. */
-static inline void
-why_note(const struct mali_jm_device *jd, struct mali_jm_queue *q, enum mali_jm_why why,
-         mali_jm_ref r)
+/* The soft atom of an event batch (file comment). 0 with *result set on
+ * failure. */
+static mali_jm_ref
+build_event(struct mali_device *dev, struct mali_jm_queue *q, const struct mali_jm_batch *bt,
+            uint64_t ud, VkResult *result)
 {
-   if (unlikely(q->why_on) && r && mali_jm_ref_live(jd, r))
-      q->why[why]++;
-}
-
-static void
-why_log(struct mali_jm_queue *q)
-{
-   static const char *const names[MALI_JM_WHY_COUNT] = {
-      "barrier", "xfer", "batch", "heap", "xvtc", "wait",
-   };
-   const int64_t now = os_time_get_nano();
-   if (!q->why_since) {
-      q->why_since = now;
-      return;
+   if (bt->event_op != MALI_JM_EVENT_WAIT) {
+      const uint32_t req = bt->event_op == MALI_JM_EVENT_SET ? KB_JM_REQ_SOFT_EVENT_SET
+                                                             : KB_JM_REQ_SOFT_EVENT_RESET;
+      return mali_jm_build_atom(dev, MALI_JM_ATOM_EVENT, MALI_JM_SLOT_FRAG, req, bt->event_addr,
+                                NULL, ud, q->last[MALI_JM_SLOT_FRAG], q->last[MALI_JM_SLOT_VTC],
+                                result);
    }
-   if (now - q->why_since < 1000000000)
-      return;
-   char line[256];
-   int n = snprintf(line, sizeof(line), "malisx2 vtc waits: %u vtc atoms in %.2f s;",
-                    q->why_vtc, (now - q->why_since) / 1e9);
-   for (unsigned i = 0; i < MALI_JM_WHY_COUNT && n > 0 && (size_t)n < sizeof(line); i++)
-      n += snprintf(line + n, sizeof(line) - (size_t)n, " %s %u", names[i], q->why[i]);
-   mesa_logi("%s", line);
-   memset(q->why, 0, sizeof(q->why));
-   q->why_vtc = 0;
-   q->why_since = now;
+   const unsigned gate = stage_gate(bt->event_stages);
+   const uint8_t slot = (gate & GATE_VTC) ? MALI_JM_SLOT_VTC : MALI_JM_SLOT_FRAG;
+   const mali_jm_ref w =
+      mali_jm_build_atom(dev, MALI_JM_ATOM_EVENT_WAIT, slot, KB_JM_REQ_SOFT_EVENT_WAIT,
+                         bt->event_addr, NULL, ud, q->last[slot], 0, result);
+   if (w && gate == (GATE_FRAG | GATE_VTC))
+      q->carry |= MALI_JM_REQ_FRAG_AFTER_VTC;
+   return w;
 }
 
 /* The atom graph of the submit's waits and command buffers (file
@@ -941,47 +984,59 @@ build_submit(struct mali_device *dev, struct vk_queue_submit *submit, mali_jm_re
          const uint64_t ud = udata_of(c, k);
          mali_jm_ref vtc = 0;
 
+         if (unlikely(bt->event_op)) {
+            if (!build_event(dev, q, bt, ud, &result))
+               return result;
+            batch_frag[k] = q->last[MALI_JM_SLOT_FRAG];
+            continue;
+         }
+
          if (bt->vtc.first) {
             mali_jm_ref req = frag_req;
-            why_note(jd, q, MALI_JM_WHY_WAIT, frag_req);
             if (bt->vtc_after_frag == MALI_JM_AFTER_EARLIER ||
                 (q->carry & MALI_JM_REQ_VTC_AFTER_FRAG)) {
                req = newer(req, q->last[MALI_JM_SLOT_FRAG]);
-               why_note(jd, q, MALI_JM_WHY_BARRIER, q->last[MALI_JM_SLOT_FRAG]);
             } else {
                if (bt->vtc_after_frag == MALI_JM_AFTER_EARLIER_XFER ||
-                   (q->carry & MALI_JM_REQ_VTC_AFTER_FRAG_XFER)) {
+                   (q->carry & MALI_JM_REQ_VTC_AFTER_FRAG_XFER))
                   req = newer(req, q->last_frag_xfer);
-                  why_note(jd, q, MALI_JM_WHY_XFER, q->last_frag_xfer);
-               }
                if (bt->vtc_after_frag && bt->vtc_after_frag < MALI_JM_AFTER_EARLIER_XFER &&
-                   bt->vtc_after_frag - 1u < k) {
+                   bt->vtc_after_frag - 1u < k)
                   req = newer(req, batch_frag[bt->vtc_after_frag - 1u]);
-                  why_note(jd, q, MALI_JM_WHY_BATCH, batch_frag[bt->vtc_after_frag - 1u]);
-               }
             }
             if (bt->heap_slot >= 0 && bt->heap_slot < MALI_JM_HEAP_SLOTS_MAX) {
                req = newer(req, q->heap_last_frag[bt->heap_slot]);
                q->submit_tiled++;
-               why_note(jd, q, MALI_JM_WHY_HEAP, q->heap_last_frag[bt->heap_slot]);
             }
             /* A transfer-only requirement carried from an earlier command
              * buffer: met by the first vtc chain with a transfer job, or
              * by any vtc atom that waits for as much anyway (later vtc
              * atoms follow it in the slot order). */
             if (q->xvtc_frag) {
+               bool owed = bt->vtc_xfer;
+#if PAN_ARCH < 9
                /* A copy into a fresh image owes only a buffer barrier's. */
-               if (bt->vtc_xfer || (bt->vtc_fresh && q->xvtc_buf)) {
+               owed |= bt->vtc_fresh && q->xvtc_buf;
+#endif
+               if (owed)
                   req = newer(req, q->xvtc_frag);
-                  why_note(jd, q, MALI_JM_WHY_XVTC, q->xvtc_frag);
-               }
                if (req && newer(req, q->xvtc_frag) == req) {
                   q->xvtc_frag = 0;
+#if PAN_ARCH < 9
                   q->xvtc_buf = false;
+#endif
                }
             }
-            if (unlikely(q->why_on))
-               q->why_vtc++;
+#if PAN_ARCH < 9
+            /* The same for an image barrier's requirement, owed to the
+             * chains that can touch images. */
+            if (q->ivtc_frag) {
+               if (bt->vtc_img)
+                  req = newer(req, q->ivtc_frag);
+               if (req && newer(req, q->ivtc_frag) == req)
+                  q->ivtc_frag = 0;
+            }
+#endif
             vtc = mali_jm_build_atom(dev, MALI_JM_ATOM_VTC, MALI_JM_SLOT_VTC,
                                      MALI_JM_REQ_VTC | chain_req(&bt->vtc), bt->vtc.first,
                                      NULL, ud, q->last[MALI_JM_SLOT_VTC], req, &result);
@@ -1022,8 +1077,14 @@ build_submit(struct mali_device *dev, struct vk_queue_submit *submit, mali_jm_re
          q->xvtc_frag = newer(q->xvtc_frag, q->last[MALI_JM_SLOT_FRAG]);
       else if (cmd->jm.end_req & MALI_JM_REQ_XVTC_AFTER_FRAG_XFER)
          q->xvtc_frag = newer(q->xvtc_frag, q->last_frag_xfer);
+#if PAN_ARCH < 9
       if (cmd->jm.end_req & MALI_JM_REQ_XVTC_BUF)
          q->xvtc_buf = true;
+      if (cmd->jm.end_req & MALI_JM_REQ_IVTC_AFTER_FRAG)
+         q->ivtc_frag = newer(q->ivtc_frag, q->last[MALI_JM_SLOT_FRAG]);
+      else if (cmd->jm.end_req & MALI_JM_REQ_IVTC_AFTER_FRAG_XFER)
+         q->ivtc_frag = newer(q->ivtc_frag, q->last_frag_xfer);
+#endif
    }
    return VK_SUCCESS;
 }
@@ -1292,8 +1353,6 @@ MALI_PER_ARCH(queue_submit)(struct vk_queue *vkq, struct vk_queue_submit *submit
    q->submit_tiled = 0;
    result = build_submit(dev, submit, batch_frag);
    free(batch_frag);
-   if (unlikely(q->why_on))
-      why_log(q);
    mali_jm_ref tracker = 0;
    bool built = false;
    if (result == VK_SUCCESS)
@@ -1453,8 +1512,6 @@ MALI_PER_ARCH(device_init)(struct mali_device *dev)
                               MALI_JM_HEAP_SLOTS_MAX, MALI_JM_HEAP_SLOTS);
    jd->ubo_cpu_copy =
       !knob_uint("MALISX2_V7_GPU_UBO_COPY", "debug.malisx2.v7_gpu_ubo_copy", 0, 1, 0);
-   jd->desc_cpu_copy =
-      !knob_uint("MALISX2_V7_GPU_DESC_COPY", "debug.malisx2.v7_gpu_desc_copy", 0, 1, 0);
    jd->fpk_under_roa = knob_uint("MALISX2_V7_FPK_ROA", "debug.malisx2.v7_fpk_roa", 0, 1, 1);
    dev->v7_afbc_textures =
       knob_uint("MALISX2_V7_AFBC_TEX", "debug.malisx2.v7_afbc_tex", 0, 1, 1);
@@ -1477,9 +1534,7 @@ MALI_PER_ARCH(device_init)(struct mali_device *dev)
    mali_jm_heap_init(jd);
    jd->stats_interval_ns = stats_interval();
 #if PAN_ARCH < 9
-   jd->v7_image_barrier_narrow = !mali_debug_flag("vtcwait");
-   jd->v7_one_pass_batches = mali_debug_flag("onepass");
-   jd->v7_tile_ordered_fb_barrier = !mali_debug_flag("fbbarrier");
+   list_inithead(&jd->idraw_arenas);
 #endif
 
    dev->jm = jd;
@@ -1509,6 +1564,7 @@ MALI_PER_ARCH(device_finish)(struct mali_device *dev)
    mali_jm_heap_finish(jd);
 #if PAN_ARCH < 9
    mali_v7_desc_finish(dev);
+   mali_v7_idraw_arenas_finish(dev);
 #endif
 
    dev->vk.check_status = NULL;
@@ -1576,7 +1632,6 @@ MALI_PER_ARCH(queue_init)(struct mali_device *dev, struct mali_queue *queue)
    if (!q)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
    q->dev = dev;
-   q->why_on = mali_debug_flag("vtcwhy");
 
    pthread_mutex_lock(&dev->lock);
    jd->queue = q;

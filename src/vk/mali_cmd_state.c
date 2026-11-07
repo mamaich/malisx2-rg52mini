@@ -262,6 +262,17 @@ MALI_PER_ARCH(cmd_gfx_fau)(struct mali_cmd_buffer *cmd, const struct mali_shader
    return p.gpu | ((uint64_t)total << 56);
 }
 
+#if PAN_ARCH >= 10
+void
+MALI_PER_ARCH(gfx_fau_fill)(const struct mali_shader *s, const void *sysvals, const void *push,
+                            uint32_t push_size, uint64_t self, void *out)
+{
+   uint64_t tmp[MALI_FAU_WORD_COUNT];
+   MALI_PER_ARCH(cmd_gfx_fau_words)(s, sysvals, push, push_size, self, tmp);
+   memcpy(out, tmp, s->fau.total_count * sizeof(tmp[0]));
+}
+#endif
+
 /* ---------------------------------------------------------------------- */
 /* Thread-local storage                                                    */
 
@@ -478,11 +489,19 @@ push_begin(struct mali_cmd_buffer *cmd, struct mali_desc_state *st, unsigned sha
       if (!carry)
          memset(sh->data, 0, size);
       set->cpu = sh->data;
+#if PAN_ARCH < 9
+      /* v7 fills a draw's tables from this copy (the shadow is host
+       * memory; the GPU block is made at push_end). */
+      set->host = sh->data;
+#endif
    } else {
       set->cpu = NULL;
+      set->host = NULL;
       set->gpu = 0;
    }
    set->layout = layout;
+   set->desc_count = layout->desc_count;   /* push layouts have no variable count */
+   set->variable_count = 0;
    st->sets[idx] = set;
    MALI_PER_ARCH(descriptor_set_init_fixed_slots)(set);
    return true;

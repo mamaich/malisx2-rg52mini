@@ -21,19 +21,25 @@
  *    dummy sampler, and the bound sets' addresses;
  *  - mali_v7_desc_copy fills the entries that come from the sets (uniform
  *    buffers, textures, samplers, images and texel buffers, in the order of
- *    the shader's copy map) with one small Compute job in the same chain.
- *    The job that reads the tables depends on it: the Vertex job on the
+ *    the shader's copy map). Usually on the CPU, as the command is
+ *    recorded, from the sets' host copies (desc_fill_cpu). Otherwise with
+ *    one small Compute job in the same chain, as panvk does: for a set
+ *    laid out for update after bind, whose entries must be those of the
+ *    moment the command buffer executes, and for the image table. The job
+ *    that reads the tables depends on that job: the Vertex job on the
  *    vertex shader's, the dispatch on the compute shader's. A fragment
  *    shader's tables are read by the fragment job, which starts only once
  *    the whole vtc atom is done, so the Tiler job needs no dependency on
  *    that copy job (panvk adds none either);
  *  - storage buffers and size queries are not copied: the shader reads the
  *    set itself through the set addresses in its system values
- *    (mali_v7_desc_sysvals).
+ *    (mali_v7_desc_sysvals);
+ *  - a stage whose textures and samplers all come from one set laid out
+ *    for update after bind reads that set as its Texture and Sampler
+ *    tables, with nothing copied (mali_nir_lower_descriptors_v7.c).
  *
- * The copy runs on the GPU, as panvk's does, so the tables hold the sets as
- * they are when the command buffer executes; a copy on the CPU would read
- * set memory, which is CPU-uncached, one entry at a time.
+ * The host copy exists because set memory is CPU-uncached: reading a set
+ * back entry by entry would be slow.
  */
 
 #include "mali_cmd_state.h"
@@ -207,7 +213,7 @@ mali_v7_desc_refresh(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
    u_foreach_bit(i, s->desc.used_set_mask) {
       const struct mali_descriptor_set *set = desc ? desc->sets[i] : NULL;
       if (t->sets[i] != (set ? set->gpu : 0) ||
-          t->set_desc_counts[i] != (set ? set->layout->desc_count : 0))
+          t->set_desc_counts[i] != (set ? set->desc_count : 0))
          return false;
    }
 
@@ -269,15 +275,21 @@ mali_v7_desc_prepare(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
    if (!s->desc.used_set_mask && !v7->map_count && !s->desc.dyn_bufs.count)
       return true;
 
-   /* Every bound set: the copy shader's sources (panvk passes them all). */
+   /* Every bound set: the copy shader's sources (panvk passes them all).
+    * The tables are filled on the CPU only if every set the map copies
+    * from has a host copy: a set without one (a pool or a layout for
+    * update after bind) is read by the GPU as it is when the draw
+    * executes, so only a copy job sees what is written after the bind. A
+    * bound set the map does not read, a direct set nothing else copies
+    * from included, does not matter. */
+   out->cpu_fill = !v7->count[MALI_V7_DESC_TABLE_IMG];
    for (unsigned i = 0; i < MALI_MAX_SETS; i++) {
       const struct mali_descriptor_set *set = desc ? desc->sets[i] : NULL;
       out->sets[i] = set ? set->gpu : 0;
-      out->set_desc_counts[i] = set ? set->layout->desc_count : 0;
-      out->sets_cpu[i] = set ? set->cpu : NULL;
-      if (set && (s->desc.used_set_mask & BITFIELD_BIT(i)) &&
-          (set->layout->flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT))
-         out->update_after_bind = true;
+      out->set_desc_counts[i] = set ? set->desc_count : 0;
+      out->set_host[i] = set ? set->host : NULL;
+      if (set && set->gpu && !set->host && (v7->copy_set_mask & BITFIELD_BIT(i)))
+         out->cpu_fill = false;
    }
 
    for (unsigned t = 0; t < MALI_V7_DESC_TABLE_COUNT; t++) {
@@ -310,6 +322,16 @@ mali_v7_desc_prepare(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
             return false;
          out->img_attribs = a.gpu;
       }
+   }
+
+   /* A direct set is the stage's Texture and Sampler table: its slots,
+    * indexed as laid out, the Sampler table from the set's first sampler
+    * (mali_nir_lower_descriptors_v7.c). */
+   if (v7->direct_set >= 0) {
+      const uint64_t set = out->sets[v7->direct_set];
+      out->tables[MALI_V7_DESC_TABLE_TEXTURE] = set;
+      out->tables[MALI_V7_DESC_TABLE_SAMPLER] =
+         set ? set + (uint64_t)v7->direct_sampler_base * MALI_DESCRIPTOR_SIZE : 0;
    }
 
    /* A shader with textures and no sampler of its own gets one: texel
@@ -959,39 +981,39 @@ mali_v7_desc_finish(struct mali_device *dev)
 /* Filling the copied entries                                              */
 
 /*
- * The copy job's work done on the CPU while the draw records, for a shader
- * without images (whose entries the job turns into Attribute descriptors):
- * each map entry's slot, the whole Texture or Sampler descriptor or the
- * Uniform Buffer one at its start, into its table; zero for a slot past
- * its set's end. Without update-after-bind a bound set's slots stay as they
- * are until the command buffer has run, and a push set's shadow holds what
- * its block in command memory holds, so the slots read now are the ones the
- * job would read. Saves the job: 0.78 a draw on God of War (ARMSX2), most
- * of them for its pushed textures.
+ * The copy job's work done on the CPU, when the command buffer is
+ * recorded, from the sets' host copies: the same entries, read the same
+ * way (a slot past a set's end, or of a set that is not bound, reads as
+ * zeros). The draw then has no copy job, and its Vertex job no dependency
+ * on one: on the G52 each copy job is a small dispatch the Vertex job has
+ * to wait for, and hakuX binds a new set for most draws. Valid because a
+ * set of a pool that is not for update after bind may not change while a
+ * command buffer that bound it is recorded and run; the image table
+ * (storage images, texel buffers), whose entries the copy rewrites, keeps
+ * the job.
  */
 static void
-host_desc_copy(const struct mali_shader *s, const struct mali_v7_desc_tables *t)
+desc_fill_cpu(const struct mali_shader *s, const struct mali_v7_desc_tables *t)
 {
-   uint32_t m = 0;
+   static const uint8_t zero[MALI_DESCRIPTOR_SIZE];
+   uint32_t first = 0;
    for (unsigned tab = 0; tab < MALI_V7_DESC_TABLE_COUNT; tab++) {
       const uint32_t n = s->v7.count[tab];
-      if (!n)
-         continue;
-      const unsigned size = table_entry_size(tab);
+      const unsigned size = tab == MALI_V7_DESC_TABLE_UBO ? pan_size(UNIFORM_BUFFER)
+                            : tab == MALI_V7_DESC_TABLE_TEXTURE ? pan_size(TEXTURE)
+                                                                : pan_size(SAMPLER);
       uint8_t *dst = t->tables_cpu[tab];
-      for (uint32_t i = 0; i < n; i++, m++) {
-         const uint32_t h = s->v7.map[m];
+      assert(!n || (dst && tab != MALI_V7_DESC_TABLE_IMG));
+      for (uint32_t i = 0; i < n; i++) {
+         const uint32_t h = s->v7.map[first + i];
          const uint32_t set = MALI_COPY_DESC_HANDLE_SET(h);
-         const uint32_t idx = MALI_COPY_DESC_HANDLE_INDEX(h);
-         const uint8_t *src = set < MALI_MAX_SETS && idx < t->set_desc_counts[set] &&
-                                    t->sets_cpu[set]
-                                 ? (const uint8_t *)t->sets_cpu[set] + idx * MALI_DESCRIPTOR_SIZE
-                                 : NULL;
-         if (src)
-            memcpy(dst + i * size, src, size);
-         else
-            memset(dst + i * size, 0, size);
+         const uint32_t slot = MALI_COPY_DESC_HANDLE_INDEX(h);
+         const void *src = zero;
+         if (set < MALI_MAX_SETS && slot < t->set_desc_counts[set] && t->set_host[set])
+            src = (const uint8_t *)t->set_host[set] + (size_t)slot * MALI_DESCRIPTOR_SIZE;
+         memcpy(dst + (size_t)i * size, src, size);
       }
+      first += n;
    }
 }
 
@@ -1004,18 +1026,10 @@ mali_v7_desc_copy(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
    assert(t->shader == s);
    if (!s->v7.map_count)
       return true;
-   /* Not for update-after-bind sets (mali_v7_desc_tables): the CPU copy
-    * reads them as they are while the draw records. */
-   if (!s->v7.count[MALI_V7_DESC_TABLE_IMG] && cmd->dev->jm->desc_cpu_copy &&
-       !t->update_after_bind) {
-      bool ok = true;
-      for (unsigned tab = 0; tab < MALI_V7_DESC_TABLE_COUNT; tab++)
-         ok &= !s->v7.count[tab] || t->tables_cpu[tab];
-      if (ok) {
-         host_desc_copy(s, t);
-         cmd->jm.stats.desc_host_copies[s->stage == MESA_SHADER_FRAGMENT]++;
-         return true;
-      }
+   if (t->cpu_fill) {
+      desc_fill_cpu(s, t);
+      cmd->jm.stats.desc_host_copies[s->stage == MESA_SHADER_FRAGMENT]++;
+      return true;
    }
    /* The map is in GPU memory: shader_upload uploads it whatever the size
     * of the code, or fails the shader (mali_shader.c). */

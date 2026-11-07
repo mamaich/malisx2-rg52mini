@@ -163,7 +163,7 @@ dep_gbm = with_platform_android ? dependency('', required : false) \
 
 malisx2_vk = static_library(
   'mali_vk',
-  files('vk/mali_cpuprof.c', 'vk/mali_device.c', 'vk/mali_icd.c', 'vk/mali_instance.c',
+  files('vk/mali_device.c', 'vk/mali_icd.c', 'vk/mali_instance.c',
         'vk/mali_physical_device.c'),
   # Memory, buffers, images, formats.
   files('vk/mali_buffer.c', 'vk/mali_device_memory.c', 'vk/mali_formats.c',
@@ -175,19 +175,20 @@ malisx2_vk = static_library(
   # Command buffers, the CSF queue, submit and sync.
   files('vk/mali_cmd_buffer.c', 'vk/mali_cmd_dispatch.c', 'vk/mali_cmd_event.c',
         'vk/mali_queue.c', 'vk/mali_sync.c'),
-  # VkEvent (v11): the host side and the object; the vkCmd* commands are
-  # mali_cmd_event.c above.
+  # VkEvent: the host side and the object, for every arch; the vkCmd*
+  # commands are mali_cmd_event.c above (v11) and mali_jm_event.c (v7, v9).
   files('vk/mali_event.c'),
   # Query pools: the pool and its host reads, and the v11 commands.
   files('vk/mali_cmd_query.c', 'vk/mali_query.c'),
   # Render passes and draws (the CSF side; the shared builders and the
   # image transfers are per-arch files).
-  files('vk/mali_cmd_draw.c', 'vk/mali_cmd_render.c'),
+  files('vk/mali_cmd_draw.c', 'vk/mali_cmd_draw_indirect.c', 'vk/mali_cmd_render.c'),
   # Sync files and the Android window system; mali_android.c only on Android.
   files('vk/mali_sync_file.c', 'vk/mali_wsi.c'),
   with_platform_android ? files('vk/mali_android.c') : files('vk/mali_wsi_linux.c'),
-  # Timing and command-stream capture (MALISX2_MEASURE).
-  files('measurement/config.c', 'measurement/recorder.c', 'measurement/timing.c'),
+  # Timing, command-stream capture and the CPU profile (MALISX2_MEASURE).
+  files('measurement/config.c', 'measurement/cpuprof.c', 'measurement/recorder.c',
+        'measurement/timing.c'),
   mali_entrypoints, mali_waist_stubs, mali_version_h, mali_shader_cache_id_h,
   include_directories : [inc_include, inc_src, inc_malisx2, include_directories('vk'),
                          include_directories('measurement')],
@@ -218,8 +219,11 @@ malisx2_vk_v11 = static_library(
 # mali_jm_cmd_draw_v7.c at 7).
 _vk_jm_files = files(
   'vk/mali_jm_cmd_buffer.c', 'vk/mali_jm_cmd_dispatch.c',
-  'vk/mali_jm_cmd_render.c', 'vk/mali_jm_heap.c', 'vk/mali_jm_query.c',
+  'vk/mali_jm_cmd_render.c', 'vk/mali_jm_event.c', 'vk/mali_jm_heap.c',
+  'vk/mali_jm_query.c',
   'vk/mali_jm_queue.c', 'vk/mali_jm_sync_file.c', 'vk/mali_query.c', 'vk/mali_sync.c',
+  # The internal shaders of indirect draws.
+  'vk/mali_jm_idraw_nir.c',
   'vk/mali_wsi.c',
   # Timing and command-stream capture on the job manager (MALISX2_MEASURE):
   # their own implementation of what touches struct mali_cmd_buffer
@@ -256,9 +260,10 @@ malisx2_vk_v7 = static_library(
   _vk_jm_files,
   # The Bifrost draws (a Vertex and a Tiler job each, in place of v9's
   # mali_jm_cmd_draw.c); the descriptor tables and the copy jobs, shared by
-  # the v7 draws and dispatches; the Bifrost descriptor lowering.
+  # the v7 draws and dispatches; the Bifrost descriptor lowering and the
+  # clamped form of bounds-checked storage buffer loads.
   files('vk/mali_jm_cmd_draw_v7.c', 'vk/mali_jm_desc_v7.c', 'vk/mali_jm_irange_v7.c',
-        'vk/mali_nir_lower_descriptors_v7.c'),
+        'vk/mali_nir_lower_bounded_loads.c', 'vk/mali_nir_lower_descriptors_v7.c'),
   _vk_per_arch_files,
   mali_entrypoints[0],   # the header only; the tables are malisx2_vk's
   include_directories : _vk_inc,

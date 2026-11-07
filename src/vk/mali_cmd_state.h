@@ -121,7 +121,11 @@ mali_thread_props(const struct mali_device *dev)
 
 #if PAN_ARCH >= 9
 /* panvk calculate_task_axis_and_increment: spread workgroups evenly over
- * the cores, with tasks small enough that other clients can share them. */
+ * the cores, with tasks small enough that other clients can share them.
+ * groups NULL is an indirect dispatch, whose count is not known when the
+ * job is built: axis X and the largest increment the threads allow, which
+ * the hardware clamps to the count along the axis (panvk's indirect
+ * dispatch does the same). */
 static inline void
 mali_compute_task_axis(const struct mali_thread_props *tp, const struct mali_shader *cs,
                        const uint32_t groups[3], unsigned *axis, unsigned *inc)
@@ -131,15 +135,22 @@ mali_compute_task_axis(const struct mali_thread_props *tp, const struct mali_sha
       MIN3(tp->max_threads_per_wg, tp->max_threads_per_core, tp->registers_per_core / regs);
    const unsigned threads_per_wg =
       cs->cs.local_size[0] * cs->cs.local_size[1] * cs->cs.local_size[2];
-   const uint64_t total = (uint64_t)groups[0] * groups[1] * groups[2];
+   const unsigned threads_per_task = DIV_ROUND_UP(max_threads, tp->max_tasks_per_core);
 
    *axis = MALI_TASK_AXIS_X;
    *inc = 1;
-   if (!total || !threads_per_wg)
+   if (!threads_per_wg)
+      return;
+   if (!groups) {
+      *inc = MAX2(threads_per_task / threads_per_wg, 1);
+      return;
+   }
+
+   const uint64_t total = (uint64_t)groups[0] * groups[1] * groups[2];
+   if (!total)
       return;
 
    const unsigned wgs_per_core = (unsigned)MIN2(DIV_ROUND_UP(total, tp->core_count), UINT32_MAX);
-   const unsigned threads_per_task = DIV_ROUND_UP(max_threads, tp->max_tasks_per_core);
    unsigned wgs_per_task = CLAMP(threads_per_task / threads_per_wg, 1, wgs_per_core);
 
    *inc = wgs_per_task;
@@ -229,6 +240,22 @@ mali_compute_fau(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
    return p.gpu | ((uint64_t)cs->fau.total_count << 56);
 }
 
+/* Byte offset in a dispatch's FAU block (mali_compute_fau) of the 32-bit
+ * field `off` bytes into struct mali_compute_sysvals, -1 if the shader does
+ * not read that field's word. The used sysval words come first, in order, so
+ * a word's place is the number of used words before it. */
+static inline int
+mali_compute_fau_sysval_offset(const struct mali_shader *cs, unsigned off)
+{
+   const unsigned w = off / MALI_FAU_WORD_SIZE;
+   if (w >= MALI_MAX_SYSVAL_FAUS || !BITSET_TEST(cs->fau.used_sysvals, w))
+      return -1;
+   unsigned rank = 0;
+   for (unsigned i = 0; i < w; i++)
+      rank += BITSET_TEST(cs->fau.used_sysvals, i);
+   return rank * MALI_FAU_WORD_SIZE + off % MALI_FAU_WORD_SIZE;
+}
+
 #if PAN_ARCH >= 9
 /*
  * Resource table of a dispatch: entry 0 the driver set (the dummy sampler,
@@ -301,7 +328,11 @@ mali_cmd_tls_size_field(const struct mali_cmd_buffer *cmd)
 
 /* Local Storage descriptor of a dispatch (pan_emit_tls): the command
  * buffer's TLS buffer and, for shaders with shared memory, a per-dispatch
- * WLS buffer. 0 on failure. */
+ * WLS buffer. 0 on failure. groups NULL is an indirect dispatch, whose
+ * count is not known yet: its WLS gets as many instances as the cores can
+ * hold at once (as panvk's pan_calc_wls_instances), which is also the most
+ * any dispatch gets, so the buffer is sized by the hardware's thread
+ * limits and the shader, not by a workgroup count. */
 static inline uint64_t
 mali_compute_tsd(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
                  const struct mali_thread_props *tp, const uint32_t groups[3])
@@ -323,7 +354,8 @@ mali_compute_tsd(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
       unsigned wg_per_task =
          DIV_ROUND_UP(tp->max_threads_per_core / tp->max_tasks_per_core, threads_per_wg);
       unsigned max_per_core = util_next_power_of_two(wg_per_task * tp->max_tasks_per_core);
-      unsigned dispatch = util_next_power_of_two(groups[0]) *
+      unsigned dispatch = !groups ? max_per_core :
+                          util_next_power_of_two(groups[0]) *
                           util_next_power_of_two(groups[1]) *
                           util_next_power_of_two(groups[2]);
       wls_instances = MIN2(dispatch, max_per_core);
@@ -500,20 +532,22 @@ mali_gfx_pack_dyn_bufs(const struct mali_shader_desc_info *di, const struct mali
    }
 }
 
-/* Resource table: entry 0 the driver set (already built), entry N + 1
- * descriptor set N. */
-static inline uint64_t
-mali_gfx_res_table(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
-                   const struct mali_desc_state *desc, uint64_t drv, uint32_t drv_count)
+/* Entries of a stage's resource table (mali_gfx_pack_res_table). */
+static ALWAYS_INLINE uint32_t
+mali_gfx_res_table_count(const struct mali_shader *s)
+{
+   return ALIGN_POT(1 + util_last_bit(s->desc.used_set_mask), MALI_RESOURCE_TABLE_SIZE_ALIGNMENT);
+}
+
+/* Resource table at out (count = mali_gfx_res_table_count entries):
+ * entry 0 the driver set at drv, entry N + 1 descriptor set N. */
+static ALWAYS_INLINE void
+mali_gfx_pack_res_table(const struct mali_shader *s, const struct mali_desc_state *desc,
+                        uint64_t drv, uint32_t drv_count, uint32_t count, uint8_t *out)
 {
    const struct mali_shader_desc_info *di = &s->desc;
-   uint32_t last = util_last_bit(di->used_set_mask);
-   uint32_t count = ALIGN_POT(1 + last, MALI_RESOURCE_TABLE_SIZE_ALIGNMENT);
-   struct mali_ptr t = mali_cmd_alloc(cmd, count * MALI_RESOURCE_SIZE, 64);
-   if (!t.cpu)
-      return 0;
 
-   pan_cast_and_pack(t.cpu, RESOURCE, cfg) {
+   pan_cast_and_pack(out, RESOURCE, cfg) {
       cfg.address = drv;
       cfg.size = drv_count * MALI_DESCRIPTOR_SIZE;
       cfg.contains_descriptors = true;
@@ -523,8 +557,21 @@ mali_gfx_res_table(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
       const struct mali_descriptor_set *ds =
          (set < MALI_MAX_SETS && (di->used_set_mask & BITFIELD_BIT(set))) ? desc->sets[set]
                                                                           : NULL;
-      MALI_PER_ARCH(descriptor_set_pack_resource)(ds, (uint8_t *)t.cpu + i * MALI_RESOURCE_SIZE);
+      MALI_PER_ARCH(descriptor_set_pack_resource)(ds, out + i * MALI_RESOURCE_SIZE);
    }
+}
+
+/* Resource table: entry 0 the driver set (already built), entry N + 1
+ * descriptor set N. */
+static inline uint64_t
+mali_gfx_res_table(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
+                   const struct mali_desc_state *desc, uint64_t drv, uint32_t drv_count)
+{
+   const uint32_t count = mali_gfx_res_table_count(s);
+   struct mali_ptr t = mali_cmd_alloc(cmd, count * MALI_RESOURCE_SIZE, 64);
+   if (!t.cpu)
+      return 0;
+   mali_gfx_pack_res_table(s, desc, drv, drv_count, count, t.cpu);
    return t.gpu | count;
 }
 
@@ -569,26 +616,29 @@ mali_gfx_pack_attrib(const struct vk_vertex_input_state *vi, const uint16_t *str
    }
 }
 
-/* Vertex stage resource table. Table 0: 16 attributes, the dummy sampler,
- * the dynamic buffers, then one Buffer per vertex binding (panvk
- * prepare_vs_driver_set). 0 on failure. */
-static inline uint64_t
-mali_gfx_vs_srt(struct mali_cmd_buffer *cmd)
+/* Entries of the vertex stage's driver set (mali_gfx_pack_vs_drv): the
+ * *vb_count vertex buffers start at *vb_offset. */
+static ALWAYS_INLINE uint32_t
+mali_gfx_vs_drv_count(const struct mali_shader *vs, const struct vk_vertex_input_state *vi,
+                      uint32_t *vb_offset, uint32_t *vb_count)
+{
+   uint32_t n = 0;
+   u_foreach_bit(i, vi->attributes_valid)
+      n = MAX2(vi->attributes[i].binding + 1, n);
+   *vb_count = n;
+   *vb_offset = MALI_MAX_VS_ATTRIBS + 1 + vs->desc.dyn_bufs.count;
+   return *vb_offset + n;
+}
+
+/* The vertex stage's driver set at descs (mali_gfx_vs_drv_count entries):
+ * 16 attributes, the dummy sampler, the dynamic buffers, then one Buffer
+ * per vertex binding (panvk prepare_vs_driver_set). */
+static ALWAYS_INLINE void
+mali_gfx_pack_vs_drv(struct mali_cmd_buffer *cmd, const struct mali_shader *vs,
+                     const struct vk_vertex_input_state *vi, uint8_t *descs, uint32_t vb_offset,
+                     uint32_t vb_count)
 {
    const struct mali_gfx_draw_state *d = &cmd->gfx.draw;
-   const struct mali_shader *vs = d->pipeline->vs;
-   const struct vk_vertex_input_state *vi = d->vi;
-
-   uint32_t vb_count = 0;
-   u_foreach_bit(i, vi->attributes_valid)
-      vb_count = MAX2(vi->attributes[i].binding + 1, vb_count);
-   const uint32_t vb_offset = MALI_MAX_VS_ATTRIBS + 1 + vs->desc.dyn_bufs.count;
-   const uint32_t count = vb_offset + vb_count;
-
-   struct mali_ptr p = mali_cmd_alloc(cmd, count * MALI_DESCRIPTOR_SIZE, MALI_DESCRIPTOR_SIZE);
-   if (!p.cpu)
-      return 0;
-   uint8_t *descs = p.cpu;
 
    for (uint32_t i = 0; i < MALI_MAX_VS_ATTRIBS; i++) {
       void *o = descs + i * MALI_DESCRIPTOR_SIZE;
@@ -616,7 +666,32 @@ mali_gfx_vs_srt(struct mali_cmd_buffer *cmd)
          pan_cast_and_pack(o, NULL_DESCRIPTOR, cfg);
       }
    }
+}
+
+/* Vertex stage resource table: table 0 is the driver set
+ * (mali_gfx_pack_vs_drv). 0 on failure. *drv (when not NULL): table 0's
+ * address, where attribute i's descriptor is the i-th. */
+static inline uint64_t
+mali_gfx_vs_srt_drv(struct mali_cmd_buffer *cmd, uint64_t *drv)
+{
+   const struct mali_gfx_draw_state *d = &cmd->gfx.draw;
+   const struct mali_shader *vs = d->pipeline->vs;
+   const struct vk_vertex_input_state *vi = d->vi;
+   uint32_t vb_offset, vb_count;
+   const uint32_t count = mali_gfx_vs_drv_count(vs, vi, &vb_offset, &vb_count);
+   struct mali_ptr p = mali_cmd_alloc(cmd, count * MALI_DESCRIPTOR_SIZE, MALI_DESCRIPTOR_SIZE);
+   if (!p.cpu)
+      return 0;
+   mali_gfx_pack_vs_drv(cmd, vs, vi, p.cpu, vb_offset, vb_count);
+   if (drv)
+      *drv = p.gpu;
    return mali_gfx_res_table(cmd, vs, &cmd->gfx.desc, p.gpu, count);
+}
+
+static inline uint64_t
+mali_gfx_vs_srt(struct mali_cmd_buffer *cmd)
+{
+   return mali_gfx_vs_srt_drv(cmd, NULL);
 }
 
 /* Fragment varyings read with LD_VAR (panvk emit_varying_descs). */
@@ -1014,12 +1089,11 @@ struct mali_draw_info {
    bool indexed;
 };
 
-#if PAN_ARCH < 9
 /* Whether a dirty dynamic state may feed the pipeline bake (gfx_pack_state):
  * any but the viewports, scissors, blend constants and vertex input, which
  * the draw reads through groups of their own. */
 static inline bool
-mali_v7_dyn_bake_dirty(const struct vk_dynamic_graphics_state *dyn)
+mali_gfx_dyn_bake_dirty(const struct vk_dynamic_graphics_state *dyn)
 {
    BITSET_DECLARE(d, MESA_VK_DYNAMIC_GRAPHICS_STATE_ENUM_MAX);
    memcpy(d, dyn->dirty, sizeof(d));
@@ -1033,7 +1107,22 @@ mali_v7_dyn_bake_dirty(const struct vk_dynamic_graphics_state *dyn)
    BITSET_CLEAR(d, MESA_VK_DYNAMIC_VI_BINDING_STRIDES);
    return !BITSET_IS_EMPTY(d);
 }
-#endif
+
+/* Whether a draw reaches the rasterizer. A pipeline with rasterizer discard
+ * (static, or set dynamically) makes a draw that nothing can observe on v9
+ * and v11: the vertex shader writes no memory (vertexPipelineStoresAndAtomics
+ * is off), there is no transform feedback or primitives-generated query, and
+ * no fragment is produced for an occlusion query to count. Such a draw is
+ * dropped before it touches any state, so the dirty bits and staging
+ * registers are as they were for the next draw. (v7 keeps the Vertex job
+ * and drops the Tiler job instead, mali_jm_cmd_draw_v7.c.) */
+static inline bool
+mali_gfx_discards(const struct mali_cmd_buffer *cmd)
+{
+   const struct mali_gfx_bind *bd = &cmd->gfx.draw.pipeline->bind;
+   return unlikely(bd->dynamic ? cmd->vk.dynamic_graphics_state.rs.rasterizer_discard_enable
+                               : bd->discard);
+}
 
 /* Dynamic states this driver reads at draw time, per dirty group. */
 static inline void
@@ -1060,13 +1149,11 @@ mali_gfx_collect_dynamic_dirty(struct mali_cmd_buffer *cmd)
    if (BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_INPUT_ATTACHMENT_MAP))
       d->dirty |= MALI_GFX_DIRTY_FS_FAU;
    if (d->pipeline && d->pipeline->bind.dynamic) {
-      /* Words baked from state the pipeline left dynamic: repack. On v7
-       * only when a state the bake reads changed: the runtime marks a
-       * state dirty only when its value changes, and a new pipeline, a
-       * pass and meta operations mark these groups themselves. */
-#if PAN_ARCH < 9
-      if (mali_v7_dyn_bake_dirty(dyn))
-#endif
+      /* Words baked from state the pipeline left dynamic: repack, when a
+       * state the bake reads changed. The runtime marks a state dirty only
+       * when its value changes, and a new pipeline, a pass and meta
+       * operations mark these groups themselves. */
+      if (mali_gfx_dyn_bake_dirty(dyn))
          d->dirty |= MALI_GFX_DIRTY_PIPELINE | MALI_GFX_DIRTY_ZSD | MALI_GFX_DIRTY_BLEND |
                      MALI_GFX_DIRTY_FS_FAU;
    }
@@ -1145,6 +1232,7 @@ mali_gfx_update_dirty(struct mali_cmd_buffer *cmd, const struct mali_draw_info *
             .rp = &p->rp,
             .vs = p->vs,
             .fs = p->fs,
+            .view_mask = p->state.rp.view_mask,
          };
          d->dyn_baked.uses_dynamic_state = true;
          MALI_PER_ARCH(gfx_pack_state)(&in, &d->dyn_baked);

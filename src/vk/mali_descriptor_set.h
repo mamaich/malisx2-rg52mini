@@ -71,10 +71,23 @@ struct mali_descriptor_set {
    const struct mali_descriptor_set_layout *layout;
    bool own_layout_ref;
 
-   /* The set's slots: layout->desc_count descriptors. Both 0/NULL for a
-    * layout without slots (dynamic buffers only, or empty). */
+   /* The set's slots: desc_count descriptors, the layout's (with the
+    * variable-count binding at the count the set was allocated with:
+    * mali_desc_set_slots). gpu and cpu are 0/NULL for a layout without
+    * slots (dynamic buffers only, or empty). */
+   uint32_t desc_count;
+   /* Elements of the layout's variable-count binding in this set, 0 if it
+    * has none. */
+   uint32_t variable_count;
    uint64_t gpu;
    void *cpu;
+   /* The same slots in cached host memory, written along with cpu, for
+    * the CPU to read: v7 builds a draw's descriptor tables from them
+    * (mali_jm_desc_v7.c). Only v7 has it, and only for a set of a pool
+    * that is not update-after-bind; NULL otherwise, and without slots. A
+    * push descriptor set's cpu is already such a copy, and host is the
+    * same pointer. */
+   void *host;
 
    /* Dynamic uniform/storage buffers, by the index the layout gives them
     * (binding desc_idx + array element). */
@@ -100,6 +113,10 @@ struct mali_descriptor_pool {
    struct mali_kbase_bo bo;
    struct util_vma_heap heap;
    uint64_t heap_size;
+   /* The sets' host copies (mali_descriptor_set::host), heap_size bytes
+    * at the same offsets as in bo. NULL on v9 and v11, and for a pool
+    * created with the update-after-bind bit. */
+   uint8_t *host;
 
    /* Descriptors of each type still available (mali_desc_type_index). */
    uint32_t avail[MALI_DESC_TYPE_COUNT];
@@ -128,11 +145,11 @@ struct mali_descriptor_pool {
 VK_DEFINE_NONDISP_HANDLE_CASTS(mali_descriptor_pool, base, VkDescriptorPool,
                                VK_OBJECT_TYPE_DESCRIPTOR_POOL)
 
-/* Bytes of GPU memory a set of this layout occupies. */
+/* Bytes of GPU memory the set occupies. */
 static inline uint64_t
 mali_descriptor_set_size(const struct mali_descriptor_set *set)
 {
-   return (uint64_t)set->layout->desc_count * MALI_DESCRIPTOR_SIZE;
+   return (uint64_t)set->desc_count * MALI_DESCRIPTOR_SIZE;
 }
 
 /* Where a dynamic buffer bound to nothing points: an address the GPU's

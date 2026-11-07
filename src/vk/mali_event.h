@@ -4,28 +4,27 @@
  */
 
 /*
- * VkEvent, on the command-stream frontend (v11). An event is one 32-bit
- * word (in a 16-byte slot) of CPU-uncached device memory, the memory type
- * the application sees as HOST_VISIBLE | HOST_COHERENT. Nonzero means set.
+ * VkEvent, on every arch. An event is one 32-bit word (in a 16-byte slot)
+ * of memory the CPU and GPU see coherently without cache maintenance: CSF
+ * event memory on v11, CPU-uncached device memory on the job manager
+ * (mali_event.c, mali_event_pool_init). Nonzero means set.
  *
- *  - The host sets and resets it with a store (vkSetEvent, vkResetEvent)
- *    and reads it for vkGetEventStatus.
- *  - The device writes it from the queue, in queue order after everything
- *    recorded before the command: vkCmdSetEvent2 and vkCmdResetEvent2, as
- *    SYNC_SET32 at system scope (mali_cmd_event.c).
- *  - vkCmdWaitEvents2 is a pipeline barrier built from its dependency
- *    infos. There is one queue and the event is set earlier in it (or by
- *    the host before the command buffer is submitted), so the barrier
- *    already orders what the wait would. An event set by the host after
- *    the waiting command buffer was submitted is not supported: nothing
- *    waits for it.
+ *  - The host resets it with a store (vkResetEvent) and reads it for
+ *    vkGetEventStatus. vkSetEvent stores 1 and then tells the kernel, so
+ *    that GPU work waiting on the event goes on: SOFT_EVENT_UPDATE on the
+ *    job manager, CS_EVENT_SIGNAL on the command-stream frontend
+ *    (mali_event.c).
+ *  - The device writes it in queue order, after everything recorded before
+ *    the command (vkCmdSetEvent2, vkCmdResetEvent2), and waits for it
+ *    (vkCmdWaitEvents2): on v11 with command-stream sync instructions
+ *    (mali_cmd_event.c), on the job manager (v7, v9) with kbase soft atoms
+ *    (EVENT_SET, EVENT_RESET, EVENT_WAIT; mali_jm_event.c). The job
+ *    manager's kernel reads and writes only the word's first byte, which is
+ *    the whole value in little-endian order.
  *
- * The job-manager GPUs (v7, v9) have no events: their entry points are
- * waist stubs.
- *
- * VK_EVENT_CREATE_DEVICE_ONLY_BIT needs synchronization2, which the driver
- * does not expose, so the creation flags are not looked at: every event is
- * host-visible.
+ * VK_EVENT_CREATE_DEVICE_ONLY_BIT needs synchronization2, which every arch
+ * offers; the creation flags are not looked at: every event is
+ * host-visible, which a device-only event may also be.
  */
 
 #ifndef MALI_EVENT_H

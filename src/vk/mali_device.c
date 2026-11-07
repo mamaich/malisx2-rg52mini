@@ -16,13 +16,6 @@
 #include <string.h>
 #include <time.h>
 
-#ifdef __ANDROID__
-#include <sys/system_properties.h>
-#define PROP_VALUE_MAX_ PROP_VALUE_MAX
-#else
-#define PROP_VALUE_MAX_ 92
-#endif
-
 #include "c11/threads.h"
 #include "util/log.h"
 
@@ -37,48 +30,12 @@
 #include "vk_pipeline_cache.h"
 
 #include "util/hash_table.h"
+#include "util/stack_array.h"
 #include "mali_pipeline.h"
 
 #ifndef __ANDROID__
 #include "wsi_common.h"
 #endif
-
-/* ---------------------------------------------------------------------- */
-/* Debug switches (mali_vk.h)                                              */
-
-static char debug_flags[PROP_VALUE_MAX_ + 2];
-static once_flag debug_flags_once = ONCE_FLAG_INIT;
-
-static void
-debug_flags_read(void)
-{
-   /* Kept with a comma at each end, so a name matches as ",name,". */
-   const char *s = getenv("MALISX2_DEBUG");
-#ifdef __ANDROID__
-   char prop[PROP_VALUE_MAX];
-   if (!s || !*s) {
-      prop[0] = 0;
-      __system_property_get("debug.malisx2.debug", prop);
-      s = prop;
-   }
-#endif
-   snprintf(debug_flags, sizeof(debug_flags), ",%s,", s ? s : "");
-   for (char *p = debug_flags; *p; p++) {
-      if (*p == ' ')
-         *p = ',';
-   }
-   if (debug_flags[2])
-      mesa_logi("malisx2: debug switches \"%s\"", s);
-}
-
-bool
-mali_debug_flag(const char *name)
-{
-   call_once(&debug_flags_once, debug_flags_read);
-   char key[48];
-   snprintf(key, sizeof(key), ",%s,", name);
-   return strstr(debug_flags, key) != NULL;
-}
 
 /* ---------------------------------------------------------------------- */
 /* Interned keys (mali_pipeline.h), shared by every arch's pipelines      */
@@ -245,8 +202,7 @@ device_destroy(struct mali_device *dev, const VkAllocationCallbacks *alloc)
       vk_pipeline_cache_destroy(dev->vk.mem_cache, NULL);
    mali_device_keys_finish(dev);
    if (dev->kbase) {
-      if (!mali_arch_is_jm(mali_device_physical(dev)->arch))
-         mali_event_pool_finish(dev);
+      mali_event_pool_finish(dev);
       mali_bo_pool_finish(&dev->desc_pool);
       mali_bo_pool_finish(&dev->exec_pool);
    }
@@ -319,10 +275,37 @@ mali_CreateDevice(VkPhysicalDevice physicalDevice,
    vk_device_dispatch_table_from_entrypoints(&dispatch, &wsi_device_entrypoints, false);
 #endif
 
+   /* On v7 VK_MALISX2_descriptor_indexing is VK_EXT_descriptor_indexing to
+    * Mesa's runtime, which supports only the latter where the former is
+    * offered (mali_EnumerateDeviceExtensionProperties). The EXT itself is
+    * not offered there, so it cannot be enabled by name. v9 and v11 offer
+    * the EXT under its own name, and malisx2's name is unknown to them. */
+   VkDeviceCreateInfo create_info = *pCreateInfo;
+   STACK_ARRAY(const char *, ext_names, pCreateInfo->enabledExtensionCount);
+   if (!ext_names) {
+      vk_free2(&instance->vk.alloc, pAllocator, dev);
+      return vk_error(pdev, VK_ERROR_OUT_OF_HOST_MEMORY);
+   }
+   for (uint32_t i = 0; i < pCreateInfo->enabledExtensionCount; i++) {
+      const char *name = pCreateInfo->ppEnabledExtensionNames[i];
+      if (mali_descriptor_indexing_renamed(pdev->arch)) {
+         if (!strcmp(name, VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME)) {
+            STACK_ARRAY_FINISH(ext_names);
+            vk_free2(&instance->vk.alloc, pAllocator, dev);
+            return vk_errorf(pdev, VK_ERROR_EXTENSION_NOT_PRESENT, "%s not supported", name);
+         }
+         if (!strcmp(name, VK_MALISX2_DESCRIPTOR_INDEXING_EXTENSION_NAME))
+            name = VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME;
+      }
+      ext_names[i] = name;
+   }
+   create_info.ppEnabledExtensionNames = ext_names;
+
    /* Checks the extension names and the requested features against what
     * the physical device reports (VK_ERROR_EXTENSION_NOT_PRESENT /
     * VK_ERROR_FEATURE_NOT_PRESENT). */
-   result = vk_device_init(&dev->vk, &pdev->vk, &dispatch, pCreateInfo, pAllocator);
+   result = vk_device_init(&dev->vk, &pdev->vk, &dispatch, &create_info, pAllocator);
+   STACK_ARRAY_FINISH(ext_names);
    if (result != VK_SUCCESS) {
       vk_free2(&instance->vk.alloc, pAllocator, dev);
       return result;
@@ -389,8 +372,7 @@ mali_CreateDevice(VkPhysicalDevice physicalDevice,
     * identical shaders through the device's own in-memory cache. */
    mali_bo_pool_init_exec(&dev->exec_pool, dev->kbase);
    mali_bo_pool_init_desc(&dev->desc_pool, dev->kbase);
-   if (!mali_arch_is_jm(pdev->arch))
-      mali_event_pool_init(dev);
+   mali_event_pool_init(dev);
    mali_device_keys_init(dev);
    /* Frontend-neutral device state: every path below this point that can
     * fail calls device_destroy, which tears this down again, so it must

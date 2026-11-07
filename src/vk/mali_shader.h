@@ -359,6 +359,19 @@ struct mali_v7_shader_desc {
    /* The shader reads v7_desc.sets: storage buffers, texture or image size
     * queries. */
    bool needs_set_addrs;
+   /* The sets the map copies from, one bit each. A direct set nothing is
+    * copied from is not among them. */
+   uint32_t copy_set_mask;
+   /* The direct set (mali_nir_lower_descriptors_v7.c): every texture and
+    * sampler of the stage comes from this set, laid out for update after
+    * bind, by its slot in it. The stage's Texture and Sampler tables are
+    * the set's own memory (direct_slots slots), nothing is copied. -1:
+    * none. The Sampler table starts at the set's first sampler, slot
+    * direct_sampler_base: a texel fetch names sampler 0 (pan_nir_lower_tex),
+    * which must be a sampler. */
+   int32_t direct_set;
+   uint32_t direct_slots;
+   uint32_t direct_sampler_base;
    /* The lowering could not allocate its map (mali_shader.c lower_nir). */
    bool failed;
    /* The shader's constant data (host copy, for serialization) and its GPU
@@ -530,6 +543,16 @@ bool mali_nir_lower_descriptors_v7(nir_shader *nir,
                                    const struct vk_pipeline_layout *layout,
                                    struct mali_shader_desc_info *desc_info,
                                    struct mali_v7_shader_desc *v7);
+/* v7 (mali_nir_lower_bounded_loads.c): load_global_bounded, which
+ * nir_lower_explicit_io emits for a robust storage buffer load in a shader
+ * whose options have has_load_global_bounded, as a load whose offset is
+ * clamped into the buffer. */
+bool mali_nir_lower_bounded_loads(nir_shader *nir);
+/* The colour attachments the pipeline can read as input attachments and the
+ * shader does not write, one bit per attachment (the read-only tile loads of
+ * v10 and up). Exported for the host test. */
+uint32_t mali_nir_readonly_color_mask(nir_shader *nir,
+                                      const struct vk_graphics_pipeline_state *state);
 bool mali_nir_lower_input_attachment_loads(nir_shader *nir, unsigned arch,
                                            const struct vk_graphics_pipeline_state *state,
                                            uint32_t *input_attachment_read);

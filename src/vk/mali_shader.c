@@ -60,6 +60,7 @@
 #include "panfrost/compiler/pan_nir.h"
 #include "util/blob.h"
 #include "util/log.h"
+#include "util/u_call_once.h"
 #include "util/u_dynarray.h"
 
 #include "vk_graphics_state.h"
@@ -132,6 +133,24 @@ static_assert(sizeof(struct mali_graphics_sysvals) % MALI_FAU_WORD_SIZE == 0,
               "sysvals are whole FAU words");
 static_assert(sizeof(struct mali_compute_sysvals) % MALI_FAU_WORD_SIZE == 0,
               "sysvals are whole FAU words");
+
+#if PAN_ARCH < 9
+/* The colour attachment that fragment output location `loc` feeds
+ * (VkRenderingAttachmentLocationInfoKHR, fixed at pipeline creation), or
+ * MESA_VK_ATTACHMENT_UNUSED; `loc` itself when the pipeline state is not
+ * known. */
+static uint8_t
+location_attachment(const struct vk_graphics_pipeline_state *state, unsigned loc)
+{
+   if (!state || !state->cal || !state->rp)
+      return loc;
+   for (uint32_t i = 0; i < state->rp->color_attachment_count && i < MALI_MAX_RTS; i++) {
+      if (state->cal->color_map[i] == loc)
+         return i;
+   }
+   return MESA_VK_ATTACHMENT_UNUSED;
+}
+#endif
 
 struct lower_sysvals_ctx {
    const struct vk_graphics_pipeline_state *state;
@@ -212,10 +231,25 @@ lower_sysvals(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       val = load_sysval(b, common, bit_size, printf_buffer_address);
       break;
 #if PAN_ARCH < 9
-   case nir_intrinsic_load_blend_descriptor_pan:
+   case nir_intrinsic_load_blend_descriptor_pan: {
       /* Bifrost reads the Blend descriptors from its blend FAU slots
-       * (BIR_FAU_BLEND_0 + rt): the backend handles the intrinsic. */
-      return false;
+       * (BIR_FAU_BLEND_0 + n), which the hardware loads from the
+       * descriptors behind the RSD, one per colour attachment
+       * (mali_jm_cmd_draw_v7.c emit_blend_descs); the backend handles the
+       * intrinsic. The blend unit looks a descriptor up by its RT index,
+       * so the descriptors stay in attachment order, and the BLEND of an
+       * output location reads the slot of the attachment the location
+       * feeds. panvk pushes the descriptors' shader half by location
+       * instead (panvk_vX_blend.c), which would take the FAU words v7
+       * gives the set addresses. Outputs that feed no attachment are gone
+       * (drop_unmapped_color_output). */
+      const unsigned loc = nir_intrinsic_base(intr);
+      const uint8_t att = location_attachment(ctx->state, loc);
+      if (att == MESA_VK_ATTACHMENT_UNUSED || att == loc)
+         return false;
+      nir_intrinsic_set_base(intr, att);
+      return true;
+   }
 #else
    case nir_intrinsic_load_blend_descriptor_pan:
       val = load_sysval(b, graphics, bit_size, fs.blend_descs[nir_intrinsic_base(intr)]);
@@ -237,7 +271,10 @@ lower_sysvals(nir_builder *b, nir_intrinsic_instr *intr, void *data)
          if (depth_idx == index || stencil_idx == index) {
             target = MALI_ZS_ATTACHMENT;
          } else {
-            for (unsigned i = 0; i < ial->color_attachment_count; i++) {
+            /* The count is MESA_VK_COLOR_ATTACHMENT_COUNT_UNKNOWN (0xff) when
+             * the pipeline gave no map: the identity map, over every entry. */
+            for (unsigned i = 0; i < ARRAY_SIZE(ial->color_map) &&
+                                 i < ial->color_attachment_count; i++) {
                if (ial->color_map[i] != MESA_VK_ATTACHMENT_UNUSED &&
                    ial->color_map[i] + 1 == index) {
                   target = MALI_COLOR_ATTACHMENT(i);
@@ -778,9 +815,32 @@ lower_ubo_push(nir_shader *nir, struct mali_shader *s)
 /* ---------------------------------------------------------------------- */
 /* Options and lowering                                                    */
 
+#if PAN_ARCH < 9
+/* v7 vertex shaders get the backend's options with has_load_global_bounded:
+ * nir_lower_explicit_io then emits a load_global_bounded for each
+ * bounds-checked storage buffer load of a robust shader instead of a branch
+ * around the load, and mali_nir_lower_bounded_loads turns that into a
+ * clamped load (lower_nir). The other stages keep the branchy checks. */
+static struct nir_shader_compiler_options v7_vs_nir_options;
+static util_once_flag v7_vs_nir_options_once = UTIL_ONCE_FLAG_INIT;
+
+static void
+v7_vs_nir_options_init(void)
+{
+   v7_vs_nir_options = *pan_get_nir_shader_compiler_options(PAN_ARCH, MESA_SHADER_VERTEX, false);
+   v7_vs_nir_options.has_load_global_bounded = true;
+}
+#endif
+
 const struct nir_shader_compiler_options *
 MALI_PER_ARCH(shader_nir_options)(struct mali_device *dev, mesa_shader_stage stage)
 {
+#if PAN_ARCH < 9
+   if (stage == MESA_SHADER_VERTEX) {
+      util_call_once(&v7_vs_nir_options_once, v7_vs_nir_options_init);
+      return &v7_vs_nir_options;
+   }
+#endif
    return pan_get_nir_shader_compiler_options(PAN_ARCH, stage, false);
 }
 
@@ -1058,7 +1118,10 @@ lower_nir(nir_shader *nir, const struct mali_shader_compile_info *info,
    }
 #else
    /* With the bounded global format, nir_lower_explicit_io bounds-checks
-    * storage buffer accesses itself. */
+    * storage buffer accesses itself: stores and atomics with a branch
+    * around them, and, in a vertex shader (v7_vs_nir_options), loads as
+    * load_global_bounded, which becomes a clamped load here. */
+   NIR_PASS(_, nir, mali_nir_lower_bounded_loads);
 #endif
 
    if (allow_merging_workgroups) {
@@ -1180,6 +1243,30 @@ drop_dual_source_output(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *
    nir_instr_remove(&intr->instr);
    return true;
 }
+
+#if PAN_ARCH < 9
+/*
+ * A colour output whose location feeds no attachment writes nothing. On v9
+ * and v11 its BLEND reads a disabled descriptor (mali_gfx_blend); v7 has
+ * no such descriptor to point it at (lower_sysvals), so the BLEND goes.
+ * Run after pan_nir_lower_fs_outputs: the ATEST before it still takes its
+ * alpha from location 0 for alpha to coverage, mapped or not.
+ */
+static bool
+drop_unmapped_color_output(UNUSED nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   const struct vk_graphics_pipeline_state *state = data;
+
+   if (intr->intrinsic != nir_intrinsic_blend_pan && intr->intrinsic != nir_intrinsic_blend2_pan)
+      return false;
+   const unsigned loc = nir_intrinsic_io_semantics(intr).location - FRAG_RESULT_DATA0;
+   if (location_attachment(state, loc) != MESA_VK_ATTACHMENT_UNUSED)
+      return false;
+
+   nir_instr_remove(&intr->instr);
+   return true;
+}
+#endif
 
 static bool
 is_const_integral(nir_alu_instr *alu, unsigned src)
@@ -1856,6 +1943,11 @@ v7_fixup_info(struct mali_device *dev, const nir_shader *nir, struct mali_shader
    s->info.ubo_count = s->v7.count[MALI_V7_DESC_TABLE_UBO] + s->v7.dyn_ubo_count;
    s->info.texture_count = s->v7.count[MALI_V7_DESC_TABLE_TEXTURE];
    s->info.sampler_count = s->v7.count[MALI_V7_DESC_TABLE_SAMPLER];
+   if (s->v7.direct_set >= 0) {
+      /* The tables are the direct set's slots (mali_jm_desc_v7.c). */
+      s->info.texture_count = s->v7.direct_slots;
+      s->info.sampler_count = s->v7.direct_slots - s->v7.direct_sampler_base;
+   }
    if (s->info.texture_count && !s->info.sampler_count)
       s->info.sampler_count = 1;
 
@@ -2479,6 +2571,11 @@ MALI_PER_ARCH(shader_compile)(struct mali_device *dev,
       const bool atest = fs_needs_atest(nir, state, s->fs.input_attachment_read, info->meta);
       s->fs.no_atest = !atest;
       NIR_PASS(_, nir, pan_nir_lower_fs_outputs, !atest, 0);
+#if PAN_ARCH < 9
+      if (nir_shader_intrinsics_pass(nir, drop_unmapped_color_output,
+                                     nir_metadata_control_flow, (void *)state))
+         NIR_PASS(_, nir, nir_opt_dce);
+#endif
       if (atest && !alpha_to_coverage_possible(state) &&
           !(nir->info.outputs_written & (BITFIELD64_BIT(FRAG_RESULT_DEPTH) |
                                          BITFIELD64_BIT(FRAG_RESULT_STENCIL) |
@@ -2591,6 +2688,10 @@ shader_serialize(struct vk_pipeline_cache_object *object, struct blob *blob)
    blob_write_bytes(blob, s->v7.count, sizeof(s->v7.count));
    blob_write_uint32(blob, s->v7.dyn_ubo_count);
    blob_write_uint32(blob, s->v7.needs_set_addrs);
+   blob_write_uint32(blob, (uint32_t)s->v7.direct_set);
+   blob_write_uint32(blob, s->v7.direct_slots);
+   blob_write_uint32(blob, s->v7.direct_sampler_base);
+   blob_write_uint32(blob, s->v7.copy_set_mask);
    blob_write_uint32(blob, s->v7.map_count);
    blob_write_bytes(blob, s->v7.map, s->v7.map_count * sizeof(uint32_t));
    blob_write_uint32(blob, s->v7.data_size);
@@ -2658,6 +2759,10 @@ shader_deserialize(struct vk_pipeline_cache *cache, const void *key_data,
    blob_copy_bytes(blob, s->v7.count, sizeof(s->v7.count));
    s->v7.dyn_ubo_count = blob_read_uint32(blob);
    s->v7.needs_set_addrs = blob_read_uint32(blob);
+   s->v7.direct_set = (int32_t)blob_read_uint32(blob);
+   s->v7.direct_slots = blob_read_uint32(blob);
+   s->v7.direct_sampler_base = blob_read_uint32(blob);
+   s->v7.copy_set_mask = blob_read_uint32(blob);
    s->v7.map_count = blob_read_uint32(blob);
    const void *map = blob_read_bytes(blob, s->v7.map_count * sizeof(uint32_t));
    s->v7.data_size = blob_read_uint32(blob);

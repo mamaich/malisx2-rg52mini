@@ -99,7 +99,8 @@ struct mali_jm_chain {
    uint32_t jobs;
    uint8_t pending;         /* MALI_JM_PENDING_* */
    /* The chain writes system timestamps: its atom asks for PERMON, without
-    * which the kernel leaves the GPU's timestamp counter stopped. */
+    * which the kernel leaves the GPU's timestamp counter stopped (on v7
+    * every atom asks for it, see chain_req in mali_jm_queue.c). */
    bool timestamps;
 };
 
@@ -135,10 +136,18 @@ struct mali_jm_batch {
                                copy, fill or update): it meets a transfer-
                                only requirement carried from an earlier
                                command buffer (mali_jm_queue::xvtc_frag) */
+#if PAN_ARCH < 9
+   bool vtc_img;            /* its vtc chain has a job that can touch images
+                               or memory (a transfer, a dispatch, a draw whose
+                               vertex shader reads images or writes memory):
+                               it meets an image barrier's requirement
+                               carried from an earlier command buffer
+                               (mali_jm_queue::ivtc_frag) */
    bool vtc_fresh;          /* its vtc chain has a copy into a fresh image
                                (mali_image::fresh): it meets such a
                                requirement only when a buffer barrier
                                asked for it (MALI_JM_REQ_XVTC_BUF) */
+#endif
    uint32_t passes, draws;
    uint64_t est_heap_bytes; /* estimated tiler heap use, for batch closing */
    uint64_t heap_desc;      /* the Tiler Heap descriptor every pass of the
@@ -146,7 +155,18 @@ struct mali_jm_batch {
    uint64_t vary_counter;   /* v7: the varying heap's offset word, zeroed by a
                                job when the batch first needs it (0: not
                                yet); kept by a pass split, like heap_slot */
+   /* An event batch (mali_jm_cmd_event) has no chains: it is one kbase soft
+    * atom on the VkEvent word at event_addr. A wait holds the work after it
+    * that runs in event_stages (its destination stages). */
+   uint8_t event_op;        /* MALI_JM_EVENT_*; NONE for every other batch */
+   uint64_t event_addr;
+   uint64_t event_stages;
 };
+
+#define MALI_JM_EVENT_NONE  0
+#define MALI_JM_EVENT_SET   1
+#define MALI_JM_EVENT_RESET 2
+#define MALI_JM_EVENT_WAIT  3
 
 /*
  * Batch limits. A batch is closed before a job that would take its vtc
@@ -211,6 +231,13 @@ struct mali_jm_batch {
  * made): a copy into a fresh image waits for them too
  * (mali_jm_batch::vtc_fresh). */
 #define MALI_JM_REQ_XVTC_BUF             (1u << 5)
+#if PAN_ARCH < 9
+/* v7: the "vtc after fragment" requirements of image memory barriers: the
+ * next vtc chain that can touch images (mali_jm_batch::vtc_img) waits, not
+ * the next frame's tiling. */
+#define MALI_JM_REQ_IVTC_AFTER_FRAG      (1u << 6)
+#define MALI_JM_REQ_IVTC_AFTER_FRAG_XFER (1u << 7)
+#endif
 
 /* A GPU-written range to restore before a command buffer runs again
  * (mali_jm_cmd::resets): size bytes at dst, from data_off in
@@ -293,7 +320,8 @@ struct mali_v7_irange {
  * Attributes pointers take, plus the dynamic storage buffer table and the
  * set addresses the stage's system values carry. Built by
  * mali_v7_desc_prepare; the entries that come from the sets are written by
- * a copy job (mali_v7_desc_copy).
+ * mali_v7_desc_copy: on the CPU from the sets' host copies when every set
+ * it reads has one, else by a copy job.
  */
 struct mali_v7_desc_tables {
    /* MALI_V7_DESC_TABLE_*, 0 for a table the shader does not have: 8-byte
@@ -305,15 +333,13 @@ struct mali_v7_desc_tables {
    uint64_t dyn_ssbos;                        /* the dynamic storage buffer table */
    uint64_t sets[MALI_MAX_SETS];              /* the bound sets' memory, 0 when unbound */
    uint32_t set_desc_counts[MALI_MAX_SETS];   /* their slot counts */
-   /* The same on the CPU, for the copy done there (mali_v7_desc_copy):
-    * the tables, and the sets' slots (a push set's shadow). Valid while
-    * the draw that built the tables records. */
+   /* Filling the copied entries on the CPU (mali_v7_desc_copy): the
+    * tables' mappings, the bound sets' host copies (none for a set of an
+    * update-after-bind pool), and whether every set the shader's map
+    * reads has one. */
    void *tables_cpu[MALI_V7_DESC_TABLE_COUNT];
-   const void *sets_cpu[MALI_MAX_SETS];
-   /* A set the shader reads is of an update-after-bind layout: the
-    * application may write it until the submit, after the draw
-    * records, so the copy runs on the GPU when the draw does. */
-   bool update_after_bind;
+   const void *set_host[MALI_MAX_SETS];
+   bool cpu_fill;
    /* The shader the tables were built for (their layout is its own). */
    const struct mali_shader *shader;
    /* The dynamic buffers they were built with, one per entry of the
@@ -446,13 +472,15 @@ struct mali_jm_cmd {
     * the end of the command buffer (MALI_JM_REQ_*), for the queue. */
    uint16_t req;
    uint8_t end_req;
+#if PAN_ARCH < 9
    /* req's transfer-only requirements (REQ_XVTC_*) include some of a
     * buffer or global barrier, not only of image barriers. */
    bool xvtc_buf;
    /* The transfer being recorded writes only a fresh image
-    * (mali_jm_cmd_xfer_fresh): its vtc jobs skip the image-only barriers'
+    * (mali_image::fresh): its vtc jobs skip the image-only barriers'
     * transfer requirements. */
    bool xfer_fresh;
+#endif
 
    /* Re-submission: command buffers recorded without ONE_TIME_SUBMIT
     * note every GPU-written word, and submit restores them before every
@@ -484,7 +512,13 @@ struct mali_jm_cmd {
    struct mali_ptr pend_tiler[MALI_V7_TILER_DEFER];
    uint16_t pend_tiler_dep1[MALI_V7_TILER_DEFER];
    uint8_t pend_tilers;          /* pending, oldest first */
+   /* Bit i: pend_tiler[i] is an indirect draw's, linked as a Not Started
+    * job that its patch job makes a Tiler job (or a Null job). */
+   uint8_t pend_tiler_ns;
    bool tiler_defer;
+   /* The varying arena of the indirect draws (mali_jm_cmd_draw_v7.c), from
+    * the first one on; returned to the device at reset. */
+   struct mali_cmd_slab *idraw_arena;
    /* vkCmdSetIndexRangeMALISX2: the smallest and largest index of the
     * next indexed draw, if it is the one named (index buffer, first index,
     * count); its index scan is then skipped (mali_jm_cmd_draw_v7.c). */
@@ -619,22 +653,27 @@ struct mali_jm_batch *mali_jm_cmd_batch(struct mali_cmd_buffer *cmd);
 void mali_jm_cmd_batch_close(struct mali_cmd_buffer *cmd);
 
 /* The open batch's vtc chain, for a job outside a render pass: closes a
- * full batch first (MALI_JM_BATCH_MAX_JOBS). NULL on failure. */
+ * full batch first (MALI_JM_BATCH_MAX_JOBS). NULL on failure. For a
+ * dispatch: on v7 it also waits for what image barriers asked of the vtc
+ * jobs that can touch images, which it may be one of. */
 struct mali_jm_chain *mali_jm_cmd_vtc(struct mali_cmd_buffer *cmd);
 
 /* The same for a transfer done by compute (buffer and image copies, fills,
  * updates): it also waits for what barriers whose destination stages are
- * only transfer stages asked for. Plain vtc jobs (dispatches, draws) are
- * not in those barriers' second scope, so such a barrier does not close a
- * batch at the next draw. */
+ * only transfer stages asked for (and on v7, as a dispatch does, for the
+ * image barriers' requirements). Dispatches and draws are not in those
+ * barriers' second scope, so such a barrier does not close a batch at the
+ * next draw or hold the next dispatch. */
 struct mali_jm_chain *mali_jm_cmd_vtc_transfer(struct mali_cmd_buffer *cmd);
 
 /*
  * A render pass's tiling, at its first tiled job (cmd_render_tiler). On v7
- * mali_jm_cmd_vtc also waits for what image-only barriers asked of vtc work
- * (mali_jm_cmd_buffer.c, MALI_JM_IMAGE_BARRIER_NARROW), as a transfer does;
- * a pass's draws do not, unless their vertex shader can touch images or
- * memory (mali_jm_cmd_pass_images). On v9 the two are the same.
+ * a dispatch or a transfer waits for what image barriers asked of vtc work
+ * (mali_jm_cmd_buffer.c, image_barrier_req); a pass's draws do not, unless
+ * their vertex shader can touch images or memory
+ * (mali_jm_cmd_pass_images); but the pass starts a new batch when an image
+ * barrier's requirement is about fragment work in the open one. On v9 the
+ * two are the same.
  */
 struct mali_jm_chain *mali_jm_cmd_vtc_draw(struct mali_cmd_buffer *cmd);
 
@@ -646,8 +685,8 @@ struct mali_jm_chain *mali_jm_cmd_vtc_value(struct mali_cmd_buffer *cmd);
 /* Before a draw whose vertex shader reads textures or images or writes
  * memory, in a pass: the image-only barrier requirements a plain pass left
  * pending apply to it, by a pass split when its batch already has
- * fragment work. Its batch then counts as one with a transfer job for the
- * requirements carried from earlier command buffers. */
+ * fragment work. Its batch then meets the image barrier requirements
+ * carried from earlier command buffers (mali_jm_batch::vtc_img). */
 void mali_jm_cmd_pass_images(struct mali_cmd_buffer *cmd);
 
 /* Would a transfer job on the vtc chain close the open batch now (a
@@ -685,6 +724,33 @@ struct mali_ptr mali_jm_cmd_add_job(struct mali_cmd_buffer *cmd, struct mali_jm_
                                     enum mali_job_type type, unsigned size, bool barrier,
                                     uint16_t dep1);
 
+/* mali_jm_cmd_add_job for a job the caller allocated (and may already
+ * have given to a GPU-side writer, as v7 indirect dispatch does). false
+ * on failure, with the command buffer's error set. */
+bool mali_jm_cmd_add_job_at(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
+                            struct mali_ptr job, enum mali_job_type type, bool barrier,
+                            uint16_t dep1);
+
+/*
+ * The job of internal compute shader m (enum mali_meta_shader) with push
+ * constants push, groups workgroups, on chain c, for the indirect draws:
+ * Barrier `barrier` (or the chain's pending one), Dependency 1 and 2 dep1
+ * and dep2, Suppress Prefetch set, so that the job manager reads the job
+ * behind it only after it is done. *index: its job index. False on
+ * failure, with the command buffer's error set.
+ */
+bool MALI_PER_ARCH(jm_cmd_meta_job)(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
+                                    unsigned m, const void *push, uint32_t push_size,
+                                    const uint32_t groups[3], bool barrier, uint16_t dep1,
+                                    uint16_t dep2, uint16_t *index);
+
+/* The indirect draws' internal shaders (mali_jm_idraw_nir.c):
+ * MALI_META_INDIRECT_DRAW, and on v7 MALI_META_INDEX_MINMAX. */
+struct nir_shader *MALI_PER_ARCH(build_indirect_draw_nir)(struct mali_device *dev);
+#if PAN_ARCH < 9
+struct nir_shader *MALI_PER_ARCH(build_index_minmax_nir)(struct mali_device *dev);
+#endif
+
 /*
  * The link half of mali_jm_cmd_add_job, for writers that pack the header
  * themselves (the draws copy whole jobs from a cached template): job, whose
@@ -712,6 +778,23 @@ mali_jm_chain_link(struct mali_jm_chain *c, struct mali_ptr job, uint16_t index,
  * first, into the open batch's vtc chain until at most keep are left. */
 void mali_v7_link_tilers(struct mali_cmd_buffer *cmd, unsigned keep);
 #endif
+
+/*
+ * An event operation after everything recorded so far: vkCmdSetEvent2 and
+ * vkCmdResetEvent2 (op SET, RESET; outside a render pass) and
+ * vkCmdWaitEvents2 (op WAIT, one per event; stages: the wait's destination
+ * stages). Closes the open batch, or inside a render pass splits the pass
+ * there (mali_jm_cmd_pass_split), and adds an event batch, which submit
+ * turns into a kbase soft atom (mali_jm_queue.c). False on allocation
+ * failure, with the command buffer's error set.
+ */
+bool mali_jm_cmd_event(struct mali_cmd_buffer *cmd, uint8_t op, uint64_t addr,
+                       VkPipelineStageFlags2 stages);
+
+/* The image layout transitions of info that make an image's CRCs stale
+ * (as vkCmdPipelineBarrier2 handles them): for the event commands, which
+ * take a dependency info but are not barriers here. */
+void mali_jm_cmd_dep_crc(struct mali_cmd_buffer *cmd, const VkDependencyInfo *info);
 
 /* A Write Value job on chain c (timestamps, availability, tests). */
 bool mali_jm_cmd_write_value(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
@@ -835,7 +918,9 @@ bool mali_v7_desc_prepare(struct mali_cmd_buffer *cmd, const struct mali_shader 
  * the same bound sets: the dynamic uniform buffer entries and the dynamic
  * storage buffer table are packed anew and the copied entries kept, so the
  * draw needs no copy job. A bound set cannot change while the command
- * buffer records (no update-after-bind is exposed), and a push set gets
+ * buffer records, except one laid out for update after bind, which is
+ * read when the command buffer executes, by a copy job or as the stage's
+ * own table, so the kept entries see its last write too. A push set gets
  * new memory with every push. *unchanged when the shader's dynamic buffers
  * (addresses with the offsets applied, and ranges) are the same too. False,
  * with *t unchanged, when the tables must be rebuilt
@@ -849,11 +934,12 @@ bool mali_v7_desc_refresh(struct mali_cmd_buffer *cmd, const struct mali_shader 
                           struct mali_v7_desc_tables *t, bool *unchanged);
 
 /*
- * Writes the table entries that come from the sets (the shader's copy map)
- * with a Compute job on chain c, one invocation per entry (panvk_v7
- * meta_get_copy_desc_job). *index: that job's index, the Dependency 1 of
- * the job that reads the tables; 0 when there is nothing to copy. The job
- * waits for job dep (0: none).
+ * Writes the table entries that come from the sets (the shader's copy map).
+ * On the CPU, from the sets' host copies, when t->cpu_fill: nothing is
+ * added to the chain. Otherwise with a Compute job on chain c, one
+ * invocation per entry (panvk_v7 meta_get_copy_desc_job). *index: that
+ * job's index, the Dependency 1 of the job that reads the tables; 0 when
+ * there is no job. The job waits for job dep (0: none).
  * attrib_buf_idx_offset: the buffer index the image Attribute descriptors
  * start at (twice the vertex binding count for a vertex shader, else 0).
  * False on failure, with the command buffer's error set.
@@ -1005,6 +1091,35 @@ uint64_t mali_v7_meta_viewport(struct mali_cmd_buffer *cmd, uint32_t minx, uint3
  * set.
  */
 void mali_v7_note_buffer_write(struct mali_cmd_buffer *cmd, uint64_t addr, uint64_t size);
+
+/*
+ * The varying arena of a command buffer's indirect draws: one block, a
+ * struct mali_jm_idraw_arena_hdr in its first MALI_IDRAW_ARENA_HDR bytes,
+ * from which the patch jobs take each draw's varying buffers when it runs
+ * (mali_jm_idraw_nir.c). The vertex count of an indirect draw is not known
+ * when it is recorded, so its varyings cannot be sized then. A draw that
+ * does not fit what is left is skipped and counted. 16 MiB holds, at 64
+ * bytes of varyings per vertex, about 260,000 shaded vertices (vertex range
+ * times instances, rounded up to a power of two for instanced draws) per
+ * command buffer run.
+ */
+#define MALI_V7_IDRAW_ARENA_SIZE (16u << 20)
+#define MALI_V7_IDRAW_ARENA_DATA (MALI_V7_IDRAW_ARENA_SIZE - MALI_IDRAW_ARENA_HDR)
+/* Arenas the device keeps for reuse. */
+#define MALI_V7_IDRAW_ARENAS_KEPT 2
+
+/* The command buffer's arena, taken on first use (from the device's kept
+ * ones, else allocated) with its header zeroed, and restored to zero
+ * before every later run. NULL on failure, with the error set. */
+struct mali_cmd_slab *mali_v7_idraw_arena(struct mali_cmd_buffer *cmd);
+
+/* The command buffer's varying arena of indirect draws (struct
+ * mali_jm_cmd::idraw_arena) goes back to the device for reuse, at reset and
+ * destruction; logs, once per device, when draws were dropped for want of
+ * room in it. */
+void mali_v7_idraw_arena_release(struct mali_cmd_buffer *cmd);
+/* Frees the arenas the device keeps, at device destruction. */
+void mali_v7_idraw_arenas_finish(struct mali_device *dev);
 #endif /* PAN_ARCH < 9 */
 
 /* ---------------------------------------------------------------------- */
@@ -1033,6 +1148,8 @@ enum mali_jm_atom_kind {
    MALI_JM_ATOM_JOIN,           /* dependency-only (core_req 0) */
    MALI_JM_ATOM_FENCE_WAIT,     /* soft: waits for an imported sync file */
    MALI_JM_ATOM_FENCE_TRIGGER,  /* soft: signals a sync file we hand out */
+   MALI_JM_ATOM_EVENT,          /* soft: sets or resets a VkEvent (mali_event.h) */
+   MALI_JM_ATOM_EVENT_WAIT,     /* soft: waits until a VkEvent is set */
 };
 
 /* udata[1] of every atom: its kind, flags, and where it came from (for
@@ -1125,10 +1242,6 @@ struct mali_jm_device {
     * on the CPU at submit, not by a copy job (MALISX2_V7_GPU_UBO_COPY=1
     * turns it off). */
    bool ubo_cpu_copy;
-   /* v7: a shader's descriptor tables without images are filled on the
-    * CPU while the draw records, not by a copy job
-    * (MALISX2_V7_GPU_DESC_COPY=1 turns it off). */
-   bool desc_cpu_copy;
    /* v7: a draw under rasterization order colour access that reads no
     * colour attachment may still kill earlier fragments (pack_rsd_state;
     * MALISX2_V7_FPK_ROA=0 turns it off). */
@@ -1180,20 +1293,14 @@ struct mali_jm_device {
    /* v7: the index ranges of draws drawn as one Indexed Vertex job are
     * found on the GPU (MALISX2_V7_GPU_INDEX_RANGE=0: on the CPU). */
    bool gpu_index_range;
-   /* Image-only barriers order only the vtc jobs that can touch images
-    * (MALI_JM_IMAGE_BARRIER_NARROW, mali_jm_cmd_buffer.c); off with the
-    * debug switch "vtcwait". */
-   bool v7_image_barrier_narrow;
-   /* One pass a batch with narrowed image barriers (debug switch onepass). */
-   bool v7_one_pass_batches;
-   /* In-pass by-region barriers between attachment writes and input
-    * attachment reads draw nothing: the tile-buffer reads are pixel
-    * ordered (mali_jm_cmd_buffer.c tile_ordered_barrier). Off with the
-    * debug switch "fbbarrier". */
-   bool v7_tile_ordered_fb_barrier;
    /* How many of mali_device::free_slabs are 1 MiB slabs for large blocks
     * (mali_jm_cmd_buffer.c); under mali_device::slab_lock. */
    unsigned free_big_slabs;
+   /* Varying arenas of indirect draws that command buffers gave back, for
+    * reuse (mali_jm_cmd_draw_v7.c); under mali_device::slab_lock. */
+   struct list_head idraw_arenas;
+   unsigned idraw_arena_count;
+   bool idraw_dropped_said;
 #endif
 
    /* Set for the duration of one vkQueueSubmit when MALISX2_MEASURE's
@@ -1224,17 +1331,6 @@ struct mali_jm_device {
    } stats_total, stats_logged;
 };
 
-/* Why a vtc atom waits for the fragment slot (mali_jm_queue::why). */
-enum mali_jm_why {
-   MALI_JM_WHY_BARRIER,      /* a barrier: every earlier fragment atom */
-   MALI_JM_WHY_XFER,         /* a barrier: the fragment-side transfers */
-   MALI_JM_WHY_BATCH,        /* a barrier: an earlier batch of the buffer */
-   MALI_JM_WHY_HEAP,         /* the tiler heap slot's last reader */
-   MALI_JM_WHY_XVTC,         /* a transfer-only requirement */
-   MALI_JM_WHY_WAIT,         /* a semaphore wait */
-   MALI_JM_WHY_COUNT,
-};
-
 struct mali_jm_queue {
    struct mali_device *dev;
    /* The newest atom in each slot's order. */
@@ -1252,23 +1348,23 @@ struct mali_jm_queue {
    mali_jm_ref last_frag_xfer;
    /* Barrier requirements (MALI_JM_REQ_*) recorded at the end of a
     * command buffer and not yet met by a later atom; the transfer-only
-    * ones are kept as xvtc_frag instead. */
+    * ones are kept as xvtc_frag instead, and on v7 the image barrier ones
+    * as ivtc_frag. */
    uint8_t carry;
    /* The newest fragment atom the next vtc chain with a transfer job has
     * to wait for (MALI_JM_REQ_XVTC_*: everything, or the fragment-side
     * transfers, up to the end of the command buffer that asked); 0 when
     * nothing is owed. */
    mali_jm_ref xvtc_frag;
+#if PAN_ARCH < 9
    /* Part of what xvtc_frag owes came from a buffer or global barrier
     * (MALI_JM_REQ_XVTC_BUF): copies into fresh images wait for it too. */
    bool xvtc_buf;
-   /* Debug switch vtcwhy: per reason, the vtc atoms whose dependency on
-    * the fragment slot named an atom still running (build_submit), logged
-    * about once a second. */
-   bool why_on;
-   uint32_t why[MALI_JM_WHY_COUNT];
-   uint32_t why_vtc;
-   int64_t why_since;
+   /* The same as xvtc_frag for the image barrier requirements
+    * (MALI_JM_REQ_IVTC_*): the next vtc chain with a job that can touch
+    * images waits (mali_jm_batch::vtc_img). */
+   mali_jm_ref ivtc_frag;
+#endif
 };
 
 VkResult MALI_PER_ARCH(device_init)(struct mali_device *dev);

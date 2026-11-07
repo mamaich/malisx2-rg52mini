@@ -46,7 +46,13 @@
  *    done by compute (mali_jm_cmd_vtc_transfer), not of draws and
  *    dispatches, which are outside its second scope: a "colour output ->
  *    transfer" barrier for a fragment-side image copy then does not close
- *    the batch at the next pass's tiling;
+ *    the batch at the next pass's tiling. On v7 the requirement of an image
+ *    memory barrier (image_barrier_req) is waited for only by the vtc jobs
+ *    that can touch images or memory (transfers, dispatches, draws whose
+ *    vertex shader reads images or writes memory), not by a pass's tiling;
+ *    the pass still starts its own batch where the plain requirement would
+ *    have closed the open one, so its tiling runs while the fragment work
+ *    before it shades;
  *  - fragment after vtc: free inside a batch (its fragment atoms depend on
  *    its vtc atom); a batch without a vtc chain waits for the newest vtc
  *    atom;
@@ -56,7 +62,8 @@
  * What is still owed when the command buffer ends goes to the queue
  * (mali_jm_cmd::end_req), which applies it to the next atoms of later
  * command buffers, as a barrier's second scope requires; a transfer-only
- * requirement there, again only to the next vtc chain with a transfer job.
+ * requirement there, again only to the next vtc chain with a transfer job,
+ * and on v7 an image barrier's to the next one that can touch images.
  */
 
 #include "mali_cmd_state.h"
@@ -239,6 +246,87 @@ oom:
    return (struct mali_ptr){0};
 }
 
+#if PAN_ARCH < 9
+/* ---------------------------------------------------------------------- */
+/* The varying arena of indirect draws (mali_jm.h)                         */
+
+struct mali_cmd_slab *
+mali_v7_idraw_arena(struct mali_cmd_buffer *cmd)
+{
+   if (cmd->jm.idraw_arena)
+      return cmd->jm.idraw_arena;
+   struct mali_device *dev = cmd->dev;
+   struct mali_jm_device *jd = dev->jm;
+   struct mali_cmd_slab *s = NULL;
+
+   simple_mtx_lock(&dev->slab_lock);
+   if (!list_is_empty(&jd->idraw_arenas)) {
+      s = list_first_entry(&jd->idraw_arenas, struct mali_cmd_slab, link);
+      list_del(&s->link);
+      jd->idraw_arena_count--;
+   }
+   simple_mtx_unlock(&dev->slab_lock);
+   if (!s)
+      s = slab_new(dev, MALI_V7_IDRAW_ARENA_SIZE, false);
+   if (!s) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return NULL;
+   }
+   memset(s->bo.cpu, 0, sizeof(struct mali_jm_idraw_arena_hdr));
+   mali_jm_cmd_note_reset(cmd, s->bo.cpu, NULL, sizeof(struct mali_jm_idraw_arena_hdr));
+   cmd->jm.idraw_arena = s;
+   return s;
+}
+
+void
+mali_v7_idraw_arena_release(struct mali_cmd_buffer *cmd)
+{
+   struct mali_cmd_slab *s = cmd->jm.idraw_arena;
+   if (!s)
+      return;
+   cmd->jm.idraw_arena = NULL;
+   struct mali_device *dev = cmd->dev;
+   struct mali_jm_device *jd = dev->jm;
+
+   /* The command buffer is not pending (a reset or a destruction): the
+    * count is its last run's. */
+   struct mali_jm_idraw_arena_hdr h;
+   memcpy(&h, s->bo.cpu, sizeof(h));
+   bool keep = false, say = false;
+   if (jd) {
+      simple_mtx_lock(&dev->slab_lock);
+      if (h.dropped && !jd->idraw_dropped_said)
+         say = jd->idraw_dropped_said = true;
+      if (jd->idraw_arena_count < MALI_V7_IDRAW_ARENAS_KEPT) {
+         list_add(&s->link, &jd->idraw_arenas);
+         jd->idraw_arena_count++;
+         keep = true;
+      }
+      simple_mtx_unlock(&dev->slab_lock);
+   }
+   if (say)
+      mesa_logw("malisx2: %u indirect draws were skipped: their varyings did not fit the "
+                "command buffer's %u MiB of varying memory for indirect draws",
+                h.dropped, MALI_V7_IDRAW_ARENA_SIZE >> 20);
+   if (!keep) {
+      mali_kbase_free(dev->kbase, &s->bo);
+      free(s);
+   }
+}
+
+void
+mali_v7_idraw_arenas_finish(struct mali_device *dev)
+{
+   struct mali_jm_device *jd = dev->jm;
+   list_for_each_entry_safe(struct mali_cmd_slab, s, &jd->idraw_arenas, link) {
+      list_del(&s->link);
+      mali_kbase_free(dev->kbase, &s->bo);
+      free(s);
+   }
+   jd->idraw_arena_count = 0;
+}
+#endif
+
 /* ---------------------------------------------------------------------- */
 /* Re-submission                                                           */
 
@@ -302,12 +390,12 @@ job_is_tiler_side(enum mali_job_type type)
 #endif
 }
 
-/* Header and link of a job at job (size bytes, from command memory). */
+/* Header and link of a job at job (size bytes, from command memory), on
+ * the tiler side or not. */
 static inline void
-link_job(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c, struct mali_ptr job,
-         enum mali_job_type type, bool barrier, uint16_t dep1)
+link_job_side(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c, struct mali_ptr job,
+              enum mali_job_type type, bool barrier, uint16_t dep1, bool tiler_side)
 {
-   const bool tiler_side = job_is_tiler_side(type);
    const uint16_t index = ++c->index;
 
    pan_cast_and_pack(job.cpu, JOB_HEADER, h) {
@@ -319,6 +407,13 @@ link_job(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c, struct mali_ptr j
    }
    mali_jm_chain_link(c, job, index, tiler_side);
    mali_jm_cmd_note_reset(cmd, job.cpu, NULL, 16);
+}
+
+static inline void
+link_job(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c, struct mali_ptr job,
+         enum mali_job_type type, bool barrier, uint16_t dep1)
+{
+   link_job_side(cmd, c, job, type, barrier, dep1, job_is_tiler_side(type));
 }
 
 /* Room for one more job in the chain's 16-bit index space, with a Cache
@@ -346,15 +441,51 @@ mali_v7_link_tilers(struct mali_cmd_buffer *cmd, unsigned keep)
    for (unsigned i = 0; i < n; i++) {
       if (!chain_has_room(cmd, c))
          break;
-      link_job(cmd, c, jm->pend_tiler[i], MALI_JOB_TYPE_TILER, false, jm->pend_tiler_dep1[i]);
+      /* An indirect draw's Tiler job: Not Started until its patch job
+       * writes the type, a tiler-side job all the same. */
+      const bool ns = jm->pend_tiler_ns & BITFIELD_BIT(i);
+      link_job_side(cmd, c, jm->pend_tiler[i],
+                    ns ? MALI_JOB_TYPE_NOT_STARTED : MALI_JOB_TYPE_TILER, false,
+                    jm->pend_tiler_dep1[i], true);
    }
    for (unsigned i = 0; i < keep; i++) {
       jm->pend_tiler[i] = jm->pend_tiler[n + i];
       jm->pend_tiler_dep1[i] = jm->pend_tiler_dep1[n + i];
    }
+   jm->pend_tiler_ns >>= n;
    jm->pend_tilers = keep;
 }
 #endif
+
+bool
+mali_jm_cmd_add_job_at(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
+                       struct mali_ptr job, enum mali_job_type type, bool barrier,
+                       uint16_t dep1)
+{
+#if PAN_ARCH < 9
+   if (unlikely(cmd->jm.pend_tilers) && !cmd->jm.tiler_defer)
+      mali_v7_link_tilers(cmd, 0);
+#endif
+   if (!chain_has_room(cmd, c))
+      return false;
+
+   if (unlikely(c->pending)) {
+      if (c->pending & MALI_JM_PENDING_FLUSH) {
+         struct mali_ptr f = mali_cmd_alloc(cmd, pan_size(CACHE_FLUSH_JOB), 128);
+         if (!f.cpu)
+            return false;
+         link_job(cmd, c, f, MALI_JOB_TYPE_CACHE_FLUSH, true, 0);
+         pan_section_pack(f.cpu, CACHE_FLUSH_JOB, PAYLOAD, p) {
+            p.invalidate_shader_core_other = true;
+         }
+      }
+      barrier = true;
+      c->pending = 0;
+   }
+
+   link_job(cmd, c, job, type, barrier, dep1);
+   return true;
+}
 
 struct mali_ptr
 mali_jm_cmd_add_job(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
@@ -425,17 +556,41 @@ mali_jm_cmd_write_value(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
 #define REQ_FRAG_FLUSH          (1u << 6)
 /* The VTC_AFTER_FRAG requirements of barriers whose vtc-slot destination
  * stages are only transfer stages: only the next transfer job on the vtc
- * chain (mali_jm_cmd_vtc_transfer) waits for them. On v7 also those of
- * image-only barriers (MALI_JM_IMAGE_BARRIER_NARROW), which every vtc job
- * that can touch an image waits for: transfers, dispatches and the other
- * jobs of mali_jm_cmd_vtc, and draws whose vertex shader reads textures or
- * images or writes memory (mali_jm_cmd_pass_images). */
+ * chain (mali_jm_cmd_vtc_transfer) waits for them. */
 #define REQ_XVTC_AFTER_FRAG      (1u << 7)
 #define REQ_XVTC_AFTER_FRAG_XFER (1u << 8)
+#if PAN_ARCH < 9
+/* v7: the VTC_AFTER_FRAG requirements of image memory barriers
+ * (image_barrier_req), which the vtc jobs that can touch an image wait
+ * for: transfers, dispatches (mali_jm_cmd_vtc) and draws whose vertex
+ * shader reads textures or images or writes memory
+ * (mali_jm_cmd_pass_images). Not the tiling of a pass, and not Write Value
+ * jobs. REQ_IVTC_SPLIT goes with them until the next pass that tiles:
+ * that pass's tiling starts a new batch if the open one has fragment work
+ * the requirement is about (mali_jm_cmd_vtc_draw). */
+#define REQ_IVTC_AFTER_FRAG      (1u << 9)
+#define REQ_IVTC_AFTER_FRAG_XFER (1u << 10)
+#define REQ_IVTC_SPLIT           (1u << 11)
+#else
+#define REQ_IVTC_AFTER_FRAG      0
+#define REQ_IVTC_AFTER_FRAG_XFER 0
+#define REQ_IVTC_SPLIT           0
+#endif
 
 #define REQ_VTC_ALL                                                            \
    (REQ_VTC_AFTER_VTC | REQ_VTC_AFTER_FRAG | REQ_VTC_AFTER_FRAG_XFER | REQ_VTC_FLUSH)
 #define REQ_XVTC_ALL (REQ_XVTC_AFTER_FRAG | REQ_XVTC_AFTER_FRAG_XFER)
+#define REQ_IVTC_ALL (REQ_IVTC_AFTER_FRAG | REQ_IVTC_AFTER_FRAG_XFER)
+
+/* What a job on the vtc chain waits for, besides the plain requirements. */
+enum vtc_job {
+   VTC_JOB_PLAIN,   /* the tiling of a pass, Write Value jobs */
+   VTC_JOB_XFER,    /* a transfer by compute: also REQ_XVTC_*, and on v7 REQ_IVTC_* */
+#if PAN_ARCH < 9
+   VTC_JOB_IMAGE,   /* a dispatch, a draw that can touch images or memory: REQ_IVTC_* */
+   VTC_JOB_FRESH,   /* a copy into a fresh image: the plain ones only */
+#endif
+};
 
 static inline bool
 batch_has_frag_jobs(const struct mali_cmd_buffer *cmd)
@@ -485,18 +640,26 @@ mali_jm_cmd_batch_close(struct mali_cmd_buffer *cmd)
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
 }
 
-/* The requirements on the next vtc job: a transfer job also takes the
- * transfer-only ones (folded into the plain bits). */
+/* The requirements on the next vtc job, with the ones its kind also waits
+ * for folded into the plain bits. */
 static inline uint16_t
-vtc_req(uint16_t req, bool xfer)
+vtc_req(uint16_t req, enum vtc_job job)
 {
    uint16_t want = req & REQ_VTC_ALL;
-   if (xfer) {
+   if (job == VTC_JOB_XFER) {
       if (req & REQ_XVTC_AFTER_FRAG)
          want |= REQ_VTC_AFTER_FRAG;
       if (req & REQ_XVTC_AFTER_FRAG_XFER)
          want |= REQ_VTC_AFTER_FRAG_XFER;
    }
+#if PAN_ARCH < 9
+   if (job == VTC_JOB_XFER || job == VTC_JOB_IMAGE) {
+      if (req & REQ_IVTC_AFTER_FRAG)
+         want |= REQ_VTC_AFTER_FRAG;
+      if (req & REQ_IVTC_AFTER_FRAG_XFER)
+         want |= REQ_VTC_AFTER_FRAG_XFER;
+   }
+#endif
    return want;
 }
 
@@ -512,18 +675,10 @@ vtc_req_closes(const struct mali_cmd_buffer *cmd, uint16_t req)
 }
 
 static struct mali_jm_chain *
-vtc_chain(struct mali_cmd_buffer *cmd, bool xfer)
+vtc_chain(struct mali_cmd_buffer *cmd, enum vtc_job job)
 {
    struct mali_jm_batch *b = mali_jm_cmd_batch(cmd);
-   /* A copy into a fresh image (mali_image::fresh): no earlier work read
-    * or wrote the image or its memory, so of the transfer-only
-    * requirements it needs only those of buffer and global barriers (its
-    * source buffer). Image barriers' requirements stay for the next job
-    * that can touch their image. */
-   const bool fresh = xfer && cmd->jm.xfer_fresh && !cmd->jm.xvtc_buf;
-   if (fresh)
-      xfer = false;
-   const uint16_t req = vtc_req(cmd->jm.req, xfer);
+   const uint16_t req = vtc_req(cmd->jm.req, job);
 
    /* Outside a render pass, a full batch closes before the next job. */
    if (unlikely(b->vtc.jobs >= MALI_JM_BATCH_MAX_JOBS) && !cmd->gfx.render.active) {
@@ -550,21 +705,30 @@ vtc_chain(struct mali_cmd_buffer *cmd, bool xfer)
       if (b->vtc.jobs && (req & REQ_VTC_AFTER_VTC))
          b->vtc.pending |= MALI_JM_PENDING_BARRIER |
                            ((req & REQ_VTC_FLUSH) ? MALI_JM_PENDING_FLUSH : 0);
-      /* The transfer-only requirements are met with the plain ones: the
-       * batch's vtc atom now waits for every fragment atom they name. */
+      /* The transfer-only and image requirements are met with the plain
+       * ones: the batch's vtc atom now waits for every fragment atom they
+       * name. */
       uint16_t met = REQ_VTC_ALL;
-      if (xfer || (req & REQ_VTC_AFTER_FRAG))
-         met |= REQ_XVTC_ALL;
+      if (req & REQ_VTC_AFTER_FRAG)
+         met |= REQ_XVTC_ALL | REQ_IVTC_ALL;
       else if (req & REQ_VTC_AFTER_FRAG_XFER)
-         met |= REQ_XVTC_AFTER_FRAG_XFER;
+         met |= REQ_XVTC_AFTER_FRAG_XFER | REQ_IVTC_AFTER_FRAG_XFER;
       cmd->jm.req &= ~met;
+#if PAN_ARCH < 9
       if (!(cmd->jm.req & REQ_XVTC_ALL))
          cmd->jm.xvtc_buf = false;
+      if (!(cmd->jm.req & REQ_IVTC_ALL))
+         cmd->jm.req &= ~REQ_IVTC_SPLIT;
+#endif
    }
-   if (xfer)
+   if (job == VTC_JOB_XFER)
       b->vtc_xfer = true;
-   if (fresh)
+#if PAN_ARCH < 9
+   if (job == VTC_JOB_XFER || job == VTC_JOB_IMAGE)
+      b->vtc_img = true;
+   if (job == VTC_JOB_FRESH)
       b->vtc_fresh = true;
+#endif
    return &b->vtc;
 }
 
@@ -572,39 +736,53 @@ struct mali_jm_chain *
 mali_jm_cmd_vtc(struct mali_cmd_buffer *cmd)
 {
 #if PAN_ARCH < 9
-   /* Dispatches: they may read an image an image-only barrier ordered
-    * (MALI_JM_IMAGE_BARRIER_NARROW). Write Value jobs take
-    * mali_jm_cmd_vtc_value. */
-   if (cmd->dev->jm->v7_image_barrier_narrow)
-      return vtc_chain(cmd, true);
+   /* Dispatches: they write memory and may read an image that an
+    * image-only barrier ordered (image_barrier_req). They are not in the
+    * second scope of a transfer-only barrier. */
+   return vtc_chain(cmd, VTC_JOB_IMAGE);
+#else
+   return vtc_chain(cmd, VTC_JOB_PLAIN);
 #endif
-   return vtc_chain(cmd, false);
 }
 
 struct mali_jm_chain *
 mali_jm_cmd_vtc_draw(struct mali_cmd_buffer *cmd)
 {
-   return vtc_chain(cmd, false);
+#if PAN_ARCH < 9
+   /* The tiling of a pass does not wait for an image barrier's
+    * requirement, but it still starts a new batch when the open one has
+    * the fragment work that requirement is about: a batch's fragment atoms
+    * wait for all of its tiling, and the next batch's tiling runs while
+    * they shade. This is where a plain requirement would have closed the
+    * batch, so the batches are the ones such a barrier always made, minus
+    * the wait. Once per barrier (REQ_IVTC_SPLIT): later passes go into the
+    * batch as usual. */
+   if (cmd->jm.req & REQ_IVTC_SPLIT) {
+      cmd->jm.req &= ~REQ_IVTC_SPLIT;
+      if (cmd->jm.open &&
+          vtc_req_closes(cmd, vtc_req(cmd->jm.req & REQ_IVTC_ALL, VTC_JOB_IMAGE)))
+         mali_jm_cmd_batch_close(cmd);
+   }
+#endif
+   return vtc_chain(cmd, VTC_JOB_PLAIN);
 }
 
 struct mali_jm_chain *
 mali_jm_cmd_vtc_value(struct mali_cmd_buffer *cmd)
 {
-   return vtc_chain(cmd, false);
+   return vtc_chain(cmd, VTC_JOB_PLAIN);
 }
 
 void
 mali_jm_cmd_pass_images(struct mali_cmd_buffer *cmd)
 {
 #if PAN_ARCH < 9
-   if (!cmd->dev->jm->v7_image_barrier_narrow)
-      return;
-   const uint16_t req = vtc_req(cmd->jm.req, true);
+   const uint16_t req = vtc_req(cmd->jm.req, VTC_JOB_IMAGE);
    /* The pass's tiling so far ran ahead of this batch's fragment work: the
     * draw goes on in a new batch, which waits for it. */
    if (vtc_req_closes(cmd, req))
       mali_jm_cmd_pass_split(cmd);
-   vtc_chain(cmd, true);
+   vtc_chain(cmd, VTC_JOB_IMAGE);
 #else
    (void)cmd;
 #endif
@@ -613,13 +791,22 @@ mali_jm_cmd_pass_images(struct mali_cmd_buffer *cmd)
 struct mali_jm_chain *
 mali_jm_cmd_vtc_transfer(struct mali_cmd_buffer *cmd)
 {
-   return vtc_chain(cmd, true);
+#if PAN_ARCH < 9
+   /* A copy into a fresh image (mali_image::fresh): no earlier work read
+    * or wrote the image or its memory, so of the transfer-only
+    * requirements it needs only those of buffer and global barriers (its
+    * source buffer). Image barriers' requirements stay for the next job
+    * that can touch their image. */
+   if (cmd->jm.xfer_fresh && !cmd->jm.xvtc_buf)
+      return vtc_chain(cmd, VTC_JOB_FRESH);
+#endif
+   return vtc_chain(cmd, VTC_JOB_XFER);
 }
 
 bool
 mali_jm_cmd_transfer_needs_frag(struct mali_cmd_buffer *cmd)
 {
-   return cmd->jm.open && vtc_req_closes(cmd, vtc_req(cmd->jm.req, true));
+   return cmd->jm.open && vtc_req_closes(cmd, vtc_req(cmd->jm.req, VTC_JOB_XFER));
 }
 
 struct mali_jm_chain *
@@ -691,6 +878,47 @@ mali_jm_cmd_add_batch(struct mali_cmd_buffer *cmd, const struct mali_jm_batch *b
    if (!slot)
       return false;
    *slot = b;
+   return true;
+}
+
+/*
+ * An event operation is a batch of its own, between the batches recorded
+ * before it and those after, so each side's work is in other atoms than the
+ * event's: closing the open batch is what lets the set's atom wait for the
+ * work before it, and lets the work after a wait be held by the wait's
+ * atom. A Write Value job in the vtc chain could not set the word: the
+ * batch's fragment atoms run after its vtc atom, and the job's store is not
+ * ordered against the cache clean the kernel does when an atom completes.
+ *
+ * Inside a render pass (a wait: a set or reset is not valid there) the pass
+ * is split at the wait: its tiling so far is one vtc atom, the wait's atom
+ * comes next, and the rest of the pass goes on in a new batch with the
+ * same tiler heap. That batch's fragment work, which reads all of the
+ * pass's polygon lists, must follow the first vtc atom even when the batch
+ * gets no vtc job of its own after the wait: frag_after_vtc.
+ */
+bool
+mali_jm_cmd_event(struct mali_cmd_buffer *cmd, uint8_t op, uint64_t addr,
+                  VkPipelineStageFlags2 stages)
+{
+   const bool split = cmd->gfx.render.active && cmd->jm.open;
+   if (split)
+      mali_jm_cmd_pass_split(cmd);
+   else
+      mali_jm_cmd_batch_close(cmd);
+   struct mali_jm_batch *slot = util_dynarray_grow(&cmd->jm.batches, struct mali_jm_batch, 1);
+   if (!slot) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return false;
+   }
+   *slot = (struct mali_jm_batch){
+      .heap_slot = -1,
+      .event_op = op,
+      .event_addr = addr,
+      .event_stages = stages,
+   };
+   if (split)
+      cmd->jm.cur.frag_after_vtc = true;
    return true;
 }
 
@@ -777,30 +1005,31 @@ mali_jm_cmd_barrier(struct mali_cmd_buffer *cmd, VkPipelineStageFlags2 src_stage
    cmd->jm.req |= req;
 #if PAN_ARCH < 9
    irange_barrier(cmd, src_stages, dst_stages);
-#endif
    /* Not known to be about images only (mali_jm_cmd::xvtc_buf). */
    if (req & REQ_XVTC_ALL)
       cmd->jm.xvtc_buf = true;
+#endif
 }
 
 #if PAN_ARCH < 9
 /*
- * MALI_JM_IMAGE_BARRIER_NARROW: the vtc requirements of image memory
- * barriers. Their memory dependency covers only the image; what is global
- * is the execution dependency. A vtc job that cannot access the image and
- * has no side effects cannot tell whether it ran before the first scope's
- * fragment work or after it: a read of a buffer that work wrote needs a
- * buffer or global memory dependency, which keeps the full rule, and a
- * write-after-read needs a write. So only the vtc jobs that can touch
- * images wait (REQ_XVTC_*, the transfer-only class): a pass whose vertex
- * shaders read no textures or images and write no memory tiles while the
- * fragment work before it still runs.
+ * The vtc requirements of image memory barriers. Their memory dependency
+ * covers only the image; what is global is the execution dependency. A vtc
+ * job that cannot access the image and writes no memory cannot tell
+ * whether it ran before the first scope's fragment work or after it: a
+ * read of a buffer that work wrote needs a buffer or global memory
+ * dependency, which keeps the full rule, and a write-after-read needs a
+ * write. So the "vtc after fragment" requirements of an image barrier
+ * (REQ_IVTC_*) are waited for only by the vtc jobs that can touch images
+ * or memory: a pass whose vertex shaders read no textures or images and
+ * write no memory tiles while the fragment work before it still runs. The
+ * barrier's transfer-only requirements (REQ_XVTC_*) and the others stay as
+ * barrier_req made them.
  *
  * Titles that end every render-to-texture pass with an "all commands ->
  * all commands" image barrier (hakuX) otherwise get no overlap between a
  * pass's tiling and the fragment work before it: on the Mali-G52 that
- * left about a quarter of the GPU's time serialised. Off with the debug
- * switch vtcwait.
+ * left about a quarter of the GPU's time serialised.
  */
 static uint16_t
 image_barrier_req(VkPipelineStageFlags2 src_stages, VkPipelineStageFlags2 dst_stages,
@@ -808,9 +1037,11 @@ image_barrier_req(VkPipelineStageFlags2 src_stages, VkPipelineStageFlags2 dst_st
 {
    uint16_t req = barrier_req(src_stages, dst_stages, dst_access);
    if (req & REQ_VTC_AFTER_FRAG)
-      req = (req & ~REQ_VTC_AFTER_FRAG) | REQ_XVTC_AFTER_FRAG;
+      req = (req & ~REQ_VTC_AFTER_FRAG) | REQ_IVTC_AFTER_FRAG;
    if (req & REQ_VTC_AFTER_FRAG_XFER)
-      req = (req & ~REQ_VTC_AFTER_FRAG_XFER) | REQ_XVTC_AFTER_FRAG_XFER;
+      req = (req & ~REQ_VTC_AFTER_FRAG_XFER) | REQ_IVTC_AFTER_FRAG_XFER;
+   if (req & REQ_IVTC_ALL)
+      req |= REQ_IVTC_SPLIT;
    return req;
 }
 #endif
@@ -906,6 +1137,17 @@ image_barrier_invalidates_crc(const VkImageMemoryBarrier2 *m)
            m->srcQueueFamilyIndex == VK_QUEUE_FAMILY_FOREIGN_EXT);
 }
 
+void
+mali_jm_cmd_dep_crc(struct mali_cmd_buffer *cmd, const VkDependencyInfo *info)
+{
+   for (uint32_t i = 0; i < info->imageMemoryBarrierCount; i++) {
+      const VkImageMemoryBarrier2 *m = &info->pImageMemoryBarriers[i];
+      if (image_barrier_invalidates_crc(m))
+         MALI_PER_ARCH(cmd_crc_invalidate)(cmd, container_of(vk_image_from_handle(m->image),
+                                                             struct mali_image, vk));
+   }
+}
+
 /*
  * An in-pass by-region barrier that only orders attachment writes before
  * attachment and input attachment reads (local read, framebuffer fetch).
@@ -917,7 +1159,9 @@ image_barrier_invalidates_crc(const VkImageMemoryBarrier2 *m)
  * pipeline per barrier: hakuX's cockpit passes have about 22 of them, and
  * with every draw scissored to one pixel such a 640x720 pass still took
  * 4.1 ms of fragment time on the G52. Storage and other memory accesses
- * keep the barrier; so does everything with the debug switch fbbarrier.
+ * keep the barrier, and so does a barrier that orders execution only (no
+ * access in either scope): its masks say nothing about what it orders, so
+ * the draw stays.
  */
 #define TILE_SRC_ACCESS                                                        \
    (VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | \
@@ -926,26 +1170,39 @@ image_barrier_invalidates_crc(const VkImageMemoryBarrier2 *m)
 #define TILE_DST_ACCESS                                                        \
    (TILE_SRC_ACCESS | VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT)
 
+#if PAN_ARCH < 9
+/* A barrier with no access in either scope, once the masks are filtered for
+ * its stages: an execution dependency only. */
+static bool
+execution_only(VkPipelineStageFlags2 src, VkAccessFlags2 srca, VkPipelineStageFlags2 dst,
+               VkAccessFlags2 dsta)
+{
+   src = vk_expand_src_stage_flags2(src);
+   dst = vk_expand_dst_stage_flags2(dst);
+   return !vk_filter_src_access_flags2(src, srca) && !vk_filter_dst_access_flags2(dst, dsta);
+}
+#endif
+
+/* The masks are the unions over the call's barriers; exec_only says whether
+ * any one of those barriers orders execution only. */
 static bool
 tile_ordered_barrier(VkPipelineStageFlags2 src, VkAccessFlags2 srca, VkPipelineStageFlags2 dst,
-                     VkAccessFlags2 dsta, const struct mali_cmd_buffer *cmd)
+                     VkAccessFlags2 dsta, bool exec_only)
 {
 #if PAN_ARCH < 9
-   if (!cmd->dev->jm->v7_tile_ordered_fb_barrier)
+   if (exec_only)
       return false;
    src = vk_expand_src_stage_flags2(src);
    dst = vk_expand_dst_stage_flags2(dst);
    srca = vk_filter_src_access_flags2(src, srca);
    dsta = vk_filter_dst_access_flags2(dst, dsta);
-   /* An execution-only barrier (no source access) keeps its draw: it may
-    * order storage reads before writes, which the tile order does not. */
-   return srca && !(srca & ~TILE_SRC_ACCESS) && !(dsta & ~TILE_DST_ACCESS);
+   return !(srca & ~TILE_SRC_ACCESS) && !(dsta & ~TILE_DST_ACCESS);
 #else
    (void)src;
    (void)srca;
    (void)dst;
    (void)dsta;
-   (void)cmd;
+   (void)exec_only;
    return false;
 #endif
 }
@@ -958,8 +1215,13 @@ MALI_PER_ARCH(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
 
    VkPipelineStageFlags2 src = 0, dst = 0;
    VkAccessFlags2 srca = 0, dsta = 0;
+   bool exec_only = false;   /* some barrier of the call orders execution only */
    for (uint32_t i = 0; i < info->memoryBarrierCount; i++) {
       const VkMemoryBarrier2 *m = &info->pMemoryBarriers[i];
+#if PAN_ARCH < 9
+      exec_only |=
+         execution_only(m->srcStageMask, m->srcAccessMask, m->dstStageMask, m->dstAccessMask);
+#endif
       src |= m->srcStageMask;
       dst |= m->dstStageMask;
       srca |= m->srcAccessMask;
@@ -970,6 +1232,10 @@ MALI_PER_ARCH(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
     * and foreign ones. */
    for (uint32_t i = 0; i < info->bufferMemoryBarrierCount; i++) {
       const VkBufferMemoryBarrier2 *m = &info->pBufferMemoryBarriers[i];
+#if PAN_ARCH < 9
+      exec_only |=
+         execution_only(m->srcStageMask, m->srcAccessMask, m->dstStageMask, m->dstAccessMask);
+#endif
       src |= m->srcStageMask;
       dst |= m->dstStageMask;
       srca |= m->srcAccessMask;
@@ -980,14 +1246,18 @@ MALI_PER_ARCH(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
     * is the image), for ubo_copy_dep. */
    const VkPipelineStageFlags2 buf_src = src, buf_dst = dst;
    const VkAccessFlags2 buf_srca = srca, buf_dsta = dsta;
-#endif
    VkPipelineStageFlags2 img_src = 0, img_dst = 0;
    VkAccessFlags2 img_dsta = 0;
+#endif
    for (uint32_t i = 0; i < info->imageMemoryBarrierCount; i++) {
       const VkImageMemoryBarrier2 *m = &info->pImageMemoryBarriers[i];
+#if PAN_ARCH < 9
+      exec_only |=
+         execution_only(m->srcStageMask, m->srcAccessMask, m->dstStageMask, m->dstAccessMask);
       img_src |= m->srcStageMask;
       img_dst |= m->dstStageMask;
       img_dsta |= m->dstAccessMask;
+#endif
       src |= m->srcStageMask;
       dst |= m->dstStageMask;
       srca |= m->srcAccessMask;
@@ -1006,29 +1276,22 @@ MALI_PER_ARCH(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
       const VkPipelineStageFlags2 fs = FRAG_RENDER_STAGES;
       if ((info->dependencyFlags & VK_DEPENDENCY_BY_REGION_BIT) &&
           (vk_expand_src_stage_flags2(src) & fs) && (vk_expand_dst_stage_flags2(dst) & fs) &&
-          !tile_ordered_barrier(src, srca, dst, dsta, cmd))
+          !tile_ordered_barrier(src, srca, dst, dsta, exec_only))
          MALI_PER_ARCH(cmd_fb_barrier)(cmd);
       return;
    }
 #if PAN_ARCH < 9
-   if (cmd->dev->jm->v7_image_barrier_narrow) {
-      /* The global and buffer dependencies keep the full rule; the image
-       * ones apply to the vtc jobs that can touch images. */
-      const uint16_t buf_req = barrier_req(buf_src, buf_dst, buf_dsta);
-      cmd->jm.req |= buf_req | image_barrier_req(img_src, img_dst, img_dsta);
-      irange_barrier(cmd, src, dst);
-      if (buf_req & REQ_XVTC_ALL)
-         cmd->jm.xvtc_buf = true;
-   } else {
-      mali_jm_cmd_barrier(cmd, src, srca, dst, dsta);
-   }
+   /* The global and buffer dependencies keep the full rule; the image ones
+    * apply to the vtc jobs that can touch images. */
+   const uint16_t buf_req = barrier_req(buf_src, buf_dst, buf_dsta);
+   cmd->jm.req |= buf_req | image_barrier_req(img_src, img_dst, img_dsta);
+   irange_barrier(cmd, src, dst);
+   if (buf_req & REQ_XVTC_ALL)
+      cmd->jm.xvtc_buf = true;
    if (ubo_copy_dep(buf_src, buf_srca, buf_dst, buf_dsta))
       mali_jm_cmd_barrier(cmd, buf_src, buf_srca, VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
                           VK_ACCESS_2_UNIFORM_READ_BIT);
 #else
-   (void)img_src;
-   (void)img_dst;
-   (void)img_dsta;
    mali_jm_cmd_barrier(cmd, src, srca, dst, dsta);
 #endif
 }
@@ -1050,10 +1313,10 @@ MALI_PER_ARCH(BeginCommandBuffer)(VkCommandBuffer commandBuffer,
     * one after the other: one chain cannot run twice at the same time. */
    cmd->jm.resubmit = !(info->flags & VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
 #if PAN_ARCH < 9
-   cmd->jm.idx_hint.set = false;
-#endif
    cmd->jm.xvtc_buf = false;
    cmd->jm.xfer_fresh = false;
+   cmd->jm.idx_hint.set = false;
+#endif
    return VK_SUCCESS;
 }
 
@@ -1087,11 +1350,21 @@ MALI_PER_ARCH(EndCommandBuffer)(VkCommandBuffer commandBuffer)
    }
    if (req & REQ_FRAG_AFTER_VTC)
       cmd->jm.end_req |= MALI_JM_REQ_FRAG_AFTER_VTC;
+#if PAN_ARCH < 9
+   /* An image barrier's requirements likewise stay for the later vtc
+    * chains that can touch images (mali_jm_batch::vtc_img). */
+   if (!(req & REQ_VTC_AFTER_FRAG)) {
+      if (req & REQ_IVTC_AFTER_FRAG)
+         cmd->jm.end_req |= MALI_JM_REQ_IVTC_AFTER_FRAG;
+      else if (req & REQ_IVTC_AFTER_FRAG_XFER)
+         cmd->jm.end_req |= MALI_JM_REQ_IVTC_AFTER_FRAG_XFER;
+   }
    if (cmd->jm.xvtc_buf &&
        (cmd->jm.end_req & (MALI_JM_REQ_XVTC_AFTER_FRAG | MALI_JM_REQ_XVTC_AFTER_FRAG_XFER)))
       cmd->jm.end_req |= MALI_JM_REQ_XVTC_BUF;
-   cmd->jm.req = 0;
    cmd->jm.xvtc_buf = false;
+#endif
+   cmd->jm.req = 0;
    return vk_command_buffer_end(&cmd->vk);
 }
 
@@ -1112,7 +1385,9 @@ cmd_clear(struct mali_cmd_buffer *cmd)
    cmd->jm.open = false;
 #if PAN_ARCH < 9
    memset(&cmd->jm.irange, 0, sizeof(cmd->jm.irange));
+   mali_v7_idraw_arena_release(cmd);
    cmd->jm.pend_tilers = 0;
+   cmd->jm.pend_tiler_ns = 0;
    cmd->jm.tiler_defer = false;
    cmd->jm.copy_tsd = 0;
    util_dynarray_clear(&cmd->jm.buf_writes);
@@ -1189,6 +1464,9 @@ cmd_destroy(struct vk_command_buffer *vk_cmd)
 {
    struct mali_cmd_buffer *cmd = container_of(vk_cmd, struct mali_cmd_buffer, vk);
    mali_jm_measure_cmd_destroy(cmd);
+#if PAN_ARCH < 9
+   mali_v7_idraw_arena_release(cmd);
+#endif
    release_memory(cmd);
    util_dynarray_fini(&cmd->jm.batches);
    util_dynarray_fini(&cmd->jm.frags);

@@ -161,7 +161,103 @@ enum mali_meta_shader {
    MALI_META_QUERY_COPY,  /* vkCmdCopyQueryPoolResults, one invocation per query */
    MALI_META_QUERY_COPY_SUM, /* the same for pools whose query is a sum of
                               * counters (v7 occlusion: one per shader core) */
+   MALI_META_INDIRECT_DISPATCH, /* v7 and v9 vkCmdDispatchIndirect: patches the Compute job */
+   MALI_META_INDIRECT_DRAW,     /* v7 and v9 indirect draws: patches a draw's jobs */
+   MALI_META_INDEX_MINMAX,      /* v7 indirect indexed draws: the indices' range */
    MALI_META_COUNT,
+};
+
+/* Push constants of MALI_META_INDIRECT_DISPATCH (mali_jm_cmd_dispatch.c):
+ * the VkDispatchIndirectCommand, the Compute job's header, the place the
+ * counts go in the job, and the FAU addresses of num_work_groups.xyz (0
+ * where the shader does not read one). On v7 inv is the Invocation
+ * section, whose words inv0 and inv1 have the workgroup size packed and
+ * the counts left out, and wgx_shift is where the counts start. On v9 inv
+ * is the first of the three Workgroup count words of the Compute payload,
+ * and the other three fields are not used. */
+struct mali_meta_indirect_push {
+   uint64_t cmd;
+   uint64_t job;
+   uint64_t inv;
+   uint64_t nwg[3];
+   uint32_t inv0;
+   uint32_t inv1;
+   uint32_t wgx_shift;
+   uint32_t pad;
+};
+
+/*
+ * One draw of a vkCmdDraw*Indirect* on the job manager (v7 and v9), for its
+ * patch job (MALI_META_INDIRECT_DRAW, mali_jm_idraw_nir.c), which reads it
+ * from command memory through the one 64-bit push constant it has. What
+ * the command buffer knows when it records the draw: where the draw's
+ * parameters and the draw count are, and where in the draw's jobs and
+ * descriptors each value that comes from them goes. Addresses that are 0
+ * name nothing to patch. v9 uses the fields up to attr_stride.
+ */
+#define MALI_IDRAW_MAX_ATTRIBS 16
+struct mali_jm_idraw_rec {
+   uint64_t cmd;            /* the VkDraw(Indexed)IndirectCommand */
+   uint64_t count;          /* the draw count (indirect count draws), else 0 */
+   uint32_t draw_index;     /* this draw's place in the call */
+   uint32_t max_draws;      /* drawCount or maxDrawCount */
+   uint32_t indexed;
+   uint32_t index_shift;    /* log2 of the index size */
+   uint64_t indices;        /* the bound index buffer, its offset applied */
+   uint64_t job;            /* v9: the Malloc Vertex job; v7: the Vertex job */
+   uint64_t tiler_job;      /* v7: the Tiler job, 0 without one */
+   uint64_t first_vertex;   /* FAU words of the vertex shader's system values */
+   uint64_t base_instance;
+   uint64_t raw_vertex_offset;   /* v7 */
+   /* Per-instance attributes: their offset is base + firstInstance x stride.
+    * v9: in the vertex shader's driver table (32-byte Attribute
+    * descriptors, offset in word 2); v7: in the draw's Attribute table
+    * (8-byte descriptors, offset in word 1). */
+   uint64_t attribs;
+   uint32_t inst_attr_mask;
+   /* v7: of those, the ones whose buffer is a 1D POT Divisor: the attribute
+    * unit adds the draw's Offset start to their element too, so their
+    * offset is base + (firstInstance - Offset start) x stride. */
+   uint32_t inst_attr_raw_mask;
+   uint32_t attr_base[MALI_IDRAW_MAX_ATTRIBS];
+   uint32_t attr_stride[MALI_IDRAW_MAX_ATTRIBS];
+   /* v7 */
+   uint64_t minmax;         /* indexed: the smallest and largest index */
+   uint64_t attrib_bufs;    /* the Attribute Buffer table, two per binding */
+   uint32_t mod_mask;       /* bindings packed 1D Modulus (per vertex) */
+   uint32_t pot_mask;       /* bindings packed 1D POT Divisor (per instance) */
+   uint32_t pot_shift[MALI_IDRAW_MAX_ATTRIBS];   /* log2 of their divisor */
+   uint64_t vary_bufs;      /* the varying Attribute Buffers */
+   uint32_t vary_stride[3];
+   uint32_t vary_max[3];    /* the most vertices that fit the arena at that stride */
+   uint64_t arena;          /* the varying arena: header, then arena_size bytes */
+   uint32_t arena_size;
+   uint32_t prim_verts;     /* vertices per primitive: 1, 2 or 3 */
+   uint32_t inv1;           /* Invocation word 1 without the Workgroups Z shift */
+   uint32_t writes_psiz;
+};
+
+/* The header of a v7 command buffer's varying arena (mali_jm_cmd_draw_v7.c):
+ * the bytes handed out so far, and the draws that did not fit. */
+struct mali_jm_idraw_arena_hdr {
+   uint32_t used;
+   uint32_t dropped;
+};
+#define MALI_IDRAW_ARENA_HDR 64
+
+/* Push constants of MALI_META_INDEX_MINMAX: the smallest and largest of a
+ * VkDrawIndexedIndirectCommand's indices into result[0] and result[1]
+ * (atomic min and max), restart indices left out when restart is set. elems
+ * is the bound index buffer's size in indices; each invocation reads
+ * per_thread of them. */
+struct mali_meta_minmax_push {
+   uint64_t indices;
+   uint64_t cmd;
+   uint64_t result;
+   uint32_t elems;
+   uint32_t per_thread;
+   uint32_t index_shift;
+   uint32_t restart;
 };
 
 /* A fault as the kernel described it, for vkGetDeviceFaultInfoEXT. code
@@ -317,14 +413,14 @@ struct mali_device {
       uint32_t shader_cache_hits;
    } pipeline_stats;
 
-   /* VkEvent words (mali_event.h), host-visible. Command-stream frontend
-    * (v11) only; set up by mali_event_pool_init. */
+   /* VkEvent words (mali_event.h), host-visible; set up by
+    * mali_event_pool_init. */
    struct mali_bo_pool event_pool;
 };
 
 VK_DEFINE_HANDLE_CASTS(mali_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
 
-/* The event pool (mali_event.c, v11 only): set up after the kbase context
+/* The event pool (mali_event.c): set up after the kbase context
  * exists, torn down before it goes. Slabs are allocated by the first
  * event. */
 void mali_event_pool_init(struct mali_device *dev);
@@ -393,32 +489,6 @@ mali_diag_should_log(uint32_t *counter, uint32_t *n)
    return i < 8 || (i + 1) % 100 == 0;
 }
 
-/*
- * Switches for trying a change both ways on the device: MALISX2_DEBUG (on
- * Android the property debug.malisx2.debug), a comma-separated list of
- * names, read once per process. mali_debug_flag says whether name is in
- * it.
- */
-bool mali_debug_flag(const char *name);
-
-/* With the debug switch "cpuprof", timing wrappers in front of the
- * per-draw and per-frame entry points of the device's dispatch table
- * (mali_cpuprof.c). */
-struct vk_device_dispatch_table;
-void mali_cpuprof_install(struct vk_device_dispatch_table *t);
-
-/* Sections of the wrapped entry points, timed apart with the same switch:
- * mali_cpuprof_part(part, t0) adds the time since t0 (os_time_get_nano)
- * when mali_cpuprof_on. Reported with the entry points, not added to the
- * total. */
-enum mali_cpuprof_part {
-   MALI_CPUPROF_IDXSCAN,  /* v7: an indexed draw's index range scan */
-   MALI_CPUPROF_DRAWPREP, /* v7: a draw's descriptors and state (prepare_draw) */
-   MALI_CPUPROF_PART_COUNT
-};
-extern bool mali_cpuprof_on;
-void mali_cpuprof_part(enum mali_cpuprof_part part, uint64_t t0);
-
 /* malisx2's own command, handed out by vkGetDeviceProcAddr on v7
  * (mali_device.c): the index range of the next indexed draw, which must
  * cover all its indices but the restart index (mali_jm_cmd_draw_v7.c). */
@@ -429,6 +499,51 @@ VKAPI_ATTR void VKAPI_CALL mali_v7_CmdSetIndexRangeMALISX2(VkCommandBuffer comma
                                                            uint32_t firstIndex,
                                                            uint32_t indexCount,
                                                            uint32_t minIndex, uint32_t maxIndex);
+
+/*
+ * malisx2's own device extension on v7, in place of
+ * VK_EXT_descriptor_indexing (whose required features and 500000
+ * update-after-bind limits v7's 16-bit descriptor tables cannot meet). v9
+ * and v11 offer VK_EXT_descriptor_indexing itself (mali_physical_device.c)
+ * and not this one; v7 offers this one and not the EXT.
+ *
+ * - With it offered, VkPhysicalDeviceDescriptorIndexingFeatures and
+ *   VkPhysicalDeviceDescriptorIndexingProperties may be chained into
+ *   vkGetPhysicalDeviceFeatures2 and vkGetPhysicalDeviceProperties2. They
+ *   report the part v7 has (runtime arrays, partially bound bindings,
+ *   sampled images updated after bind, non-uniform sampled-image indexing)
+ *   and its own update-after-bind limits.
+ * - With it enabled, an application may use those features (in
+ *   VkPhysicalDeviceDescriptorIndexingFeatures at vkCreateDevice too),
+ *   VkDescriptorSetLayoutBindingFlagsCreateInfo, the update-after-bind
+ *   layout and pool flags, and SPV_EXT_descriptor_indexing's capabilities
+ *   for them, as VK_EXT_descriptor_indexing defines them, within those
+ *   limits.
+ * - One deviation: a non-uniform index into a sampled-image or sampler
+ *   array must be the same for the four invocations of each 2x2 fragment
+ *   quad, and dynamically uniform in other stages. That holds for every
+ *   operation of the texture unit, texelFetch, explicit level of detail and
+ *   gather included, so it is wider than what the reported
+ *   quadDivergentImplicitLod (false) excuses, which is only implicit level
+ *   of detail. (hakuX indexes per draw, which a quad never straddles.)
+ * - A stage can use at most 240 storage images, storage texel buffers and
+ *   uniform texel buffers together (the image table), whatever
+ *   maxPerStageDescriptorUpdateAfterBindSampledImages says of the last
+ *   kind; pipeline creation fails with VK_ERROR_FEATURE_NOT_PRESENT past
+ *   that.
+ */
+#define VK_MALISX2_DESCRIPTOR_INDEXING_EXTENSION_NAME "VK_MALISX2_descriptor_indexing"
+#define VK_MALISX2_DESCRIPTOR_INDEXING_SPEC_VERSION 1
+
+/* Whether descriptor indexing is offered to applications under malisx2's own
+ * name (v7) and not VK_EXT_descriptor_indexing's (v9, v11). Mesa's runtime
+ * keys the feature structs on the EXT, so it is supported to the runtime
+ * either way. */
+static inline bool
+mali_descriptor_indexing_renamed(uint32_t arch)
+{
+   return arch == 7;
+}
 
 #if defined(PAN_ARCH) && PAN_ARCH == 7
 #include "util/log.h"

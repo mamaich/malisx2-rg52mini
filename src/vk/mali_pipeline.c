@@ -172,26 +172,18 @@ stage_init(struct mali_device *dev, VkPipelineCreateFlags2KHR flags,
    st->info = info;
    vk_pipeline_robustness_state_fill(&dev->vk.robustness_state, &st->rs,
                                      pipeline_pNext, info->pNext);
-#if PAN_ARCH < 9
-   /*
-    * The v7 Vertex job shades every vertex of an indexed draw's index range
-    * [min, max] (mali_jm_cmd_draw_v7.c), not just the ones the indices
-    * name, so a vertex shader also runs for vertices the application never
-    * draws, and does storage buffer reads it never meant to happen. Dolphin
-    * expands lines in the vertex shader when there is no geometry shader
-    * and reads the other end of the line at vertex_id - 1 in the corners
-    * the indices only ever take from the second vertex of a pair. Shaded
-    * for the first vertex too, that is input_buffer[0xffffffff]: element
-    * -1, which the 32-bit offset wraps to almost 4 GiB past the buffer's
-    * start, an unmapped address, so the GPU faults and the device is lost
-    * (ND Demo, at its first EFB draw). So a vertex shader's storage buffer
-    * accesses are bounds-checked whatever the pipeline's robustness: such a
-    * read returns zeros, which go out with the vertex that nothing draws.
-    * An Indexed Vertex job (IDVS) shades only the vertices the indices
-    * name, but whether a shader is split is up to the compiler
-    * (bi_should_idvs), so the check stays on every vertex shader.
-    * Before the stage hash, so the cache key follows.
-    */
+#if PAN_ARCH == 7
+   /* A v7 Vertex job shades every vertex of the draw's index range,
+    * including ones no index names (mali_jm_cmd_draw_v7.c), which the
+    * application never meant to run. A vertex shader that pulls its
+    * vertices out of a storage buffer by gl_VertexIndex can compute an
+    * address far outside the buffer for one of those: ARMSX2's line
+    * expansion reads vertex BaseVertex + n - 1, which wraps to 2^32 - 1
+    * when BaseVertex and n are 0, and the unchecked load there faults the
+    * GPU context. Vertex shaders get bounds-checked storage buffer loads,
+    * as with robustBufferAccess (the loads are clamped, not branched
+    * around: mali_nir_lower_bounded_loads.c); the hash below keeps them
+    * apart in the caches. */
    if (info->stage == VK_SHADER_STAGE_VERTEX_BIT &&
        st->rs.storage_buffers == VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT)
       st->rs.storage_buffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_EXT;
@@ -607,6 +599,13 @@ hash_fs_state(struct mesa_blake3 *ctx, const struct mali_device *dev,
          _mesa_blake3_update(ctx, state->rp->color_attachment_formats, n * sizeof(VkFormat));
       }
    }
+#if PAN_ARCH < 9
+   /* Which output locations feed an attachment (mali_shader.c
+    * location_attachment). */
+   if (state->rp)
+      _mesa_blake3_update(ctx, &state->rp->color_attachment_count,
+                          sizeof(state->rp->color_attachment_count));
+#endif
 }
 
 /* Descriptor sets a stage's resource table reads: the sets it indexes and
@@ -673,6 +672,7 @@ fill_bind(struct mali_device *dev, struct mali_graphics_pipeline *p)
    bd->tls_size = bk->tls_size;
    bd->noperspective = p->fs ? p->fs->info.varyings.noperspective : 0;
    bd->dynamic = bk->uses_dynamic_state;
+   bd->discard = !bk->uses_dynamic_state && p->state.rs.rasterizer_discard_enable;
    /* A dynamic topology keeps the point size (mali_cmd_draw.c reads
     * baked.prim only when it is static). */
    bd->lines = bk->prim != MESA_PRIM_COUNT && u_reduced_prim(bk->prim) == MESA_PRIM_LINES;

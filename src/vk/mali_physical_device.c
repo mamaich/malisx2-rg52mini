@@ -8,6 +8,8 @@
  * the blob's values, including the memory types.
  */
 
+#include "mali_descriptor_set_layout.h"
+#include "mali_image.h"
 #include "mali_queue.h"
 #include "mali_vk.h"
 #include "mali_shader.h"
@@ -400,6 +402,17 @@ static const struct vk_device_extension_table mali_device_extensions = {
     * code (mali_descriptor_set.c), so this needs no per-arch gate. */
    .KHR_push_descriptor = true,
 
+   /* Descriptor indexing: the sets are read in place through the resource
+    * tables on v9 and v11, which is what update after bind needs, and v7
+    * copies a stage's descriptors from them when the draw executes
+    * (get_descriptor_indexing_features has what each arch has). v7 cannot
+    * meet the extension's limits for what it does not have, so it is
+    * listed there under malisx2's own name (mali_vk.h): Mesa's runtime keys
+    * the feature structs on this entry, which stays set, and
+    * mali_EnumerateDeviceExtensionProperties and mali_CreateDevice swap the
+    * name (mali_descriptor_indexing_renamed). */
+   .EXT_descriptor_indexing = true,
+
    /* The timeline semaphore type is Mesa's emulated one over our binary
     * sync (mali_sync.c), so the device runs in Mesa's emulated timeline
     * mode. */
@@ -413,43 +426,111 @@ static const struct vk_device_extension_table mali_device_extensions = {
    .KHR_dynamic_rendering = true,
    .KHR_depth_stencil_resolve = true,
    .KHR_create_renderpass2 = true,
+
+   /* What Vulkan 1.3 made core, on every arch. The device stays 1.1: 1.2
+    * and 1.3 also require host query reset, buffer device address,
+    * maintenance4, inline uniform blocks and subgroup size control, which
+    * no arch has.
+    *
+    *  - synchronization2: the driver's barrier, submit and timestamp
+    *    commands are the 2 forms (the 1.0 forms are the runtime's wrappers
+    *    around them), so the 64-bit stage and access masks reach the same
+    *    code, the event commands included (every arch has VkEvent);
+    *  - extended dynamic state 1 and 2 and vertex input dynamic state: the
+    *    runtime keeps the state, and a pipeline that leaves any of it
+    *    dynamic has its hardware words packed again at the draw from the
+    *    command buffer's state (mali_cmd_state.h mali_gfx_update_dirty).
+    *    Rasterizer discard drops the draw. No logic op and no patch control
+    *    points (no logicOp, no tessellation);
+    *  - demote to helper invocation: every back end's discard is a demote;
+    *  - private data: the runtime's, on every object. */
+   .KHR_synchronization2 = true,
+   .EXT_extended_dynamic_state = true,
+   .EXT_extended_dynamic_state2 = true,
+   .EXT_vertex_input_dynamic_state = true,
+   .EXT_shader_demote_to_helper_invocation = true,
+   .EXT_private_data = true,
+
+   /* Reads of the bound colour and depth/stencil attachments inside a
+    * dynamic rendering pass, and the maps that decide which output location
+    * feeds which attachment and which input index reads which. Every arch
+    * has the three parts it needs: input attachments are tile reads
+    * (mali_nir_lower_input_attachments.c, panvk's scheme), where the maps
+    * are the pipeline's (VkRenderingAttachmentLocationInfo and
+    * VkRenderingInputAttachmentIndexInfo, kept by the runtime, which also
+    * implements the two vkCmdSetRendering* commands); a blend descriptor
+    * and the BLEND of an output location go with the attachment the
+    * location feeds (mali_pipeline_state.c pack_blend; v7 in mali_shader.c
+    * lower_sysvals); and a by-region barrier inside a pass is a draw with a
+    * primitive barrier (cmd_fb_barrier). */
+   .KHR_dynamic_rendering_local_read = true,
 };
 
 /*
- * v7 (Bifrost) offers, as extensions of its Vulkan 1.1 device, what it
- * has of what 1.2 and 1.3 made core: synchronization2 (the driver's
- * barrier and submit are the 2 forms; the runtime has the 1.0 ones), the
- * dynamic states of VK_EXT_extended_dynamic_state and _2 and vertex input
- * dynamic state (pipelines with dynamic state repack their words at the
- * draw, mali_cmd_state.h mali_gfx_update_dirty), descriptor indexing,
- * private data (runtime) and demote to helper invocation (Mesa's Bifrost
- * backend). The device stays 1.1: 1.2 and 1.3 also require host query
- * reset, buffer device address, maintenance4, inline uniform blocks and
- * subgroup size control, which v7 does not have. Other arches are as
- * before.
+ * 8- and 16-bit storage buffer and push constant access, and 8-bit integer
+ * arithmetic, as panvk reports them. v7's shaders go through Mesa's Bifrost
+ * backend, which lowers narrow loads and stores itself (bifrost_nir.c,
+ * nir_lower_mem_access_bit_sizes); kraid (v9, v11) loads and stores bytes
+ * and half words directly (8- and 16-bit OpLoad and OpStore) and has the
+ * narrow integer ALU. parallel-RDP (N64) requires the storage features.
+ * One predicate per extension, so that a part that fails on a device can be
+ * turned off alone.
  */
+static bool
+storage8_for_arch(uint32_t arch)      /* VK_KHR_8bit_storage */
+{
+   return arch == 7 || arch == 9 || arch == 11;
+}
+
+static bool
+storage16_for_arch(uint32_t arch)     /* VK_KHR_16bit_storage */
+{
+   return arch == 7 || arch == 9 || arch == 11;
+}
+
+static bool
+int8_for_arch(uint32_t arch)          /* shaderInt8 of VK_KHR_shader_float16_int8 */
+{
+   return arch == 7 || arch == 9 || arch == 11;
+}
+
+/*
+ * Indirect draws with more than one command (multiDrawIndirect), a first
+ * instance taken from the command (drawIndirectFirstInstance), and the
+ * indirect count forms (VK_KHR_draw_indirect_count). v11 runs the commands
+ * in a command-stream loop (mali_cmd_draw_indirect.c). On the job manager
+ * (v7, v9) each draw of a call is its own jobs behind a patch job that
+ * reads its parameters (mali_jm_idraw_nir.c), so maxDrawCount draws are
+ * recorded for an indirect count call whatever the count turns out to be.
+ */
+static bool
+draw_indirect_for_arch(uint32_t arch)
+{
+   return arch == 7 || arch == 9 || arch == 11;
+}
+
+/* maxDrawIndirectCount. v11: the stream compares the count as a signed
+ * word. v7, v9: the smallest limit Vulkan allows with multiDrawIndirect,
+ * which bounds what one call records. */
+static uint32_t
+max_draw_indirect_count_for_arch(uint32_t arch)
+{
+   if (!draw_indirect_for_arch(arch))
+      return 1;
+   return arch == 11 ? INT32_MAX : UINT16_MAX;
+}
+
 static struct vk_device_extension_table
 device_extensions_for_arch(uint32_t arch)
 {
    struct vk_device_extension_table ext = mali_device_extensions;
-   if (arch == 7) {
-      /* Reads of the bound colour and depth attachments inside a dynamic
-       * rendering pass: input attachments are tile reads already
-       * (mali_nir_lower_input_attachments.c, panvk's scheme, with the
-       * input attachment map from the runtime's
-       * vkCmdSetRenderingInputAttachmentIndices), and a by-region
-       * barrier inside a pass is a draw with a primitive barrier
-       * (mali_jm_cmd_buffer.c). */
-      ext.KHR_dynamic_rendering_local_read = true;
-      ext.KHR_synchronization2 = true;
-      ext.EXT_extended_dynamic_state = true;
-      ext.EXT_extended_dynamic_state2 = true;
-      ext.EXT_vertex_input_dynamic_state = true;
-      ext.EXT_shader_demote_to_helper_invocation = true;
-      ext.EXT_descriptor_indexing = true;
-      ext.KHR_maintenance3 = true;
-      ext.EXT_private_data = true;
-   }
+
+   ext.KHR_draw_indirect_count = draw_indirect_for_arch(arch);
+
+   /* 8- and 16-bit storage and int8 (see storage8_for_arch). */
+   ext.KHR_8bit_storage = storage8_for_arch(arch);
+   ext.KHR_16bit_storage = storage16_for_arch(arch);
+   ext.KHR_shader_float16_int8 = int8_for_arch(arch);
    return ext;
 }
 
@@ -482,6 +563,75 @@ dual_src_blend_for_arch(uint32_t arch)
    }
 }
 
+/* textureCompressionBC: every BCn format a sampled image, linearly
+ * filtered and a blit source (Vulkan's required format support). v7 and v9
+ * have that when the GPU has all of BC1-7 (mali_format_table.c); v11
+ * answers no for every BCn format. */
+static bool
+bc_formats_complete(const struct mali_physical_device *pdev)
+{
+   const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+                                     VK_FORMAT_FEATURE_BLIT_SRC_BIT |
+                                     VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+   for (VkFormat f = VK_FORMAT_BC1_RGB_UNORM_BLOCK; f <= VK_FORMAT_BC7_SRGB_BLOCK; f++) {
+      if ((mali_format_image_features(pdev, f) & need) != need)
+         return false;
+   }
+   return true;
+}
+
+/*
+ * VkPhysicalDeviceDescriptorIndexingFeatures (VK_EXT_descriptor_indexing on
+ * v9 and v11, VK_MALISX2_descriptor_indexing on v7: mali_vk.h).
+ *
+ * v9 and v11: a set is read in place through its resource table entry
+ * when a job runs, so a descriptor written after the set is bound, or never
+ * written when the shader does not reach it, needs nothing from the
+ * driver; the variable-count binding is the set's size (mali_descriptor_set.c).
+ * Every kind of array a stage can index is lowered with
+ * nir_lower_non_uniform_access (mali_shader.c). Input attachments are tile
+ * reads with a compile-time attachment (mali_nir_lower_input_attachments.c),
+ * so arrays of them are not offered. Dynamic uniform and storage buffers
+ * are not update-after-bind (a specification rule) and their addresses are
+ * taken when the command is recorded.
+ *
+ * v7: runtime arrays, partially bound bindings, sampled images updated
+ * after bind and non-uniform sampled-image indexing, within what its
+ * descriptor tables, copied by a job when the draw runs, can do: no
+ * variable count, no update after bind of buffers and storage images, no
+ * update while pending.
+ */
+static void
+get_descriptor_indexing_features(struct vk_features *f, uint32_t arch)
+{
+   if (arch == 7) {
+      f->runtimeDescriptorArray = true;
+      f->descriptorBindingPartiallyBound = true;
+      f->descriptorBindingSampledImageUpdateAfterBind = true;
+      f->shaderSampledImageArrayNonUniformIndexing = true;
+      return;
+   }
+
+   f->shaderUniformTexelBufferArrayDynamicIndexing = true;
+   f->shaderStorageTexelBufferArrayDynamicIndexing = true;
+   f->shaderUniformBufferArrayNonUniformIndexing = true;
+   f->shaderSampledImageArrayNonUniformIndexing = true;
+   f->shaderStorageBufferArrayNonUniformIndexing = true;
+   f->shaderStorageImageArrayNonUniformIndexing = true;
+   f->shaderUniformTexelBufferArrayNonUniformIndexing = true;
+   f->shaderStorageTexelBufferArrayNonUniformIndexing = true;
+   f->descriptorBindingUniformBufferUpdateAfterBind = true;
+   f->descriptorBindingSampledImageUpdateAfterBind = true;
+   f->descriptorBindingStorageImageUpdateAfterBind = true;
+   f->descriptorBindingStorageBufferUpdateAfterBind = true;
+   f->descriptorBindingUniformTexelBufferUpdateAfterBind = true;
+   f->descriptorBindingStorageTexelBufferUpdateAfterBind = true;
+   f->descriptorBindingUpdateUnusedWhilePending = true;
+   f->descriptorBindingPartiallyBound = true;
+   f->descriptorBindingVariableDescriptorCount = true;
+   f->runtimeDescriptorArray = true;
+}
+
 /*
  * The features we intend to implement for ARMSX2 on this GPU, not the
  * blob's full list. Values that decide ARMSX2's paths follow the blob
@@ -501,8 +651,10 @@ get_features(struct vk_features *f, uint32_t arch)
       .sampleRateShading = true,
       .dualSrcBlend = dual_src_blend_for_arch(arch),
       .logicOp = false,
-      .multiDrawIndirect = false,
-      .drawIndirectFirstInstance = false,
+      .multiDrawIndirect = draw_indirect_for_arch(arch),
+      .drawIndirectFirstInstance = draw_indirect_for_arch(arch),
+      /* Vulkan 1.2's name for VK_KHR_draw_indirect_count. */
+      .drawIndirectCount = draw_indirect_for_arch(arch),
       .depthClamp = true,
       .depthBiasClamp = true,
       /* v7 and v11 (not v9): clip distances are varyings the fragment
@@ -525,7 +677,7 @@ get_features(struct vk_features *f, uint32_t arch)
       .samplerAnisotropy = true,
       .textureCompressionETC2 = true,
       .textureCompressionASTC_LDR = true,
-      .textureCompressionBC = false,
+      .textureCompressionBC = false,  /* bc_formats_complete */
       .occlusionQueryPrecise = true,
       .pipelineStatisticsQuery = false,
       .vertexPipelineStoresAndAtomics = false,
@@ -539,6 +691,17 @@ get_features(struct vk_features *f, uint32_t arch)
       .shaderStorageBufferArrayDynamicIndexing = true,
       .shaderStorageImageArrayDynamicIndexing = true,
       .shaderInt16 = true,
+
+      /* VK_KHR_8bit_storage, VK_KHR_16bit_storage and the int8 half of
+       * VK_KHR_shader_float16_int8 (storage8_for_arch and the two after
+       * it). */
+      .storageBuffer8BitAccess = storage8_for_arch(arch),
+      .uniformAndStorageBuffer8BitAccess = storage8_for_arch(arch),
+      .storagePushConstant8 = storage8_for_arch(arch),
+      .storageBuffer16BitAccess = storage16_for_arch(arch),
+      .uniformAndStorageBuffer16BitAccess = storage16_for_arch(arch),
+      .storagePushConstant16 = storage16_for_arch(arch),
+      .shaderInt8 = int8_for_arch(arch),
 
       /* Vulkan 1.1: multiview is required of a 1.1 device. */
       .multiview = true,
@@ -591,36 +754,24 @@ get_features(struct vk_features *f, uint32_t arch)
        * whose only rendering path on a 1.1 device is vkCmdBeginRendering
        * and which requires all three names. */
       .dynamicRendering = true,
+
+      /* The extensions of mali_device_extensions that Vulkan 1.3 made
+       * core. Extended dynamic state 2 reports neither of its two optional
+       * parts. */
+      .synchronization2 = true,
+      .privateData = true,
+      .shaderDemoteToHelperInvocation = true,
+      .extendedDynamicState = true,
+      .extendedDynamicState2 = true,
+      .extendedDynamicState2LogicOp = false,
+      .extendedDynamicState2PatchControlPoints = false,
+      .vertexInputDynamicState = true,
+
+      /* VK_KHR_dynamic_rendering_local_read (the table above). */
+      .dynamicRenderingLocalRead = true,
    };
 
-   if (arch == 7) {
-      /* The extensions of device_extensions_for_arch on v7. */
-      f->synchronization2 = true;
-      f->privateData = true;
-      f->shaderDemoteToHelperInvocation = true;
-      f->dynamicRenderingLocalRead = true;
-      /* VK_EXT_extended_dynamic_state, _2 and vertex input dynamic
-       * state: the runtime keeps the state; a pipeline with dynamic
-       * state repacks its words from it at the draw. No logic op and no
-       * patch control points (no logicOp, no tessellation). */
-      f->extendedDynamicState = true;
-      f->extendedDynamicState2 = true;
-      f->extendedDynamicState2LogicOp = false;
-      f->extendedDynamicState2PatchControlPoints = false;
-      f->vertexInputDynamicState = true;
-      /* Descriptor indexing (VK_EXT_descriptor_indexing), the part hakuX uses.
-       * v7 copies the descriptors of update-after-bind sets into a
-       * stage's tables by a copy job when the draw runs (the others are
-       * copied on the CPU at recording, mali_jm_desc_v7.c), so writes
-       * after the bind are what it copies; unwritten descriptors are copied but not read; non-
-       * uniform indices are lowered to loops (mali_shader.c). The update-
-       * after-bind limits are the ordinary ones (get_properties), which
-       * on v7 are far below a bindless table. */
-      f->runtimeDescriptorArray = true;
-      f->descriptorBindingPartiallyBound = true;
-      f->descriptorBindingSampledImageUpdateAfterBind = true;
-      f->shaderSampledImageArrayNonUniformIndexing = true;
-   }
+   get_descriptor_indexing_features(f, arch);
 }
 
 /* The sample counts we report. Rendering is single-sampled (mali_fb.c) and
@@ -769,7 +920,7 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       .mipmapPrecisionBits = 8,
       .lineSubPixelPrecisionBits = 8,     /* same as panvk on this hardware */
       .maxDrawIndexedIndexValue = UINT32_MAX,
-      .maxDrawIndirectCount = 1,
+      .maxDrawIndirectCount = max_draw_indirect_count_for_arch(pdev->arch),
       .maxSamplerLodBias = 126.0f,
       .maxSamplerAnisotropy = 16.0f,
       .maxViewports = 1,
@@ -831,20 +982,20 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       /* VK_KHR_push_descriptor. panvk's value; ARMSX2 needs 7 (its TFX
        * texture set). */
       .maxPushDescriptors = 32,
-      .maxPerStageDescriptorSamplers = 1u << 20,
-      .maxPerStageDescriptorUniformBuffers = 1u << 20,
-      .maxPerStageDescriptorStorageBuffers = 1u << 20,
-      .maxPerStageDescriptorSampledImages = 1u << 20,
-      .maxPerStageDescriptorStorageImages = 1u << 20,
+      .maxPerStageDescriptorSamplers = MALI_MAX_DESCS_PER_TYPE,
+      .maxPerStageDescriptorUniformBuffers = MALI_MAX_DESCS_PER_TYPE,
+      .maxPerStageDescriptorStorageBuffers = MALI_MAX_DESCS_PER_TYPE,
+      .maxPerStageDescriptorSampledImages = MALI_MAX_DESCS_PER_TYPE,
+      .maxPerStageDescriptorStorageImages = MALI_MAX_DESCS_PER_TYPE,
       .maxPerStageDescriptorInputAttachments = 9,
-      .maxPerStageResources = 5 * (1u << 20) + 9,
-      .maxDescriptorSetSamplers = 1u << 20,
-      .maxDescriptorSetUniformBuffers = 1u << 20,
+      .maxPerStageResources = 5 * MALI_MAX_DESCS_PER_TYPE + 9,
+      .maxDescriptorSetSamplers = MALI_MAX_DESCS_PER_TYPE,
+      .maxDescriptorSetUniformBuffers = MALI_MAX_DESCS_PER_TYPE,
       .maxDescriptorSetUniformBuffersDynamic = 16,
-      .maxDescriptorSetStorageBuffers = 1u << 20,
+      .maxDescriptorSetStorageBuffers = MALI_MAX_DESCS_PER_TYPE,
       .maxDescriptorSetStorageBuffersDynamic = 8,
-      .maxDescriptorSetSampledImages = 1u << 20,
-      .maxDescriptorSetStorageImages = 1u << 20,
+      .maxDescriptorSetSampledImages = MALI_MAX_DESCS_PER_TYPE,
+      .maxDescriptorSetStorageImages = MALI_MAX_DESCS_PER_TYPE,
       .maxDescriptorSetInputAttachments = 9,
       .maxVertexInputAttributes = 16,
       .maxVertexInputBindings = 16,
@@ -898,7 +1049,63 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
        * per pipeline (panvk reports the same). */
       .provokingVertexModePerPipeline = false,
       .transformFeedbackPreservesTriangleFanProvokingVertex = false,
+
+      /* VK_KHR_dynamic_rendering_local_read (get_features): depth and
+       * stencil are tile reads like colour; rendering is single-sampled
+       * (MALI_SUPPORTED_SAMPLE_COUNTS), so there is no multisampled
+       * attachment to read. */
+      .dynamicRenderingLocalReadDepthStencilAttachments = true,
+      .dynamicRenderingLocalReadMultisampledAttachments = false,
    };
+
+   /*
+    * VK_EXT_descriptor_indexing's properties on v9 and v11 (v7 has its own
+    * below). An update-after-bind limit counts the descriptors of sets with
+    * and without the update-after-bind bit, so none is below its ordinary
+    * limit; with the sets read in place there is no cost to a descriptor
+    * being update-after-bind, so they are the ordinary limits (as panvk's).
+    * No pool-wide count is kept for update-after-bind pools: a pool is as
+    * large as the memory it can allocate.
+    *
+    * No quad-divergent implicit level of detail: an implicit-lod operation
+    * whose image or sampler differs inside a fragment quad is not defined
+    * (nir_lower_non_uniform_access makes the index uniform in the warp, not
+    * in the quad, mali_shader.c), and nothing is native: every non-uniform
+    * index goes through that lowering.
+    */
+   if (p->arch_major != 7) {
+      props->maxUpdateAfterBindDescriptorsInAllPools = UINT32_MAX;
+      props->shaderUniformBufferArrayNonUniformIndexingNative = false;
+      props->shaderSampledImageArrayNonUniformIndexingNative = false;
+      props->shaderStorageBufferArrayNonUniformIndexingNative = false;
+      props->shaderStorageImageArrayNonUniformIndexingNative = false;
+      props->shaderInputAttachmentArrayNonUniformIndexingNative = false;
+      props->robustBufferAccessUpdateAfterBind = true;
+      props->quadDivergentImplicitLod = false;
+      props->maxPerStageDescriptorUpdateAfterBindSamplers = props->maxPerStageDescriptorSamplers;
+      props->maxPerStageDescriptorUpdateAfterBindUniformBuffers =
+         props->maxPerStageDescriptorUniformBuffers;
+      props->maxPerStageDescriptorUpdateAfterBindStorageBuffers =
+         props->maxPerStageDescriptorStorageBuffers;
+      props->maxPerStageDescriptorUpdateAfterBindSampledImages =
+         props->maxPerStageDescriptorSampledImages;
+      props->maxPerStageDescriptorUpdateAfterBindStorageImages =
+         props->maxPerStageDescriptorStorageImages;
+      props->maxPerStageDescriptorUpdateAfterBindInputAttachments =
+         props->maxPerStageDescriptorInputAttachments;
+      props->maxPerStageUpdateAfterBindResources = props->maxPerStageResources;
+      props->maxDescriptorSetUpdateAfterBindSamplers = props->maxDescriptorSetSamplers;
+      props->maxDescriptorSetUpdateAfterBindUniformBuffers = props->maxDescriptorSetUniformBuffers;
+      props->maxDescriptorSetUpdateAfterBindUniformBuffersDynamic =
+         props->maxDescriptorSetUniformBuffersDynamic;
+      props->maxDescriptorSetUpdateAfterBindStorageBuffers = props->maxDescriptorSetStorageBuffers;
+      props->maxDescriptorSetUpdateAfterBindStorageBuffersDynamic =
+         props->maxDescriptorSetStorageBuffersDynamic;
+      props->maxDescriptorSetUpdateAfterBindSampledImages = props->maxDescriptorSetSampledImages;
+      props->maxDescriptorSetUpdateAfterBindStorageImages = props->maxDescriptorSetStorageImages;
+      props->maxDescriptorSetUpdateAfterBindInputAttachments =
+         props->maxDescriptorSetInputAttachments;
+   }
 
    /*
     * The Mali-G52 (v7) has no resource tables and takes panvk_v7's limits:
@@ -939,9 +1146,13 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       props->maxDescriptorSetStorageImages = 1u << 8;
       props->subgroupSize = 8;
 
-      /* Descriptor indexing (get_features): update-after-bind limits are
-       * the ordinary ones. */
+      /* VK_MALISX2_descriptor_indexing (get_descriptor_indexing_features):
+       * the limits start as the ordinary ones; per-stage ones are raised
+       * below. A non-uniform index must be uniform within a fragment quad
+       * even for explicit level of detail, which quadDivergentImplicitLod
+       * does not cover (mali_vk.h). */
       props->maxUpdateAfterBindDescriptorsInAllPools = UINT32_MAX / 2;
+      props->quadDivergentImplicitLod = false;
       props->shaderSampledImageArrayNonUniformIndexingNative = false;
       props->maxPerStageDescriptorUpdateAfterBindSamplers = props->maxPerStageDescriptorSamplers;
       props->maxPerStageDescriptorUpdateAfterBindUniformBuffers =
@@ -967,11 +1178,37 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       props->maxDescriptorSetUpdateAfterBindInputAttachments =
          props->maxDescriptorSetInputAttachments;
 
-      /* VK_EXT_extended_dynamic_state3 is not offered; local read's two
-       * dynamic attachment maps are the runtime's. VK_EXT_vertex_input
-       * dynamic state has no properties. */
-      props->dynamicRenderingLocalReadDepthStencilAttachments = true;
-      props->dynamicRenderingLocalReadMultisampledAttachments = false;
+      /*
+       * VK_MALISX2_descriptor_indexing (get_descriptor_indexing_features).
+       * An update-after-bind limit counts the descriptors of sets with and
+       * without the update-after-bind bit, so none is below its ordinary
+       * counterpart: per set they are the ordinary limits.
+       *
+       * Per stage, a stage whose textures and samplers all come from one
+       * update-after-bind set reads that set as its tables
+       * (mali_nir_lower_descriptors_v7.c direct sets), so a bindless array
+       * costs nothing per draw there. The tables have 16-bit counts, so the
+       * set must have fewer than 65536 slots: up to 16384 images and 1024
+       * samplers (hakuX asks for 3 x 4096 and 256, and then drops its
+       * per-draw sets: about a third of the driver's time per draw on the
+       * Mali-G52).
+       *
+       * The sampled image limit counts uniform texel buffers too, and those
+       * are not read through the Texture table: each takes an entry of the
+       * stage's image table, which storage images and storage texel buffers
+       * share and which holds MALI_V7_MAX_STAGE_IMG_ENTRIES whatever the
+       * limits say. A pipeline whose stage needs more fails to be created
+       * with VK_ERROR_FEATURE_NOT_PRESENT (mali_shader.c v7_fixup_info).
+       */
+      props->maxPerStageDescriptorUpdateAfterBindSampledImages = 16384;
+      props->maxPerStageDescriptorUpdateAfterBindSamplers = 1024;
+      props->maxPerStageUpdateAfterBindResources =
+         props->maxPerStageDescriptorUpdateAfterBindSamplers +
+         props->maxPerStageDescriptorUpdateAfterBindUniformBuffers +
+         props->maxPerStageDescriptorUpdateAfterBindStorageBuffers +
+         props->maxPerStageDescriptorUpdateAfterBindSampledImages +
+         props->maxPerStageDescriptorUpdateAfterBindStorageImages +
+         props->maxPerStageDescriptorUpdateAfterBindInputAttachments;
    }
 
    /* dArkOS: the blob's name plus the driver's, so that an emulator listing both drivers
@@ -1006,6 +1243,39 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
 
 /* ---------------------------------------------------------------------- */
 /* Queries we implement ourselves                                          */
+
+/* Mesa's list, with VK_EXT_descriptor_indexing shown as malisx2's own
+ * VK_MALISX2_descriptor_indexing on v7 (device_extensions_for_arch,
+ * mali_vk.h). */
+VKAPI_ATTR VkResult VKAPI_CALL
+mali_EnumerateDeviceExtensionProperties(VkPhysicalDevice physicalDevice,
+                                        const char *pLayerName,
+                                        uint32_t *pPropertyCount,
+                                        VkExtensionProperties *pProperties)
+{
+   VK_FROM_HANDLE(mali_physical_device, pdev, physicalDevice);
+   VK_OUTARRAY_MAKE_TYPED(VkExtensionProperties, out, pProperties, pPropertyCount);
+
+   for (int i = 0; i < VK_DEVICE_EXTENSION_COUNT; i++) {
+      if (!pdev->vk.supported_extensions.extensions[i])
+         continue;
+#ifdef ANDROID_STRICT
+      if (!vk_android_allowed_device_extensions.extensions[i])
+         continue;
+#endif
+      vk_outarray_append_typed(VkExtensionProperties, &out, prop) {
+         *prop = vk_device_extensions[i];
+         if (mali_descriptor_indexing_renamed(pdev->arch) &&
+             !strcmp(prop->extensionName, VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME)) {
+            snprintf(prop->extensionName, sizeof(prop->extensionName), "%s",
+                     VK_MALISX2_DESCRIPTOR_INDEXING_EXTENSION_NAME);
+            prop->specVersion = VK_MALISX2_DESCRIPTOR_INDEXING_SPEC_VERSION;
+         }
+      }
+   }
+
+   return vk_outarray_status(&out);
+}
 
 VKAPI_ATTR void VKAPI_CALL
 mali_GetPhysicalDeviceQueueFamilyProperties2(VkPhysicalDevice physicalDevice,
@@ -1159,6 +1429,7 @@ physical_device_create(struct mali_instance *instance, const char *path,
    struct vk_features features;
    struct vk_properties props;
    get_features(&features, pdev->arch);
+   features.textureCompressionBC = bc_formats_complete(pdev);
    get_properties(pdev, name, &props);
 
    const struct vk_device_extension_table extensions =
