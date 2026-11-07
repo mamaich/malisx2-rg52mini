@@ -235,6 +235,13 @@ struct mali_jm_idraw_rec {
    uint32_t prim_verts;     /* vertices per primitive: 1, 2 or 3 */
    uint32_t inv1;           /* Invocation word 1 without the Workgroups Z shift */
    uint32_t writes_psiz;
+   /* The vertex shader's Draw: the Vertex job's, or with idvs the Indexed
+    * Vertex job's Vertex Draw. idvs: the draw is one Indexed Vertex job,
+    * tiler_job (its sections up to the Fragment Draw are the Tiler job's),
+    * and job is 0. */
+   uint64_t vertex_draw;
+   uint32_t idvs;
+   uint32_t pad;
 };
 
 /* The header of a v7 command buffer's varying arena (mali_jm_cmd_draw_v7.c):

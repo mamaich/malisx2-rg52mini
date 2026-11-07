@@ -2029,12 +2029,15 @@ draw_indirect(struct mali_cmd_buffer *cmd, const struct idraw_call *call, uint32
       p->bind.dynamic ? &cmd->vk.dynamic_graphics_state : &p->state;
    const struct mali_shader *vs = p->vs;
 
-   /* The patch job writes a Vertex and a Tiler job. A vertex shader the
-    * compiler split for IDVS (v7 IDVS, one Indexed Vertex job a draw) has
-    * no such pair, and its Indexed Vertex job is not patched yet: the draw
-    * is skipped rather than run with the wrong job. */
-   if (vs->info.vs.idvs) {
-      MALI_V7_UNSUPPORTED("an indirect draw whose vertex shader is compiled for IDVS");
+   /* A vertex shader the compiler split for IDVS: one Indexed Vertex job
+    * instead of the Vertex and Tiler jobs, patched the same way (its
+    * sections up to the Fragment Draw are laid out as the Tiler job's;
+    * mali_jm_idraw_nir.c). It tiles even under rasterizer discard in a
+    * direct draw, behind a viewport that culls everything; not done here. */
+   const bool idvs = vs->info.vs.idvs;
+   if (idvs && st->rs.rasterizer_discard_enable) {
+      MALI_V7_UNSUPPORTED("an indirect draw under rasterizer discard whose vertex shader is "
+                          "compiled for IDVS");
       return;
    }
 
@@ -2085,10 +2088,13 @@ draw_indirect(struct mali_cmd_buffer *cmd, const struct idraw_call *call, uint32
    mali_v7_pack_invocation(&invocation, one, one, true);
 
    struct mali_ptr rp = mali_cmd_alloc(cmd, sizeof(rec), 8);
-   struct mali_ptr vj = mali_cmd_alloc(cmd, pan_size(COMPUTE_JOB), 128);
-   struct mali_ptr tj = tiling ? mali_cmd_alloc(cmd, pan_size(TILER_JOB), 128) : (struct mali_ptr){0};
+   struct mali_ptr vj =
+      idvs ? (struct mali_ptr){0} : mali_cmd_alloc(cmd, pan_size(COMPUTE_JOB), 128);
+   struct mali_ptr tj =
+      tiling ? mali_cmd_alloc(cmd, idvs ? pan_size(INDEXED_VERTEX_JOB) : pan_size(TILER_JOB), 128)
+             : (struct mali_ptr){0};
    struct mali_ptr mm = call->indexed ? mali_cmd_alloc(cmd, 8, 8) : (struct mali_ptr){0};
-   if (!rp.cpu || !vj.cpu || (tiling && !tj.cpu) || (call->indexed && !mm.cpu))
+   if (!rp.cpu || (!idvs && !vj.cpu) || (tiling && !tj.cpu) || (call->indexed && !mm.cpu))
       return;
 
    rec.cmd = call->cmd + (uint64_t)i * call->stride;
@@ -2100,6 +2106,9 @@ draw_indirect(struct mali_cmd_buffer *cmd, const struct idraw_call *call, uint32
    rec.indices = call->indexed ? d->ib.addr : 0;
    rec.job = vj.gpu;
    rec.tiler_job = tj.gpu;
+   rec.idvs = idvs;
+   rec.vertex_draw = idvs ? tj.gpu + pan_section_offset(INDEXED_VERTEX_JOB, VERTEX_DRAW)
+                          : vj.gpu + pan_section_offset(COMPUTE_JOB, DRAW);
    rec.first_vertex =
       vs_sysval_addr(vs, t->vs_fau, offsetof(struct mali_graphics_sysvals, vs.first_vertex));
    rec.base_instance =
@@ -2122,9 +2131,10 @@ draw_indirect(struct mali_cmd_buffer *cmd, const struct idraw_call *call, uint32
    struct mali_jm_chain *c = mali_jm_cmd_pass_vtc(cmd);
 
    /* As in draw(), with the min/max and patch jobs between the copies and
-    * the Vertex job. */
+    * the Vertex job. An Indexed Vertex job goes in behind the pending
+    * Tiler jobs, as in draw(). */
    const bool pending = c->pending != 0;
-   const bool defer = !pending;
+   const bool defer = !pending && !idvs;
    if (!defer)
       mali_v7_link_tilers(cmd, 0);
    cmd->jm.tiler_defer = defer;
@@ -2175,6 +2185,43 @@ draw_indirect(struct mali_cmd_buffer *cmd, const struct idraw_call *call, uint32
    if (!MALI_PER_ARCH(jm_cmd_meta_job)(cmd, c, MALI_META_INDIRECT_DRAW, &push, sizeof(push), one,
                                        pending, vs_dep, minmax, &patch))
       goto fail;
+   if (idvs) {
+      /* The Indexed Vertex job: written as a Tiler job (the same sections at
+       * the same offsets, the Fragment Draw where the Tiler job has its
+       * Draw) plus the Vertex Draw, and linked as an indirect draw's Tiler
+       * job is: tiler-side, Not Started until the patch job writes its
+       * type, but waiting for the patch job rather than a Vertex job. */
+      STATIC_ASSERT(pan_section_offset(INDEXED_VERTEX_JOB, INVOCATION) ==
+                    pan_section_offset(TILER_JOB, INVOCATION));
+      STATIC_ASSERT(pan_section_offset(INDEXED_VERTEX_JOB, PRIMITIVE) ==
+                    pan_section_offset(TILER_JOB, PRIMITIVE));
+      STATIC_ASSERT(pan_section_offset(INDEXED_VERTEX_JOB, PRIMITIVE_SIZE) ==
+                    pan_section_offset(TILER_JOB, PRIMITIVE_SIZE));
+      STATIC_ASSERT(pan_section_offset(INDEXED_VERTEX_JOB, TILER) ==
+                    pan_section_offset(TILER_JOB, TILER));
+      STATIC_ASSERT(pan_section_offset(INDEXED_VERTEX_JOB, PADDING) ==
+                    pan_section_offset(TILER_JOB, PADDING));
+      STATIC_ASSERT(pan_section_offset(INDEXED_VERTEX_JOB, FRAGMENT_DRAW) ==
+                    pan_section_offset(TILER_JOB, DRAW));
+      cmd->jm.tiler_defer = false;
+      pan_section_pack(tj.cpu, INDEXED_VERTEX_JOB, VERTEX_DRAW, cfg) {
+         cfg.state = t->vs_rsd;
+         cfg.attributes = dd.attribs;
+         cfg.attribute_buffers = dd.attrib_bufs;
+         cfg.varyings = t->vs_vary;
+         cfg.varying_buffers = dd.vary_bufs;
+         cfg.thread_storage = t->tsd;
+         cfg.offset_start = 0;
+         cfg.instance_size = 1;
+         cfg.push_uniforms = t->vs_fau;
+         cfg.uniform_buffers = t->vs_tab.tables[MALI_V7_DESC_TABLE_UBO];
+         cfg.textures = t->vs_tab.tables[MALI_V7_DESC_TABLE_TEXTURE];
+         cfg.samplers = t->vs_tab.tables[MALI_V7_DESC_TABLE_SAMPLER];
+      }
+      emit_tiler_job(cmd, &di, &dd, &invocation, 1, patch, false, tj, true);
+      cmd->jm.stats.idvs_draws++;
+      goto done;
+   }
    if (!mali_jm_cmd_add_job_at(cmd, c, vj, MALI_JOB_TYPE_NOT_STARTED, false, patch))
       goto fail;
    cmd->jm.tiler_defer = false;
@@ -2203,6 +2250,7 @@ draw_indirect(struct mali_cmd_buffer *cmd, const struct idraw_call *call, uint32
    if (tiling)
       emit_tiler_job(cmd, &di, &dd, &invocation, 1, vertex_index, defer, tj, true);
 
+done:
    /* Heap use: not known here; a guess of a few thousand vertices. */
    mali_jm_cmd_heap_use(cmd, 4096ull * 32);
    cmd->jm.cur.draws++;

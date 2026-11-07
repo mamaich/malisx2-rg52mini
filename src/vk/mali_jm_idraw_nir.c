@@ -81,14 +81,20 @@ store32_if(nir_builder *b, nir_def *v, nir_def *addr)
    nir_pop_if(b, NULL);
 }
 
-/* Job Header word 4, Type in bits 1-7 (v7 and v9): `type` when keep, else
- * Null. */
+/* Job Header word 4, Type in bits 1-7 (v7 and v9): `type` (already shifted
+ * into place) when keep, else Null. */
+static void
+set_job_type_def(nir_builder *b, nir_def *job, nir_def *keep, nir_def *type_bits)
+{
+   nir_def *w4 = load32(b, job, 16);
+   nir_def *t = nir_bcsel(b, keep, type_bits, nir_imm_int(b, MALI_JOB_TYPE_NULL << 1));
+   store32(b, nir_ior(b, nir_iand_imm(b, w4, ~0xfeu), t), job, 16);
+}
+
 static void
 set_job_type(nir_builder *b, nir_def *job, nir_def *keep, unsigned type)
 {
-   nir_def *w4 = load32(b, job, 16);
-   nir_def *t = nir_bcsel(b, keep, nir_imm_int(b, type << 1), nir_imm_int(b, MALI_JOB_TYPE_NULL << 1));
-   store32(b, nir_ior(b, nir_iand_imm(b, w4, ~0xfeu), t), job, 16);
+   set_job_type_def(b, job, keep, nir_imm_int(b, type << 1));
 }
 
 /* The parameters of the draw: whether it draws, and the command's fields.
@@ -240,13 +246,14 @@ store_byte(nir_builder *b, nir_def *v, nir_def *addr, int64_t off, unsigned shif
 }
 
 /* Job offsets (v7.xml): Invocation at 32 in both jobs; the Vertex job's
- * Draw at 64; the Tiler job's Primitive at 40, Primitive Size at 64,
- * Draw at 128. Draw word 0 has Instance Size in bits 16-23 and Instance
+ * Draw at 64 (the record's vertex_draw, which is the Indexed Vertex job's
+ * Vertex Draw for IDVS); the Tiler job's Primitive at 40, Primitive Size at
+ * 64, Draw at 128, and the Indexed Vertex job's the same, with its Fragment
+ * Draw there. Draw word 0 has Instance Size in bits 16-23 and Instance
  * Primitive Size in bits 24-31, word 1 Offset start, words 4-5 Position.
  * Primitive word 1 is Base vertex offset, word 3 Index count minus one,
  * words 4-5 Indices. */
 #define J_INVOCATION 32
-#define VJ_DRAW 64
 #define TJ_PRIM 40
 #define TJ_PSIZE 64
 #define TJ_DRAW 128
@@ -317,6 +324,11 @@ MALI_PER_ARCH(build_indirect_draw_nir)(struct mali_device *dev)
    nir_def *lp = logbase2_ceil(&b, range);
    nir_def *li = logbase2_ceil(&b, p.instances);
    nir_def *instanced = nir_uge_imm(&b, p.instances, 2);
+   /* An Indexed Vertex job keeps each instance's positions in cache lines
+    * of their own: an instance stride of at least 4 vertices, as a direct
+    * draw pads it (ALIGN_POT(range, 4), mali_jm_cmd_draw_v7.c). */
+   nir_def *idvs = nir_ine_imm(&b, REC32(&b, rec, idvs), 0);
+   lp = nir_bcsel(&b, nir_iand(&b, idvs, instanced), nir_umax(&b, lp, nir_imm_int(&b, 2)), lp);
    nir_def *per_instance = nir_bcsel(&b, instanced, nir_ishl(&b, nir_imm_int(&b, 1), lp), range);
    nir_def *fits = nir_iand(&b, nir_ine_imm(&b, range, 0),
                             nir_ult_imm(&b, nir_iadd(&b, lp, li), MAX_COUNT_BITS + 1));
@@ -350,12 +362,19 @@ MALI_PER_ARCH(build_indirect_draw_nir)(struct mali_device *dev)
                      nir_imm_int(&b, 1), .atomic_op = nir_atomic_op_iadd);
    nir_pop_if(&b, NULL);
 
+   /* With idvs, one Indexed Vertex job in the Tiler job's place and no
+    * Vertex job. */
    nir_def *vjob = REC64(&b, rec, job);
+   nir_def *vdraw = REC64(&b, rec, vertex_draw);
    nir_def *tjob = REC64(&b, rec, tiler_job);
    nir_def *tiling = nir_ine_imm(&b, tjob, 0);
+   nir_push_if(&b, nir_inot(&b, idvs));
    set_job_type(&b, vjob, ok, MALI_JOB_TYPE_VERTEX);
+   nir_pop_if(&b, NULL);
    nir_push_if(&b, tiling);
-   set_job_type(&b, tjob, ok, MALI_JOB_TYPE_TILER);
+   set_job_type_def(&b, tjob, ok,
+                    nir_bcsel(&b, idvs, nir_imm_int(&b, MALI_JOB_TYPE_INDEXED_VERTEX << 1),
+                              nir_imm_int(&b, MALI_JOB_TYPE_TILER << 1)));
    nir_pop_if(&b, NULL);
 
    nir_push_if(&b, ok);
@@ -388,14 +407,16 @@ MALI_PER_ARCH(build_indirect_draw_nir)(struct mali_device *dev)
       nir_def *zs = nir_bcsel(&b, instanced, lp, nir_imm_int(&b, 32));
       nir_def *inv = nir_vec2(&b, inv0,
                               nir_ior(&b, REC32(&b, rec, inv1), nir_ishl_imm(&b, zs, INV1_WGZ_SHIFT)));
+      nir_push_if(&b, nir_inot(&b, idvs));
       nir_store_global(&b, inv, nir_iadd_imm(&b, vjob, J_INVOCATION), .write_mask = 0x3,
                        .align_mul = 8);
+      nir_pop_if(&b, NULL);
 
       /* Instance Size: P as a padded count (a power of two packs as its
        * shift), or 1 (0) for one instance. */
       nir_def *isz = nir_bcsel(&b, instanced, lp, nir_imm_int(&b, 0));
-      store_byte(&b, isz, vjob, VJ_DRAW, 16);
-      store32(&b, raw, vjob, VJ_DRAW + 4);
+      store_byte(&b, isz, vdraw, 0, 16);
+      store32(&b, raw, vdraw, 4);
 
       nir_push_if(&b, tiling);
       {
