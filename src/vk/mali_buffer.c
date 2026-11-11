@@ -5,8 +5,7 @@
 
 /*
  * VkBuffer. A buffer is a size and, once bound, a GPU address; binding
- * makes no kernel call. Sparse buffers and buffer device addresses are
- * not exposed.
+ * makes no kernel call. Sparse buffers are not exposed.
  */
 
 #include "mali_vk.h"

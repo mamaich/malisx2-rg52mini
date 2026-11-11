@@ -372,8 +372,6 @@ struct mali_v7_shader_desc {
    int32_t direct_set;
    uint32_t direct_slots;
    uint32_t direct_sampler_base;
-   /* The lowering could not allocate its map (mali_shader.c lower_nir). */
-   bool failed;
    /* The shader's constant data (host copy, for serialization) and its GPU
     * copy, which common.constant_data points at. */
    void *data;

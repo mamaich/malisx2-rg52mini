@@ -14,7 +14,7 @@
 project(
   'malisx2',
   ['c', 'cpp'],
-  version : '0.4.0',
+  version : '0.4.1',
   license : 'MIT',
   meson_version : '>= 1.7.0',
   default_options : [
@@ -54,7 +54,8 @@ rust = import('rust')
 # (branch malisx2 of github.com/bmdhacks/armsx2-turnip, i.e. upstream Mesa
 # plus the kraid changes, plus our compiler fixes) at this commit, checked
 # out (or symlinked) at mesa/. Only the sources are used; Mesa's own build
-# is not run.
+# is not run. Upstream 0.4.1 pins 45ff8fa (Bifrost spill slots aligned to the
+# value's size); our 9d239e8 already makes that change, so the pin stays.
 mesa_commit = '3b0e0367a4b360baad70616a1dd51f90ee471a27'
 if not fs.is_dir('mesa' / 'src' / 'panfrost')
   error('''Mesa is missing. Fetch it with:
