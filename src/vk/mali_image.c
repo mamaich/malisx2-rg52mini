@@ -67,7 +67,7 @@ external_memory(const VkImageCreateInfo *info)
  * raw compute copy. panvk makes the same choices (panvk_image_can_use_mod,
  * pan_mod_afbc_test_props).
  *
- * v9 and v11. On a G57 at 2x upscaling, uncompressed render targets made
+ * v9, v10 and v11. On a G57 at 2x upscaling, uncompressed render targets made
  * fragment-bound dumps 20-25 % slower than with AFBC.
  *
  * v7 has narrower rules of its own: colour attachments and sampled
@@ -385,9 +385,10 @@ mali_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
                  image->vk.drm_format_mod == MALI_MOD_AFBC_YTR) ? "AFBC"
                 : image->vk.drm_format_mod == DRM_FORMAT_MOD_LINEAR ? "linear"
                                                                     : "u-interleaved");
-   /* No CRC on v7 and v9 yet: the job manager cannot update the seed from the
-    * GPU, and the CPU-side seed it needs is not written yet. */
-   const bool crc = !mali_arch_is_jm(arch) &&
+   /* CRC on the command-stream archs (v10 and v11). Not on v7 and v9 yet:
+    * the job manager cannot update the CRC state from the GPU, and the
+    * CPU-side state it needs is not written yet. */
+   const bool crc = mali_arch_is_csf(arch) &&
                     mali_image_wants_crc(pCreateInfo, image->vk.drm_format_mod);
 
    if (mod_explicit && image->plane_count != 1) {

@@ -229,14 +229,9 @@ tile_dims(uint32_t pixels, uint32_t *w, uint32_t *h)
 /* The colour and depth tile buffer sizes of every arch 9 part. Mesa's
  * model table lists the G57 and G68 with these sizes and has no G77, G78
  * or G78AE entry, and Arm's drivers use one 16 KiB colour budget for all
- * arch 9 parts. The table is not consulted on v9: a part it lacks would
- * get the v11 budgets below, twice these. */
+ * arch 9 parts. */
 #define V9_TILEBUF_COLOR 16384
 #define V9_TILEBUF_Z     8192
-
-/* The depth tile buffer size of the G52 and the G52 r1 (Mesa's model
- * table). Their colour tile buffers differ (mali_physical_device.c). */
-#define V7_TILEBUF_Z     8192
 
 /* pan_select_fb_tile_size for single-sampled framebuffers: the largest
  * power-of-two tile whose colour and depth fit half the tile buffer (the
@@ -246,11 +241,12 @@ select_tile_size(struct mali_cmd_buffer *cmd, struct mali_render_state *r)
 {
    uint32_t rt_budget, z_budget;
    if (PAN_ARCH == 7) {
-      /* The colour tile buffer is 16 KiB on the G52 and 8 KiB on the G52
-       * r1 (Mesa's model table), the depth tile buffer 8 KiB on both. Half
-       * of each, as pan_query_optimal_tib_size does on v7. */
-      rt_budget = mali_physical_device_tilebuf_color_bytes(mali_device_physical(cmd->dev)) / 2;
-      z_budget = V7_TILEBUF_Z / 2;
+      /* The part's tile buffers (mali_physical_device.c: 16 and 8 KiB on
+       * the G52 and G76, 8 and 8 KiB on the G52 r1, G51 and G31). Half of
+       * each, as pan_query_optimal_tib_size does on v7. */
+      const struct mali_physical_device *pdev = mali_device_physical(cmd->dev);
+      rt_budget = mali_physical_device_tilebuf_color_bytes(pdev) / 2;
+      z_budget = mali_physical_device_tilebuf_z_bytes(pdev) / 2;
    } else if (PAN_ARCH < 10) {
       rt_budget = V9_TILEBUF_COLOR / 2;
       z_budget = V9_TILEBUF_Z / 2;
@@ -828,7 +824,7 @@ pack_zs_ext(const struct mali_render_state *r, unsigned layer, uint64_t crc_clea
          cfg.zs.base = base;
          cfg.zs.row_stride = row;
          cfg.zs.surface_stride = (uint32_t)surf;
-#if PAN_ARCH >= 10
+#if PAN_ARCH >= 11
          cfg.zs.surface_stride_hi = (uint32_t)(surf >> 32);
 #else
          assert(surf <= UINT32_MAX);
@@ -863,7 +859,7 @@ pack_zs_ext(const struct mali_render_state *r, unsigned layer, uint64_t crc_clea
          cfg.s.base = base;
          cfg.s.row_stride = row;
          cfg.s.surface_stride = (uint32_t)surf;
-#if PAN_ARCH >= 10
+#if PAN_ARCH >= 11
          cfg.s.surface_stride_hi = (uint32_t)(surf >> 32);
 #else
          assert(surf <= UINT32_MAX);
@@ -974,7 +970,7 @@ pack_rt(const struct mali_render_state *r, unsigned i, unsigned layer, void *out
       cfg.writeback_buffer.base = base;
       cfg.writeback_buffer.row_stride = row;
       cfg.writeback_buffer.surface_stride = (uint32_t)surf;
-#if PAN_ARCH >= 10
+#if PAN_ARCH >= 11
       cfg.writeback_buffer.surface_stride_hi = (uint32_t)(surf >> 32);
 #else
       assert(surf <= UINT32_MAX);
@@ -1014,11 +1010,16 @@ MALI_PER_ARCH(fb_build)(struct mali_cmd_buffer *cmd, struct mali_render_state *r
       clean |= clean_tile_write(&r->desc.rt[i]);
    /* panvk runs the preloads of a pass with a CRC target on every tile
     * (pan_emit_fb_desc: "Pre-frame shaders that preload a CRC-enabled RT
-    * must run in ALWAYS mode"). We keep Intersect: on the device a LOAD
-    * pass with CRC leaves tiles without geometry alone and does not stamp
-    * them (vk_render_smoke part 9), and Always would read back every tile
-    * of ARMSX2's full-target passes. The option restores panvk's rule. */
-   const bool always_preload = clean || (crc && mali_crc_options.always_preload);
+    * must run in ALWAYS mode"). We keep Intersect on v11: on the device a
+    * LOAD pass with CRC leaves tiles without geometry alone and does not
+    * stamp them (vk_render_smoke part 9), and Always would read back every
+    * tile of ARMSX2's full-target passes. The option restores panvk's
+    * rule. v10 takes panvk's rule: until its CRCs are valid, a pass turns
+    * on clean-tile writes of the target from the stream (mali_cmd_render.c),
+    * and pan_fix_frame_shader_mode's hardware issue (clean-tile writes
+    * break Intersect preloads) then applies. */
+   const bool always_preload =
+      clean || (crc && (PAN_ARCH == 10 || mali_crc_options.always_preload));
 
    uint64_t samples = sample_positions(cmd);
    struct mali_ptr p = mali_cmd_alloc(cmd, (uint64_t)size * layers, 64);
@@ -1097,6 +1098,23 @@ MALI_PER_ARCH(fb_build)(struct mali_cmd_buffer *cmd, struct mali_render_state *r
       for (unsigned i = 0; i < r->rt_count; i++)
          pack_rt(r, i, l, next + i * pan_size(RENDER_TARGET));
    }
+
+#if PAN_ARCH == 10
+   /* The words the fragment stream picks the CRC enables from on v10, as
+    * packed (mali_cmd_render.c emit_crc_updates), and whether the pass's
+    * render area holds every tile of the target, so that after it all of
+    * the target's CRCs have been written. A CRC target has one layer. */
+   if (crc) {
+      const struct mali_image *img = r->desc.rt[r->crc_rt].image;
+      const uint32_t *words = p.cpu;
+      r->crc_fbd_flags = words[12];
+      r->crc_rt_flags = words[(pan_size(FRAMEBUFFER) + pan_size(ZS_CRC_EXTENSION) +
+                               r->crc_rt * pan_size(RENDER_TARGET)) / 4 + 1];
+      r->crc_covers_image = r->minx == 0 && r->miny == 0 &&
+                            r->maxx + 1 >= img->vk.extent.width &&
+                            r->maxy + 1 >= img->vk.extent.height;
+   }
+#endif
 
    struct mali_framebuffer_pointer_packed tag;
    pan_pack(&tag, FRAMEBUFFER_POINTER, cfg) {

@@ -261,10 +261,19 @@ struct mali_render_state {
    bool first_provoking_vertex;
    bool first_provoking_vertex_set;
 
+   /* v10's CRC (mali_fb_build, mali_cmd_render.c): the pass covers every
+    * tile of the CRC target, and Framebuffer Parameters word 12 and word 1
+    * of the target's Render Target as packed (CRC read and write on). The
+    * fields sit in what was padding, so the layout v11 uses is
+    * unchanged. */
+   bool crc_covers_image;
+   uint32_t crc_fbd_flags;
+
    /* Set by the first draw or full-screen draw of the pass. */
    uint64_t tiler;                  /* Tiler Contexts, 0 if nothing tiled */
    void *tiler_cpu;
    uint32_t td_count;
+   uint32_t crc_rt_flags;           /* v10's CRC, see crc_fbd_flags */
    uint64_t tsd;                    /* the pass's Local Storage descriptor */
    void *tsd_cpu;
    uint32_t tls_size;               /* largest per-thread TLS of the pass */
@@ -497,7 +506,7 @@ MALI_PER_ARCH_DECL(void, cmd_gfx_fau_words,
                     uint32_t push_size, uint64_t block, uint64_t *out));
 
 /* The same block written at out, whose GPU address is self, for blocks the
- * caller allocates itself (v11 indirect draws: one per draw). */
+ * caller allocates itself (v10/v11 indirect draws: one per draw). */
 #if !defined(PAN_ARCH) || PAN_ARCH >= 10
 MALI_PER_ARCH_DECL(void, gfx_fau_fill,
                    (const struct mali_shader *s, const void *sysvals, const void *push,
@@ -507,8 +516,10 @@ MALI_PER_ARCH_DECL(void, gfx_fau_fill,
 /* ---------------------------------------------------------------------- */
 /* mali_cmd_draw.c                                                         */
 
-/* Set RUN_IDVS bit 55 (default true; tests only change it). */
+#if defined(PAN_ARCH) && PAN_ARCH >= 11
+/* Set RUN_IDVS bit 55 (v11 only; default true; tests only change it). */
 extern bool mali_idvs_bit55;
+#endif
 
 /* A primitive barrier inside the render pass (by-region dependencies). */
 MALI_PER_ARCH_DECL(void, cmd_fb_barrier, (struct mali_cmd_buffer *cmd));
