@@ -82,7 +82,7 @@
 ## Аппаратные счётчики GPU
 
 - **Интерфейс — только kinstr_prfcnt** (vinstr в kbase g25p0 нет). Читалка —
-  своя небольшая программа вне репозитория: ENUM_INFO, SETUP (ручной режим,
+  `tools/hwcnt/mhwc.c`: ENUM_INFO, SETUP (ручной режим,
   все блоки набора 0), кольцо через mmap, START, SAMPLE_SYNC раз в секунду,
   GET/PUT_SAMPLE. На G52 MC1 по одному блоку Front-end, Tiler, Memory (L2) и
   Shader core, по 64 счётчика (проверено).
