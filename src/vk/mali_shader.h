@@ -195,9 +195,12 @@ mali_sysval_word(const void *sysvals, size_t size, unsigned w)
 /* Most 64-bit words of dynamic uniform buffers one shader keeps in FAU,
  * and on v11 the part of a buffer they may come from (ARMSX2's constant
  * buffers are smaller). v7 has its own byte limit (mali_shader.c
- * V7_UBO_PUSH_MAX_BYTES). */
-#define MALI_MAX_UBO_PUSH_FAUS 32
+ * V7_UBO_PUSH_MAX_BYTES), and how many of these a v7 shader may use is
+ * the device's v7_ubo_push_fs / _vs (mali_vk.h). */
+#define MALI_MAX_UBO_PUSH_FAUS MALI_FAU_WORD_COUNT
 #define MALI_UBO_PUSH_MAX_BYTES 1024
+#define MALI_V7_UBO_PUSH_FS_DEFAULT MALI_FAU_WORD_COUNT
+#define MALI_V7_UBO_PUSH_VS_DEFAULT 32
 
 /* The uniform-buffer copy in a draw's vertex/tiler stream: scratch
  * registers (mali_cs.h: 66 + n) for the source and FAU addresses and the

@@ -405,6 +405,12 @@ struct mali_device {
     * are guarded and the ifs flattened (mali_shader.c flatten_vs_ubo_ifs;
     * MALISX2_V7_VS_UBO_IF=0 keeps the ifs). */
    bool v7_vs_ubo_if;
+   /* v7: the most 64-bit uniform buffer words a fragment / vertex shader
+    * keeps in its FAU block (mali_shader.c lower_ubo_push), up to the whole
+    * block. Each word saves the shader a uniform buffer LOAD and costs the
+    * draw a copy on the CPU (mali_jm_desc_v7.c host_ubo). */
+   uint8_t v7_ubo_push_fs;
+   uint8_t v7_ubo_push_vs;
    /* The tiler hierarchy mask to use outright (mali_jm_cmd_render.c
     * hierarchy_mask; MALISX2_JM_HIER_MASK), 0 for the rule there. */
    uint8_t jm_hierarchy_mask;

@@ -613,7 +613,7 @@ ubo_push_intr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
  * All or nothing: when the words do not fit, nothing is pushed.
  */
 static void
-lower_ubo_push(nir_shader *nir, struct mali_shader *s)
+lower_ubo_push(nir_shader *nir, struct mali_shader *s, unsigned cap)
 {
    s->fau.ubo_push_start = s->fau.total_count;
    s->fau.ubo_push_count = 0;
@@ -753,13 +753,13 @@ v7_ubo_push_range_cmp(const void *a, const void *b)
 }
 
 static void
-lower_ubo_push(nir_shader *nir, struct mali_shader *s)
+lower_ubo_push(nir_shader *nir, struct mali_shader *s, unsigned cap)
 {
    s->fau.ubo_push_start = s->fau.total_count;
    s->fau.ubo_push_count = 0;
 
    if ((nir->info.stage != MESA_SHADER_FRAGMENT && nir->info.stage != MESA_SHADER_VERTEX) ||
-       !s->v7.dyn_ubo_count || s->fau.total_count >= V7_UBO_PUSH_FAU_LIMIT)
+       !s->v7.dyn_ubo_count || s->fau.total_count >= V7_UBO_PUSH_FAU_LIMIT || !cap)
       return;
 
    struct v7_ubo_push_ctx ctx = {
@@ -770,7 +770,7 @@ lower_ubo_push(nir_shader *nir, struct mali_shader *s)
    nir_shader_intrinsics_pass(nir, v7_ubo_push_intr, nir_metadata_all, &ctx);
 
    /* The most used ranges first, each one whose words still fit. */
-   unsigned budget = MIN2(MALI_MAX_UBO_PUSH_FAUS, V7_UBO_PUSH_FAU_LIMIT - s->fau.total_count);
+   unsigned budget = MIN3(cap, MALI_MAX_UBO_PUSH_FAUS, V7_UBO_PUSH_FAU_LIMIT - s->fau.total_count);
    const unsigned nr = util_dynarray_num_elements(&ctx.ranges, struct v7_ubo_push_range);
    if (nr)
       qsort(util_dynarray_begin(&ctx.ranges), nr, sizeof(struct v7_ubo_push_range),
@@ -805,7 +805,7 @@ lower_ubo_push(nir_shader *nir, struct mali_shader *s)
  * job manager does not have, and v7 with a Compute job of its own
  * (mali_jm_desc_v7.c mali_v7_ubo_copy). */
 static void
-lower_ubo_push(nir_shader *nir, struct mali_shader *s)
+lower_ubo_push(nir_shader *nir, struct mali_shader *s, unsigned cap)
 {
    s->fau.ubo_push_start = s->fau.total_count;
    s->fau.ubo_push_count = 0;
@@ -1967,7 +1967,8 @@ compile_nir(struct mali_device *dev, nir_shader *nir,
    NIR_PASS(_, nir, nir_shader_instructions_pass, fau_tex_handle,
             nir_metadata_control_flow, s);
    lower_load_push_consts(nir, s);
-   lower_ubo_push(nir, s);
+   lower_ubo_push(nir, s, nir->info.stage == MESA_SHADER_FRAGMENT ? dev->v7_ubo_push_fs
+                                                                   : dev->v7_ubo_push_vs);
 #if PAN_ARCH < 9
    /* After lower_ubo_push: what it leaves as load_ubo has a computed
     * offset. */

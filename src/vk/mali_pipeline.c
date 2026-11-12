@@ -923,6 +923,7 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
     * default. */
    if (!dev->v7_vs_ubo_if)
       _mesa_blake3_update(&h, "noubo-if", 8);
+   _mesa_blake3_update(&h, &dev->v7_ubo_push_vs, sizeof(dev->v7_ubo_push_vs));
    _mesa_blake3_final(&h, vs->key);
 
    if (fs) {
@@ -932,6 +933,7 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
       hash_layout(&h, layout);
       _mesa_blake3_update(&h, vs->stage_hash, sizeof(vs->stage_hash));
       hash_fs_state(&h, dev, &state);
+      _mesa_blake3_update(&h, &dev->v7_ubo_push_fs, sizeof(dev->v7_ubo_push_fs));
       _mesa_blake3_final(&h, fs->key);
    }
 
