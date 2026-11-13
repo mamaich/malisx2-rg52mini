@@ -932,6 +932,7 @@ build_submit(struct mali_device *dev, struct vk_queue_submit *submit, mali_jm_re
    /* The newest fragment-slot atom the submission's first vtc atom has to
     * wait for (semaphore waits with vtc-slot destination stages). */
    mali_jm_ref frag_req = 0;
+   bool heap_drained = false; /* events read for the heap ring's count */
 
    for (uint32_t i = 0; i < submit->wait_count; i++) {
       struct mali_sync *s = to_sync(submit->waits[i].sync);
@@ -1005,7 +1006,24 @@ build_submit(struct mali_device *dev, struct vk_queue_submit *submit, mali_jm_re
                   req = newer(req, batch_frag[bt->vtc_after_frag - 1u]);
             }
             if (bt->heap_slot >= 0 && bt->heap_slot < MALI_JM_HEAP_SLOTS_MAX) {
-               req = newer(req, q->heap_last_frag[bt->heap_slot]);
+               const mali_jm_ref h = q->heap_last_frag[bt->heap_slot];
+               /* The slot's last reader is the newest fragment work this
+                * tiling would wait for: the ring is what holds it back.
+                * Events are read on demand, so an atom that finished may
+                * still look live; read what is pending (without blocking,
+                * at most once a submission, as take_number does when
+                * it runs out of numbers) before counting it, or a ring
+                * that keeps up would grow anyway. */
+               if (h && jd->heap.count < MALI_JM_HEAP_SLOTS_GROWN && mali_jm_ref_live(jd, h) &&
+                   newer(req, h) == h && req != h) {
+                  if (!heap_drained) {
+                     mali_jm_drain_locked(dev);
+                     heap_drained = true;
+                  }
+                  if (mali_jm_ref_live(jd, h))
+                     q->submit_heap_waits++;
+               }
+               req = newer(req, h);
                q->submit_tiled++;
             }
             /* A transfer-only requirement carried from an earlier command
@@ -1351,6 +1369,7 @@ MALI_PER_ARCH(queue_submit)(struct vk_queue *vkq, struct vk_queue_submit *submit
 
    mali_jm_build_begin(dev, seqno);
    q->submit_tiled = 0;
+   q->submit_heap_waits = 0;
    result = build_submit(dev, submit, batch_frag);
    free(batch_frag);
    mali_jm_ref tracker = 0;
@@ -1367,7 +1386,7 @@ MALI_PER_ARCH(queue_submit)(struct vk_queue *vkq, struct vk_queue_submit *submit
 
    if (result == VK_SUCCESS) {
       if (built) {
-         mali_jm_heap_note_submit(jd, q->submit_tiled);
+         mali_jm_heap_note_submit(jd, q->submit_tiled, q->submit_heap_waits);
          q->seq++;
          q->tracker = tracker;
          /* Everything already finished and was read meanwhile. */

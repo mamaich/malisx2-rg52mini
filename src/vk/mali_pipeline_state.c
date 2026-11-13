@@ -495,8 +495,10 @@ struct earlyzs {
    enum mali_pixel_kill update, kill;
 };
 
-/* Arches that take the weak-early kill below. v9 only so far: measured on
- * the Mali-G57, and not on the arches ARMSX2's output was checked on. */
+/* Arches that take the weak-early kill below. v9 only: measured on the
+ * Mali-G57. Not v7: on the Mali-G52 it doubles the time of a discarding,
+ * depth-writing shader drawn front to back (a 960x544 pass of eight such
+ * layers: 9.6 to 10.0 ms, against 4.4 to 5.1 ms with force early). */
 #define MALI_WEAK_KILL_WITH_LATE_UPDATE (PAN_ARCH == 9)
 
 /*
@@ -841,7 +843,11 @@ pack_flags(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
                            attachment_read(fs, dyn->ial.stencil_att) ||
                            (dyn->rasterization_order_access &
                             (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT));
-            bool roa_color = dyn->rasterization_order_access & VK_IMAGE_ASPECT_COLOR_BIT;
+            /* Rasterization-order access orders a shader's reads of the
+             * colour attachments; one that reads none has nothing to order
+             * and may be killed as usual (as on v7, pack_rsd). */
+            const bool roa_color =
+               (dyn->rasterization_order_access & VK_IMAGE_ASPECT_COLOR_BIT) && out->rt_read;
 
             cfg.allow_forward_pixel_to_kill =
                fs->info.fs.can_fpk && !(rt_mask & ~out->rt_written) &&
@@ -1076,18 +1082,14 @@ pack_rsd(const struct mali_gfx_pack_input *in, const struct mali_gfx_baked *out,
       if (fs) {
          mali_v7_rsd_shader(&fs->info, 0, &cfg);
 
-         /* Rasterization order colour access orders a draw's reads of the
-          * colour attachments after the earlier fragments' writes. A draw
-          * that reads none of them (no input attachment, no blending with
-          * the destination, no output read: can_fpk) and writes all of
-          * them only replaces what the earlier fragments would leave, so
-          * killing those changes nothing, as FPK kills blended fragments
-          * in any pass; fragments with side effects are not killable.
-          * ARMSX2 puts the flag on every pipeline of a feedback pass,
-          * readers or not. panvk turns FPK off for the whole flag
-          * (MALISX2_V7_FPK_ROA=0 does so here). */
+         /* Rasterization-order access orders a shader's reads of the colour
+          * attachments; a shader that reads none has nothing to order, and a
+          * later fragment may kill it as usual. ARMSX2 puts the flag on every
+          * pipeline of a feedback pass, readers or not, and Vita3K on every
+          * pipeline once the device has it. panvk turns FPK off for the whole
+          * flag (MALISX2_V7_FPK_ROA=0 does so here). */
          const bool roa_color = (dyn->rasterization_order_access & VK_IMAGE_ASPECT_COLOR_BIT) &&
-                                !in->fpk_under_roa;
+                                (out->rt_read || !in->fpk_under_roa);
 
          cfg.properties.allow_forward_pixel_to_kill =
             fs->info.fs.can_fpk && !(rt_mask & ~out->rt_written) &&

@@ -519,6 +519,9 @@ struct mali_jm_cmd {
    /* The varying arena of the indirect draws (mali_jm_cmd_draw_v7.c), from
     * the first one on; returned to the device at reset. */
    struct mali_cmd_slab *idraw_arena;
+   /* vkCmdSetDepthCullMALISX2: its flags, 0 for the pipeline's depth
+    * clip and clamp (mali_jm_cmd_draw_v7.c). */
+   uint8_t depth_cull;
    /* vkCmdSetIndexRangeMALISX2: the smallest and largest index of the
     * next indexed draw, if it is the one named (index buffer, first index,
     * count); its index scan is then skipped (mali_jm_cmd_draw_v7.c). */
@@ -527,6 +530,19 @@ struct mali_jm_cmd {
       uint64_t ib;
       uint32_t first, count, min, max;
    } idx_hint;
+   /* The range of the last indexed draw (scanned or hinted), for the next
+    * one that draws the same indices: same index buffer address and bound
+    * size, first index, count, index size and restart. The indices cannot
+    * have changed in between, as both draws need them unchanged until they
+    * run (index_range), except by a transfer recorded in between, which
+    * clears it (mali_v7_note_buffer_write). Vita3K draws a vertex-store
+    * draw's indices twice. */
+   struct mali_v7_idx_last {
+      bool valid, restart, empty;
+      uint8_t index_size;
+      uint64_t ib, ib_size;
+      uint32_t first, count, min, max;
+   } idx_last;
    /* The Local Storage descriptor of the copy jobs (mali_jm_desc_v7.c
     * copy_tsd), 0 until the first one. */
    uint64_t copy_tsd;
@@ -693,6 +709,14 @@ void mali_jm_cmd_pass_images(struct mali_cmd_buffer *cmd);
  * recorded barrier makes it wait for this batch's fragment work)? An
  * image copy then goes to the fragment side instead (mali_cmd_image.c). */
 bool mali_jm_cmd_transfer_needs_frag(struct mali_cmd_buffer *cmd);
+
+/* Would a transfer job on the vtc chain wait for fragment work now, this
+ * batch's or an earlier one's (a recorded barrier from fragment or
+ * fragment-side transfer stages)? Every later vtc atom would wait behind
+ * it in the slot order, so v7 does such a copy on the fragment side where
+ * it can (mali_cmd_image.c). Requirements carried from an earlier command
+ * buffer are not known here. */
+bool mali_jm_cmd_transfer_waits_frag(struct mali_cmd_buffer *cmd);
 
 /* The open batch's current fragment segment, started if the batch has
  * none; with new_segment, always a new one (a new fragment atom). Applies
@@ -892,7 +916,7 @@ bool mali_jm_heap_take(struct mali_cmd_buffer *cmd, struct mali_jm_batch *b);
 /* After a submission is built: it had `tiled` batches with a heap slot.
  * Grows the ring when submissions keep wrapping it (mali_jm.h). With
  * dev->lock held. */
-void mali_jm_heap_note_submit(struct mali_jm_device *jd, uint32_t tiled);
+void mali_jm_heap_note_submit(struct mali_jm_device *jd, uint32_t tiled, uint32_t heap_waits);
 
 #if PAN_ARCH < 9
 /* ---------------------------------------------------------------------- */
@@ -1194,8 +1218,13 @@ struct mali_jm_atom_info {
  * batch in the same submission, which cannot have finished yet. When that
  * happens in MALI_JM_HEAP_GROW_HITS of MALI_JM_HEAP_GROW_WINDOW submissions,
  * the ring grows to the most tiled batches one of them had, rounded up to a
- * multiple of 4 (mali_jm_heap_note_submit). An application with few passes
- * per submission keeps 4 slots and 8 MiB.
+ * multiple of 4 (mali_jm_heap_note_submit). A submission also counts when
+ * a batch's tiling waits for fragment work that the queue has not seen
+ * finish only because that work last read the batch's slot: many small
+ * submissions (Vita3K submits once or twice a pass) wrap the ring across
+ * submissions, and the next pass cannot tile while the earlier ones
+ * shade. Then the ring doubles. An application with few passes that the
+ * ring keeps up with stays at 4 slots and 8 MiB.
  */
 #define MALI_JM_HEAP_SLOTS_MAX 32
 #define MALI_JM_HEAP_SLOTS 4
@@ -1338,6 +1367,8 @@ struct mali_jm_queue {
    /* Per tiler heap slot, the last fragment atom that used it. */
    mali_jm_ref heap_last_frag[MALI_JM_HEAP_SLOTS_MAX];
    uint32_t submit_tiled;   /* batches with a heap slot in the submission being built */
+   uint32_t submit_heap_waits; /* of those, ones whose tiling waits for a fragment
+                                * atom only because it last read their slot */
    /* Submissions with atoms so far, the last one's tracker, and the
     * newest submission whose tracker event has been read. */
    uint64_t seq;

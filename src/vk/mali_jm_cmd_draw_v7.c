@@ -514,6 +514,11 @@ emit_viewport(struct mali_cmd_buffer *cmd)
       cfg.scissor_maximum_y = CLAMP(maxy, 0, UINT16_MAX);
       cfg.minimum_z = MIN2(vp->minDepth, vp->maxDepth);
       cfg.maximum_z = MAX2(vp->minDepth, vp->maxDepth);
+      /* vkCmdSetDepthCullMALISX2 culling above: up to 1e-5 past maxDepth is
+       * kept, as float rounding puts geometry modelled on the far plane a
+       * ULP or two past it (a 24-bit depth stores it as maxDepth). */
+      if (cmd->jm.depth_cull & VK_DEPTH_CULL_ABOVE_BIT_MALISX2)
+         cfg.maximum_z += 1e-5f;
    }
    return p.gpu;
 }
@@ -924,6 +929,26 @@ build_fs_rsd(struct mali_cmd_buffer *cmd, const struct mali_graphics_pipeline *p
       }
       rsd.opaque[MALI_V7_RSD_MULTISAMPLE_MISC_WORD] |= ms.opaque[0];
    }
+   if (cmd->jm.depth_cull & VK_DEPTH_CULL_OVERRIDE_BIT_MALISX2) {
+      /* vkCmdSetDepthCullMALISX2: the fixed-function near and far discards
+       * follow its flags, as they follow depth clip from the pipeline, and
+       * the depth range is not fixed (clamped where not culled). With the
+       * Primitive's depth culls this covers exactly what the pipeline's
+       * depth clip covers (bdatest depthcull). */
+      struct mali_multisample_misc_packed mask, set;
+      pan_pack_nodefaults(&mask, MULTISAMPLE_MISC, cfg) {
+         cfg.fixed_function_near_discard = true;
+         cfg.fixed_function_far_discard = true;
+         cfg.fixed_function_depth_range_fixed = true;
+      }
+      pan_pack_nodefaults(&set, MULTISAMPLE_MISC, cfg) {
+         cfg.fixed_function_near_discard = cmd->jm.depth_cull & VK_DEPTH_CULL_BELOW_BIT_MALISX2;
+         cfg.fixed_function_far_discard = cmd->jm.depth_cull & VK_DEPTH_CULL_ABOVE_BIT_MALISX2;
+         cfg.fixed_function_depth_range_fixed = false;
+      }
+      rsd.opaque[MALI_V7_RSD_MULTISAMPLE_MISC_WORD] &= ~mask.opaque[0];
+      rsd.opaque[MALI_V7_RSD_MULTISAMPLE_MISC_WORD] |= set.opaque[0];
+   }
    memcpy(m.cpu, &rsd, sizeof(rsd));
    t->fs_rsd = m.gpu;
    return true;
@@ -1251,6 +1276,9 @@ mali_v7_note_buffer_write(struct mali_cmd_buffer *cmd, uint64_t addr, uint64_t s
 {
    if (!size)
       return;
+   /* It may write the last indexed draw's indices (struct mali_jm_cmd
+    * idx_last). */
+   cmd->jm.idx_last.valid = false;
    struct util_dynarray *a = &cmd->jm.buf_writes;
    struct mali_v7_range *r = util_dynarray_begin(a);
    const unsigned n = util_dynarray_num_elements(a, struct mali_v7_range);
@@ -1500,6 +1528,14 @@ emit_tiler_job(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di,
       di->indexed ? mali_gfx_index_type(d->ib.index_size) : MALI_INDEX_TYPE_NONE;
    prim.opaque[0] = (t->prim0 & ~prim_provoking_bit()) | prim_index_type(index_type) |
                     (r->first_provoking_vertex ? prim_provoking_bit() : 0);
+   if (cmd->jm.depth_cull & VK_DEPTH_CULL_OVERRIDE_BIT_MALISX2) {
+      /* vkCmdSetDepthCullMALISX2: the Primitive's Low and High Depth Cull
+       * (word 0 bits 16 and 17, genxml v7.xml); outside them the depth is
+       * clamped to the Viewport's Minimum and Maximum Z. */
+      prim.opaque[0] &= ~(3u << 16);
+      prim.opaque[0] |= ((cmd->jm.depth_cull & VK_DEPTH_CULL_BELOW_BIT_MALISX2) ? 1u << 16 : 0) |
+                        ((cmd->jm.depth_cull & VK_DEPTH_CULL_ABOVE_BIT_MALISX2) ? 1u << 17 : 0);
+   }
    memcpy(pan_section_ptr(tj.cpu, TILER_JOB, PRIMITIVE), &prim, sizeof(prim));
 
    pan_section_pack(tj.cpu, TILER_JOB, PRIMITIVE_SIZE, cfg) {
@@ -1586,38 +1622,61 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
    dd.raw_vertex_offset = di->vertex_offset;
    const bool idvs = p->vs->info.vs.idvs;
    if (di->indexed) {
-      dd.indices = d->ib.addr + (uint64_t)di->first_index * d->ib.index_size;
+      /* The vertex range, from the indices in the buffer at this point
+       * of recording (index_range says what that needs); a draw whose
+       * indices cannot be read here is skipped. */
+      uint32_t min = 0, max = 0;
+      bool empty = false, ok = true;
+      const bool restart = st->ia.primitive_restart_enable;
       const bool hinted = cmd->jm.idx_hint.set && cmd->jm.idx_hint.ib == d->ib.addr &&
                           cmd->jm.idx_hint.first == di->first_index &&
                           cmd->jm.idx_hint.count == di->count;
       cmd->jm.idx_hint.set = false;
-      uint32_t min, max;
+      struct mali_v7_idx_last *last = &cmd->jm.idx_last;
       if (hinted) {
          /* vkCmdSetIndexRangeMALISX2: the application's range. */
          min = cmd->jm.idx_hint.min;
          max = cmd->jm.idx_hint.max;
-         dd.vertex_range = max - min + 1;
-         dd.raw_vertex_offset = (int32_t)min + di->vertex_offset;
       } else if (gpu_range_fits(cmd, p, di, &dd.gpu_count)) {
          /* The range comes from the GPU (mali_jm_irange_v7.c); a draw with
           * no index in the bound range is skipped as below. */
          if (!dd.gpu_count)
             return;
          dd.gpu_range = true;
+      } else if (last->valid && last->ib == d->ib.addr && last->ib_size == d->ib.size &&
+                 last->first == di->first_index && last->count == di->count &&
+                 last->index_size == d->ib.index_size && last->restart == restart) {
+         /* The same indices as the last indexed draw (idx_last). */
+         min = last->min;
+         max = last->max;
+         empty = last->empty;
       } else {
-         /* The vertex range, from the indices in the buffer at this point
-          * of recording (index_range says what that needs); a draw whose
-          * indices cannot be read here is skipped. */
-         bool empty = false;
          const uint64_t t_scan = unlikely(mali_cpuprof_on) ? os_time_get_nano() : 0;
-         const bool ok = index_range(cmd, di, st->ia.primitive_restart_enable, &min, &max, &empty);
+         ok = index_range(cmd, di, restart, &min, &max, &empty);
          if (unlikely(t_scan))
             mali_cpuprof_part(MALI_CPUPROF_IDXSCAN, t_scan);
-         if (!ok || empty)
+      }
+      if (!dd.gpu_range) {
+         if (!ok)
+            return;
+         *last = (struct mali_v7_idx_last){
+            .valid = true,
+            .restart = restart,
+            .empty = empty,
+            .index_size = d->ib.index_size,
+            .ib = d->ib.addr,
+            .ib_size = d->ib.size,
+            .first = di->first_index,
+            .count = di->count,
+            .min = min,
+            .max = max,
+         };
+         if (empty)
             return;
          dd.vertex_range = max - min + 1;
          dd.raw_vertex_offset = (int32_t)min + di->vertex_offset;
       }
+      dd.indices = d->ib.addr + (uint64_t)di->first_index * d->ib.index_size;
    }
    /* With IDVS the instances of a draw keep their positions in separate
     * cache lines: 16 bytes each, so a multiple of 4 vertices
@@ -2349,6 +2408,22 @@ MALI_PER_ARCH(CmdDrawIndexedIndirectCount)(VkCommandBuffer commandBuffer, VkBuff
       .indexed = true,
    };
    draw_indirect_call(cmd, &call);
+}
+
+/* vkCmdSetDepthCullMALISX2 (malisx2's own, from vkGetDeviceProcAddr; what
+ * the flags mean: mali_vk.h). */
+VKAPI_ATTR void VKAPI_CALL
+MALI_PER_ARCH(CmdSetDepthCullMALISX2)(VkCommandBuffer commandBuffer, uint32_t flags)
+{
+   VK_FROM_HANDLE(mali_cmd_buffer, cmd, commandBuffer);
+   const uint8_t cull = (flags & VK_DEPTH_CULL_OVERRIDE_BIT_MALISX2) ? (uint8_t)(flags & 7) : 0;
+   /* The Viewport's Maximum Z carries the far-plane tolerance, the
+    * fragment RSD the near and far discards. */
+   if ((cull ^ cmd->jm.depth_cull) & VK_DEPTH_CULL_ABOVE_BIT_MALISX2)
+      cmd->gfx.draw.dirty |= MALI_GFX_DIRTY_VIEWPORT;
+   if (cull != cmd->jm.depth_cull)
+      cmd->gfx.draw.dirty |= MALI_GFX_DIRTY_ZSD;
+   cmd->jm.depth_cull = cull;
 }
 
 /*
