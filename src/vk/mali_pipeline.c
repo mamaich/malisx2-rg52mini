@@ -305,14 +305,14 @@ stage_dump(const struct stage *st, const struct mali_shader *s)
    size_t size;
    if (stage_spirv(st->info, &words, &size)) {
       snprintf(path, sizeof(path), "%s/%016" PRIx64 ".%s.spv", dir, key, sname);
-      FILE *f = fopen(path, "wb");
+      FILE *f = mali_measure_shader_fopen(path, "wb");
       if (f) {
          fwrite(words, 1, size, f);
          fclose(f);
       }
    }
    snprintf(path, sizeof(path), "%s/%016" PRIx64 ".%s.bin", dir, key, sname);
-   FILE *f = fopen(path, "wb");
+   FILE *f = mali_measure_shader_fopen(path, "wb");
    if (f) {
       fwrite(s->bin, 1, s->bin_size, f);
       fclose(f);
@@ -321,14 +321,14 @@ stage_dump(const struct stage *st, const struct mali_shader *s)
    /* The compiler's static estimate: registers, spills, and cycles per
     * quad in the arithmetic, load/store, varying and texture units. */
    snprintf(path, sizeof(path), "%s/%016" PRIx64 ".%s.stats", dir, key, sname);
-   f = fopen(path, "w");
+   f = mali_measure_shader_fopen(path, "w");
    if (f) {
       pan_bifrost_stats_verbose(f, &s->info.stats.bifrost, s->info.tls_size);
       fclose(f);
    }
 #endif
    snprintf(path, sizeof(path), "%s/index.txt", dir);
-   f = fopen(path, "a");
+   f = mali_measure_shader_fopen(path, "a");
    if (f) {
       fprintf(f, "%016" PRIx64 " %s bytes=%u regs=%u fau=%u entry=%s\n", key, sname,
               s->bin_size, s->info.work_reg_count, s->fau.total_count,
@@ -684,6 +684,9 @@ fill_bind(struct mali_device *dev, struct mali_graphics_pipeline *p)
    bd->vs_base_instance =
       BITSET_TEST(p->vs->fau.used_sysvals,
                   offsetof(struct mali_graphics_sysvals, vs.base_instance) / MALI_FAU_WORD_SIZE);
+   bd->vs_draw_id =
+      BITSET_TEST(p->vs->fau.used_sysvals,
+                  offsetof(struct mali_graphics_sysvals, draw_id) / MALI_FAU_WORD_SIZE);
    bd->fs_sets = p->fs ? stage_sets(p->fs) : 0;
 
    bd->static_mask = 0;

@@ -58,6 +58,8 @@ mali_jm_heap_init(struct mali_jm_device *jd)
    if (!jd->heap.count)
       jd->heap.count = MALI_JM_HEAP_SLOTS;
    assert(jd->heap.count <= MALI_JM_HEAP_SLOTS_MAX);
+   /* A first size above MALI_JM_HEAP_SLOTS_GROWN (the knob) is its own limit. */
+   jd->heap.limit = MAX2(jd->heap.count, MALI_JM_HEAP_SLOTS_GROWN);
    jd->heap.win_len = jd->heap.win_hits = jd->heap.win_max = 0;
 }
 
@@ -150,8 +152,19 @@ mali_jm_heap_take(struct mali_cmd_buffer *cmd, struct mali_jm_batch *b)
    struct mali_jm_heap *h = &jd->heap;
 
    simple_mtx_lock(&h->lock);
-   const uint32_t slot = h->next;
+   uint32_t slot = h->next;
    bool ok = h->bo[slot].size || slot_alloc(jd, &h->bo[slot]);
+   if (!ok && slot > 0 && h->bo[0].size) {
+      /* Out of address space for another region: the ring stops at the
+       * slots it has (they are reused in turn) and this batch takes slot 0.
+       * The limit keeps mali_jm_heap_note_submit from growing it again,
+       * which would retry the allocation on every wrap. */
+      mesa_logw("malisx2: tiler heap ring capped at %u slots", slot);
+      h->count = slot;
+      h->limit = slot;
+      slot = 0;
+      ok = true;
+   }
    if (ok)
       h->next = (slot + 1) % h->count;
    const uint64_t base = h->bo[slot].gpu_va;
@@ -191,7 +204,7 @@ void
 mali_jm_heap_note_submit(struct mali_jm_device *jd, uint32_t tiled, uint32_t heap_waits)
 {
    struct mali_jm_heap *h = &jd->heap;
-   if (h->count >= MALI_JM_HEAP_SLOTS_GROWN)
+   if (h->count >= h->limit)
       return;
    if (tiled > h->count) {
       h->win_hits++;
@@ -203,8 +216,8 @@ mali_jm_heap_note_submit(struct mali_jm_device *jd, uint32_t tiled, uint32_t hea
    if (++h->win_len < MALI_JM_HEAP_GROW_WINDOW)
       return;
    if (h->win_hits >= MALI_JM_HEAP_GROW_HITS) {
-      const uint32_t want = MIN2(ALIGN_POT(h->win_max, 4), MALI_JM_HEAP_SLOTS_GROWN);
       simple_mtx_lock(&h->lock);
+      const uint32_t want = MIN2(ALIGN_POT(h->win_max, 4), h->limit);
       const uint32_t old = h->count;
       h->count = MAX2(h->count, want);
       simple_mtx_unlock(&h->lock);

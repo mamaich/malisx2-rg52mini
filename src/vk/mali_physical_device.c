@@ -81,6 +81,10 @@
 #define MALI_V10_DRIVER_VERSION MALI_DRIVER_VERSION
 #define MALI_V10_DRIVER_INFO \
    "v1.r44p1-malisx2." MALI_VERSION_STRING ".s" MALI_SHADER_CACHE_ID_V10_SHORT
+/* The G720 build (arch 12): the same scheme, ending in its own shader
+ * cache ID. */
+#define MALI_V12_DRIVER_INFO \
+   "v1.r44p1-malisx2." MALI_VERSION_STRING ".s" MALI_SHADER_CACHE_ID_V12_SHORT
 
 static inline const char *
 driver_info_for_arch(uint32_t arch)
@@ -88,6 +92,7 @@ driver_info_for_arch(uint32_t arch)
    return arch == 7    ? MALI_V7_DRIVER_INFO
           : arch == 9  ? MALI_V9_DRIVER_INFO
           : arch == 10 ? MALI_V10_DRIVER_INFO
+          : arch == 12 ? MALI_V12_DRIVER_INFO
                        : MALI_DRIVER_INFO;
 }
 
@@ -263,9 +268,30 @@ v11_device_name(const struct mali_kbase_gpu_props *p, char *buf, size_t size)
    snprintf(buf, size, "Mali-%s MC%u", model, p->core_count);
 }
 
-/* Every product of the arches built in (7, 9, 10, 11) has a name; any other
- * arch (Midgard, the arch 6 G71 and G72, arch 12 on) has no back half here
- * and gets none. */
+/*
+ * Arch 12: the parts Mesa's model table knows (pan_model.c), which keys
+ * them by the CORE_FEATURES variant as for arch 11. The G720 with fewer
+ * than 6 cores is sold as the G620, with 10 or more and ray tracing as the
+ * Immortalis-G720 (the table's G720-Immortalis).
+ */
+static bool
+v12_device_name(const struct mali_kbase_gpu_props *p, char *buf, size_t size)
+{
+   const struct pan_model *model =
+      pan_get_model(p->gpu_id, p->core_features & 0xff, p->core_count, p->gpu_features);
+   if (!model)
+      return false;
+   /* The table's names carry the "Mali-" prefix already. */
+   const char *name = model->name;
+   if (!strcmp(name, "Mali-G720") && p->core_count < 6)
+      name = "Mali-G620";
+   snprintf(buf, size, "%s MC%u", name, p->core_count);
+   return true;
+}
+
+/* Every product of the arches built in (7, 9, 10, 11) and the arch 12 parts
+ * Mesa's model table knows have a name; any other arch (Midgard, the arch 6
+ * G71 and G72, arch 13 on) has no back half here and gets none. */
 bool
 mali_device_name(const struct mali_kbase_gpu_props *p, char *buf, size_t size)
 {
@@ -282,6 +308,8 @@ mali_device_name(const struct mali_kbase_gpu_props *p, char *buf, size_t size)
    case 11:
       v11_device_name(p, buf, size);
       return true;
+   case 12:
+      return v12_device_name(p, buf, size);
    default:
       return false;
    }
@@ -399,6 +427,14 @@ static const struct vk_device_extension_table mali_device_extensions = {
    .KHR_external_semaphore_fd = true,
    /* ARMSX2 logs the fault records after VK_ERROR_DEVICE_LOST. */
    .EXT_device_fault = true,
+   /* ARMSX2's "Spin GPU During Readbacks" turns GPU timestamps into CPU
+    * time with these; Arm's WSI layer on Linux calibrates present timing
+    * with them. Both names: ARMSX2 releases before the KHR name was
+    * accepted ask for EXT only. The device domain is the GPU TIMESTAMP
+    * register (device_get_timestamp, mali_device.c); Mesa's common code
+    * reads the host clocks around it. */
+   .KHR_calibrated_timestamps = true,
+   .EXT_calibrated_timestamps = true,
 #ifdef VK_USE_PLATFORM_ANDROID_KHR
    /* Without it the Android loader builds no swapchain. */
    .ANDROID_native_buffer = true,
@@ -421,7 +457,6 @@ static const struct vk_device_extension_table mali_device_extensions = {
    .EXT_external_memory_dma_buf = true,
    .EXT_image_drm_format_modifier = true,
    .KHR_image_format_list = true,
-   .KHR_calibrated_timestamps = true,
    /* Vulkan 1.1 core; for an application that asks for Vulkan 1.0 the
     * layer enables them by name. */
    .KHR_bind_memory2 = true,
@@ -552,19 +587,19 @@ static const struct vk_device_extension_table mali_device_extensions = {
 static bool
 storage8_for_arch(uint32_t arch)      /* VK_KHR_8bit_storage */
 {
-   return arch == 7 || arch == 9 || arch == 10 || arch == 11;
+   return arch == 7 || arch == 9 || arch == 10 || arch == 11 || arch == 12;
 }
 
 static bool
 storage16_for_arch(uint32_t arch)     /* VK_KHR_16bit_storage */
 {
-   return arch == 7 || arch == 9 || arch == 10 || arch == 11;
+   return arch == 7 || arch == 9 || arch == 10 || arch == 11 || arch == 12;
 }
 
 static bool
 int8_for_arch(uint32_t arch)          /* shaderInt8 of VK_KHR_shader_float16_int8 */
 {
-   return arch == 7 || arch == 9 || arch == 10 || arch == 11;
+   return arch == 7 || arch == 9 || arch == 10 || arch == 11 || arch == 12;
 }
 
 /*
@@ -579,7 +614,7 @@ int8_for_arch(uint32_t arch)          /* shaderInt8 of VK_KHR_shader_float16_int
 static bool
 draw_indirect_for_arch(uint32_t arch)
 {
-   return arch == 7 || arch == 9 || arch == 10 || arch == 11;
+   return arch == 7 || arch == 9 || arch == 10 || arch == 11 || arch == 12;
 }
 
 /*
@@ -595,7 +630,7 @@ draw_indirect_for_arch(uint32_t arch)
 static bool
 bda_for_arch(uint32_t arch)
 {
-   return arch == 7 || arch == 9 || arch == 10 || arch == 11;
+   return arch == 7 || arch == 9 || arch == 10 || arch == 11 || arch == 12;
 }
 
 /*
@@ -607,10 +642,28 @@ bda_for_arch(uint32_t arch)
 static bool
 ubo_std_layout_for_arch(uint32_t arch)
 {
-   return arch == 7 || arch == 9 || arch == 10 || arch == 11;
+   return arch == 7 || arch == 9 || arch == 10 || arch == 11 || arch == 12;
 }
 
-/* maxDrawIndirectCount. v10, v11: the stream compares the count as a signed
+/*
+ * VK_KHR_shader_float_controls on v7: Bifrost keeps fp16 and fp32 denormals,
+ * signed zeros, infinities and NaNs and rounds to nearest even, with or
+ * without the shader's execution modes asking for it (checked on a G52 in
+ * compute and fragment shaders: fp32 add, mul, fma, min, max and compares
+ * into and on denormals, ties, -0, inf and NaN; fp16 subnormals through
+ * 16-bit storage loads and stores, packHalf2x16 and unpackHalf2x16).
+ * Reported as preserving, as panvk reports v7; the flush-to-zero and
+ * round-toward-zero modes are not claimed, as they are not checked here.
+ * Vita3K builds subnormal halves in software on every F16 pack when a
+ * driver does not say it preserves them.
+ */
+static bool
+float_controls_for_arch(uint32_t arch)
+{
+   return arch == 7;
+}
+
+/* maxDrawIndirectCount. v10, v11, v12: the stream compares the count as a signed
  * word. v7, v9: the smallest limit Vulkan allows with multiDrawIndirect,
  * which bounds what one call records. */
 static uint32_t
@@ -662,6 +715,22 @@ arm_wsi_layer_loaded(void)
 }
 #endif
 
+/*
+ * Sampler features the hardware's Sampler descriptor already has: custom
+ * border colours (Mesa's runtime gives the colour, mali_sampler.c packs it as
+ * it packs the standard ones), a seamless-cube bit to clear, and the
+ * mirrored-clamp-to-edge wrap mode. Checked with the CTS on the G31 and G52.
+ * customBorderColorWithoutFormat holds because v7_afbc_format (mali_image.c)
+ * makes only R8, RG8 and RGBA8 AFBC: a BGR-order AFBC image on v7 would need
+ * the border colour's red and blue swapped per format, as panvk does
+ * (panvk_afbc_reswizzle_border_color), and would end it.
+ */
+static bool
+sampler_features_for_arch(uint32_t arch)
+{
+   return arch == 7;
+}
+
 static struct vk_device_extension_table
 device_extensions_for_arch(uint32_t arch)
 {
@@ -676,6 +745,16 @@ device_extensions_for_arch(uint32_t arch)
 
    ext.KHR_buffer_device_address = bda_for_arch(arch);
    ext.KHR_uniform_buffer_standard_layout = ubo_std_layout_for_arch(arch);
+   ext.KHR_shader_float_controls = float_controls_for_arch(arch);
+   ext.EXT_custom_border_color = sampler_features_for_arch(arch);
+   ext.EXT_non_seamless_cube_map = sampler_features_for_arch(arch);
+   ext.KHR_sampler_mirror_clamp_to_edge = sampler_features_for_arch(arch);
+   /* v7: DrawIndex is a system value the draw sets (draw_id); 8-bit indices
+    * and list restart are the index scan's and the tiler's. */
+   ext.KHR_shader_draw_parameters = arch == 7;
+   ext.KHR_index_type_uint8 = arch == 7;
+   ext.EXT_index_type_uint8 = arch == 7;
+   ext.EXT_primitive_topology_list_restart = arch == 7;
 #ifndef __ANDROID__
    /* For Arm's older WSI layer only (arm_wsi_layer_loaded). */
    ext.KHR_sampler_ycbcr_conversion = arm_wsi_layer_loaded();
@@ -692,7 +771,7 @@ device_extensions_for_arch(uint32_t arch)
  * blend shader reads it from there (load_blend_input_pan); on v7 Mesa's
  * Bifrost backend does both, as for panvk_v7.
  *
- * Reported on v7, v9, v10 and v11. ARMSX2 then hardware-blends some draws into
+ * Reported on v7, v9, v10, v11 and v12. ARMSX2 then hardware-blends some draws into
  * 16-bit PS2 frames without the PS2's colour truncation, a few levels too
  * bright, as on every other driver that reports it; it saves those draws
  * a framebuffer read. Without it ARMSX2 also takes its render-target-read
@@ -707,6 +786,7 @@ dual_src_blend_for_arch(uint32_t arch)
    case 9:
    case 10:
    case 11:
+   case 12:
       return true;
    default:
       return false;
@@ -826,14 +906,15 @@ get_features(struct vk_features *f, uint32_t arch)
       .tessellationShader = false,
       .sampleRateShading = true,
       .dualSrcBlend = dual_src_blend_for_arch(arch),
-      .logicOp = false,
+      /* Logic ops run in the blend shader (mali_blend.c). */
+      .logicOp = arch == 7,
       .multiDrawIndirect = draw_indirect_for_arch(arch),
       .drawIndirectFirstInstance = draw_indirect_for_arch(arch),
       /* Vulkan 1.2's name for VK_KHR_draw_indirect_count. */
       .drawIndirectCount = draw_indirect_for_arch(arch),
       .depthClamp = true,
       .depthBiasClamp = true,
-      /* v7, v10 and v11 (not v9): clip distances are varyings the fragment
+      /* v7, v10, v11 and v12 (not v9): clip distances are varyings the fragment
        * shader tests and discards on (mali_shader.c, "Clip distances").
        * The test is per pixel, at the pixel centre, so under
        * multisampling the clipped edge is not antialiased; and with a
@@ -841,10 +922,11 @@ get_features(struct vk_features *f, uint32_t arch)
        * discards or writes memory, depth or stencil, clipped fragments
        * still write depth and stencil. Cull distances are not
        * supported. */
-      .shaderClipDistance = arch == 7 || arch == 10 || arch == 11,
+      .shaderClipDistance = arch == 7 || mali_arch_is_csf(arch),
       .fillModeNonSolid = false,
       .depthBounds = false,
-      .wideLines = false,
+      /* v7's primitive size is an fp32 (fixed_sized). */
+      .wideLines = arch == 7,
       .largePoints = true,
       .alphaToOne = false,
       .multiViewport = false,
@@ -956,6 +1038,17 @@ get_features(struct vk_features *f, uint32_t arch)
    };
 
    get_descriptor_indexing_features(f, arch);
+   if (sampler_features_for_arch(arch)) {
+      f->customBorderColors = true;
+      f->customBorderColorWithoutFormat = true;
+      f->nonSeamlessCubeMap = true;
+      f->samplerMirrorClampToEdge = true;
+   }
+   if (arch == 7) {
+      f->shaderDrawParameters = true;
+      f->indexTypeUint8 = true;
+      f->primitiveTopologyListRestart = true;
+   }
 }
 
 /* The sample counts we report. Rendering is single-sampled (mali_fb.c) and
@@ -1244,9 +1337,9 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       .maxCombinedClipAndCullDistances = 0,
       .discreteQueuePriorities = 2,
       .pointSizeRange = { 1.0f, 1024.0f },
-      .lineWidthRange = { 1.0f, 1.0f },
+      .lineWidthRange = { 1.0f, pdev->arch == 7 ? 255.0f : 1.0f },
       .pointSizeGranularity = 0.0625f,
-      .lineWidthGranularity = 0.0f,
+      .lineWidthGranularity = pdev->arch == 7 ? 0.0625f : 0.0f,
       .strictLines = true,
       .standardSampleLocations = true,
       .optimalBufferCopyOffsetAlignment = 64,
@@ -1330,6 +1423,16 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       .independentResolveNone = false,
       .independentResolve = false,
 
+      /* VK_KHR_shader_float_controls (float_controls_for_arch) */
+      .denormBehaviorIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL,
+      .roundingModeIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL,
+      .shaderSignedZeroInfNanPreserveFloat16 = float_controls_for_arch(p->arch_major),
+      .shaderSignedZeroInfNanPreserveFloat32 = float_controls_for_arch(p->arch_major),
+      .shaderDenormPreserveFloat16 = float_controls_for_arch(p->arch_major),
+      .shaderDenormPreserveFloat32 = float_controls_for_arch(p->arch_major),
+      .shaderRoundingModeRTEFloat16 = float_controls_for_arch(p->arch_major),
+      .shaderRoundingModeRTEFloat32 = float_controls_for_arch(p->arch_major),
+
       /* VK_EXT_provoking_vertex: the hardware bit is per render pass, not
        * per pipeline (panvk reports the same). */
       .provokingVertexModePerPipeline = false,
@@ -1342,6 +1445,9 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       .dynamicRenderingLocalReadDepthStencilAttachments = true,
       .dynamicRenderingLocalReadMultisampledAttachments = false,
    };
+   /* VK_EXT_custom_border_color (sampler_features_for_arch). */
+   if (sampler_features_for_arch(pdev->arch))
+      props->maxCustomBorderColorSamplers = 4000;
 
    /*
     * VK_EXT_descriptor_indexing's properties on v9 and v11 (v7 has its own
@@ -1406,7 +1512,7 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
     * 4096 16-byte entries (genxml v7.xml). Warps are 8 lanes
     * (pan_subgroup_size).
     */
-   if (p->arch_major == 10 || p->arch_major == 11) {
+   if (mali_arch_is_csf(p->arch_major)) {
       props->maxClipDistances = MALI_V11_MAX_CLIP_DISTANCES;
       props->maxCombinedClipAndCullDistances = MALI_V11_MAX_CLIP_DISTANCES;
    }
@@ -1523,6 +1629,9 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
    } else if (p->arch_major == 10) {
       pipeline_cache_uuid(props->pipelineCacheUUID, MALI_SHADER_CACHE_ID_V10,
                           sizeof(MALI_SHADER_CACHE_ID_V10), p->gpu_id, 0);
+   } else if (p->arch_major == 12) {
+      pipeline_cache_uuid(props->pipelineCacheUUID, MALI_SHADER_CACHE_ID_V12,
+                          sizeof(MALI_SHADER_CACHE_ID_V12), p->gpu_id, 0);
    } else {
       pipeline_cache_uuid(props->pipelineCacheUUID, MALI_SHADER_CACHE_ID,
                           sizeof(MALI_SHADER_CACHE_ID), p->gpu_id, 0);
@@ -1693,10 +1802,21 @@ physical_device_create(struct mali_instance *instance, const char *path,
       pdev->model = &pa->model;
    }
    const enum mali_kbase_frontend frontend = kb->frontend;
+   /* A job-manager kbase built without sync files (the RK3326's 4.4 BSP
+    * one) answers STREAM_CREATE with ENOENT: its fences and semaphores
+    * then get no SYNC_FD handle type (mali_sync.c). */
+   bool sync_files = true;
+   if (frontend == MALI_KBASE_FRONTEND_JM) {
+      int sfd;
+      if (mali_kbase_stream_create(kb, "malisx2_probe", &sfd) == MALI_KBASE_SUCCESS)
+         close(sfd);
+      else
+         sync_files = false;
+   }
    mali_kbase_destroy(kb);
 
-   /* The arch has to match the frontend the kernel speaks: CSF with v10
-    * and v11, the job manager with v7 and v9. */
+   /* The arch has to match the frontend the kernel speaks: CSF with v10,
+    * v11 and v12, the job manager with v7 and v9. */
    const bool arch_ok =
       (mali_arch_is_csf(pdev->arch) && frontend == MALI_KBASE_FRONTEND_CSF) ||
       (mali_arch_is_jm(pdev->arch) && frontend == MALI_KBASE_FRONTEND_JM);
@@ -1704,12 +1824,15 @@ physical_device_create(struct mali_instance *instance, const char *path,
    if (!arch_ok || !mali_device_name(&pdev->props, name, sizeof(name))) {
       mesa_logw("malisx2: skipping %s: GPU product 0x%04x (arch %u) is not "
                 "one this driver was built for (arch 7 or 9 on a job-manager "
-                "kernel, arch 10 or 11 on a command-stream kernel)", path,
+                "kernel, arch 10, 11 or 12 on a command-stream kernel)", path,
                 pdev->props.product_id, pdev->props.arch_major);
       vk_free(&instance->vk.alloc, pdev);
       return VK_ERROR_INCOMPATIBLE_DRIVER;
    }
 
+   /* The Mali-G31 (arch 7, product major 3): an AFBC render target faults
+    * (0x58) on the H700's, so it gets linear and u-interleaved images only. */
+   pdev->afbc = !(pdev->arch == 7 && pdev->props.product_major == 3);
    pdev->timestamp_hz = timestamp_frequency();
    init_memory(pdev);
    /* driverInfo carries the shader cache ID, not the commit; say which build
@@ -1765,16 +1888,28 @@ physical_device_create(struct mali_instance *instance, const char *path,
    vk_physical_device_dispatch_table_from_entrypoints(
       &pdev->vk.dispatch_table, &mali_waist_physical_device_entrypoints, false);
 
-   pdev->vk.supported_sync_types = pdev->arch == 7    ? mali_v7_sync_types()
-                                   : pdev->arch == 9  ? mali_v9_sync_types()
-                                   : pdev->arch == 10 ? mali_v10_sync_types()
-                                                      : mali_v11_sync_types();
+   if (sync_files) {
+      pdev->vk.supported_sync_types = pdev->arch == 7    ? mali_v7_sync_types()
+                                      : pdev->arch == 9  ? mali_v9_sync_types()
+                                      : pdev->arch == 10 ? mali_v10_sync_types()
+                                      : pdev->arch == 12 ? mali_v12_sync_types()
+                                                         : mali_v11_sync_types();
+   } else {
+      pdev->vk.supported_sync_types = pdev->arch == 7    ? mali_v7_sync_types_no_sync_file()
+                                      : pdev->arch == 9  ? mali_v9_sync_types_no_sync_file()
+                                      : pdev->arch == 10 ? mali_v10_sync_types_no_sync_file()
+                                      : pdev->arch == 12 ? mali_v12_sync_types_no_sync_file()
+                                                         : mali_v11_sync_types_no_sync_file();
+      mesa_logi("malisx2 kbase without sync files (STREAM_CREATE failed): fences and "
+                "semaphores have no SYNC_FD handle type");
+   }
 
    /* Compiled shaders are what pipeline caches hold. */
    pdev->vk.pipeline_cache_import_ops =
       pdev->arch == 7    ? mali_v7_pipeline_cache_import_ops
       : pdev->arch == 9  ? mali_v9_pipeline_cache_import_ops
       : pdev->arch == 10 ? mali_v10_pipeline_cache_import_ops
+      : pdev->arch == 12 ? mali_v12_pipeline_cache_import_ops
                          : mali_v11_pipeline_cache_import_ops;
 
 #ifndef __ANDROID__

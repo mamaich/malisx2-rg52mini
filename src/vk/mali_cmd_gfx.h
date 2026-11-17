@@ -325,6 +325,7 @@ struct mali_gfx_draw_state {
    /* The last values the FAU blocks were built with. */
    int32_t first_vertex;
    uint32_t base_instance;
+   uint32_t draw_id;                /* v7: DrawIndex */
    uint64_t blend_descs[8];         /* fs.blend_descs, from the last blend build */
    uint32_t blend_shader_mask;      /* targets blended by a shader, last blend build */
 
@@ -339,12 +340,12 @@ struct mali_gfx_draw_state {
    /* Descriptor sets bound since each stage's table was built. */
    uint32_t vs_sets_dirty, fs_sets_dirty;
 
-   /* What the IDVS staging registers 0..63 hold, per 32-bit register,
-    * where regs_valid says it is known: a draw writes only the registers
-    * whose value changes. Only mali_cmd_draw.c writes these registers;
-    * anything else that does clears regs_valid. */
-   uint64_t regs_valid;
-   uint32_t regs[64];
+   /* What the IDVS staging registers hold (0..63 on v10 and v11, 0..65 on
+    * v12), per 32-bit register, where regs_valid says it is known: a draw
+    * writes only the registers whose value changes. Only mali_cmd_draw.c
+    * writes these registers; anything else that does clears regs_valid. */
+   BITSET_DECLARE(regs_valid, 66);
+   uint32_t regs[66];
 
    /* The pipeline's words repacked with this command buffer's dynamic
     * state, for pipelines whose baked words depend on it. */
@@ -583,6 +584,13 @@ enum mali_meta_fs_op {
                                 * Render target 0 only, with no target: the
                                 * fragment-side image -> buffer and buffer ->
                                 * image copies. */
+   MALI_META_FS_COPY_OUT,      /* v7: inside the area, the source block at the
+                                * fragment's position + copy_delta (read as
+                                * COPY reads it) output raw as a uint colour;
+                                * 0 outside. Render target 0 only: the
+                                * image -> buffer copy through the tile
+                                * buffer into the buffer seen as a linear
+                                * render target (copy_to_buffer_rt). */
    MALI_META_FS_QUERY,         /* v7: vkCmdCopyQueryPoolResults on the fragment
                                 * side, one fragment per query (query x + y *
                                 * MALI_META_QUERY_ROW), what the compute copy

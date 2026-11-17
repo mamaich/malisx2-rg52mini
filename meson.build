@@ -14,7 +14,7 @@
 project(
   'malisx2',
   ['c', 'cpp'],
-  version : '0.5.0',
+  version : '0.5.1',
   license : 'MIT',
   meson_version : '>= 1.7.0',
   default_options : [
@@ -31,9 +31,9 @@ project(
 # Every arch we generate genxml packers and a pixel-format library for, and
 # build the per-arch vk/ files for (src/meson.build), Mesa numbering: 7 for
 # the G52's and 9 for the G57's job-manager back half, 10 for the G610's
-# and G710's and 11 for the G615's command-stream back half. The device's
-# arch picks one at vkCreateDevice.
-pan_archs = [7, 9, 10, 11]
+# and G710's, 11 for the G615's and 12 for the G720's command-stream back
+# half. The device's arch picks one at vkCreateDevice.
+pan_archs = [7, 9, 10, 11, 12]
 
 # The arch the tests and the host-side tools build their command-stream
 # code for when they need one: the G615's.
@@ -51,13 +51,12 @@ add_languages('rust', required : true, native : true)
 rustc = meson.get_compiler('rust')
 rust = import('rust')
 
-# Mesa: branch rg52mini-20261107 of github.com/mamaich/armsx2-turnip-rg52mini
+# Mesa: branch rg52mini-20261117 of github.com/mamaich/armsx2-turnip-rg52mini
 # (branch malisx2 of github.com/bmdhacks/armsx2-turnip, i.e. upstream Mesa
-# plus the kraid changes, plus our compiler fixes) at this commit, checked
-# out (or symlinked) at mesa/. Only the sources are used; Mesa's own build
-# is not run. Upstream 0.4.1 pins 45ff8fa (Bifrost spill slots aligned to the
-# value's size); our 9d239e8 already makes that change, so the pin stays.
-mesa_commit = '3b0e0367a4b360baad70616a1dd51f90ee471a27'
+# plus the kraid changes, at b5f8787, the pin of upstream 0.5.1, plus our
+# compiler fixes) at this commit, checked out (or symlinked) at mesa/. Only
+# the sources are used; Mesa's own build is not run.
+mesa_commit = '75e85610e87b6bc836d7ba68e8ee9d4f76dcecd5'
 if not fs.is_dir('mesa' / 'src' / 'panfrost')
   error('''Mesa is missing. Fetch it with:
   git init mesa && git -C mesa fetch --depth 1 https://github.com/mamaich/armsx2-turnip-rg52mini.git @0@ && git -C mesa checkout FETCH_HEAD'''.format(mesa_commit))

@@ -435,6 +435,7 @@ mali_gfx_fill_sysvals(struct mali_cmd_buffer *cmd, struct mali_graphics_sysvals 
 
    sv->vs.first_vertex = d->first_vertex;
    sv->vs.base_instance = d->base_instance;
+   sv->draw_id = d->draw_id;
    sv->vs.noperspective_varyings = p->bind.noperspective;
 #if PAN_ARCH >= 9
    /* On v7 these words are v7_desc.sets, which the v7 draw fills: BLEND
@@ -722,7 +723,9 @@ mali_gfx_pack_varying_descs(const struct mali_shader *vs, const struct mali_shad
          cfg.table = 61;
          cfg.frequency = MALI_ATTRIBUTE_FREQUENCY_VERTEX;
          cfg.offset = 1024 + offset;
-         cfg.buffer_index = 0;
+         /* v12 puts the hardware's varying buffer at index 1 (panvk
+          * emit_varying_descs). */
+         cfg.buffer_index = PAN_ARCH >= 12 ? 1 : 0;
          cfg.attribute_stride = vl->generic_size_B;
          cfg.packet_stride = vl->generic_size_B + 16;
       }
@@ -773,7 +776,7 @@ mali_gfx_pack_blend_constant(enum pipe_format format, float c)
    const struct util_format_description *desc = util_format_description(format);
    unsigned size = 0;
    for (unsigned i = 0; i < desc->nr_channels; i++)
-      size = MAX2(desc->channel[0].size, size);
+      size = MAX2(desc->channel[i].size, size);
    if (!size || size > 16)
       return 0;
    float factor = (float)(((1u << size) - 1) << (16 - size));
@@ -1066,6 +1069,37 @@ mali_gfx_scissor_box(const struct mali_cmd_buffer *cmd)
 
 #endif
 
+#if PAN_ARCH >= 12
+/*
+ * The packed Viewport (128 bits) of viewport 0, for the VIEWPORT_HIGH and
+ * VIEWPORT_LOW staging registers (panvk v12 prepare_vp): the rectangle as
+ * inclusive bounds, and the depth range the v11 LOW/HIGH_DEPTH_CLAMP
+ * registers held.
+ */
+static inline void
+mali_gfx_viewport(const struct mali_cmd_buffer *cmd, uint64_t words[2])
+{
+   const VkViewport *vp = &cmd->vk.dynamic_graphics_state.vp.viewports[0];
+   int minx = (int)vp->x;
+   int maxx = (int)(vp->x + vp->width);
+   int miny = (int)MIN2(vp->y, vp->y + vp->height);
+   int maxy = (int)MAX2(vp->y, vp->y + vp->height);
+   maxx = maxx > minx ? maxx - 1 : maxx;
+   maxy = maxy > miny ? maxy - 1 : maxy;
+
+   struct mali_viewport_packed v;
+   pan_pack(&v, VIEWPORT, cfg) {
+      cfg.min_x = CLAMP(minx, 0, UINT16_MAX);
+      cfg.min_y = CLAMP(miny, 0, UINT16_MAX);
+      cfg.max_x = CLAMP(maxx, 0, UINT16_MAX);
+      cfg.max_y = CLAMP(maxy, 0, UINT16_MAX);
+      cfg.min_depth = MIN2(vp->minDepth, vp->maxDepth);
+      cfg.max_depth = MAX2(vp->minDepth, vp->maxDepth);
+   }
+   memcpy(words, &v, 2 * sizeof(uint64_t));
+}
+#endif
+
 static inline enum mali_index_type
 mali_gfx_index_type(uint32_t size)
 {
@@ -1087,6 +1121,7 @@ struct mali_draw_info {
    int32_t vertex_offset;      /* firstVertex or vertexOffset */
    uint32_t first_instance;
    bool indexed;
+   uint32_t draw_id;           /* DrawIndex: the multi-draw indirect index */
 };
 
 /* Whether a dirty dynamic state may feed the pipeline bake (gfx_pack_state):
@@ -1255,6 +1290,9 @@ mali_gfx_update_dirty(struct mali_cmd_buffer *cmd, const struct mali_draw_info *
    }
    d->first_vertex = di->vertex_offset;
    d->base_instance = di->first_instance;
+   if (d->draw_id != di->draw_id && bd->vs_draw_id)
+      d->dirty |= MALI_GFX_DIRTY_VS_FAU;
+   d->draw_id = di->draw_id;
 
    /* Descriptor sets bound since a stage's table was built. */
    if (d->vs_sets_dirty & bd->vs_sets)

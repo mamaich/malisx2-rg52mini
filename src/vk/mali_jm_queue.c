@@ -856,7 +856,7 @@ stage_gate(VkPipelineStageFlags2 mask)
 static struct mali_sync *
 to_sync(struct vk_sync *s)
 {
-   assert(s->type == &MALI_PER_ARCH(sync_type) || MALI_PER_ARCH(sync_is_timeline_point)(s));
+   assert(MALI_PER_ARCH(sync_is_binary)(s) || MALI_PER_ARCH(sync_is_timeline_point)(s));
    return container_of(s, struct mali_sync, vk);
 }
 
@@ -1014,7 +1014,7 @@ build_submit(struct mali_device *dev, struct vk_queue_submit *submit, mali_jm_re
                 * at most once a submission, as take_number does when
                 * it runs out of numbers) before counting it, or a ring
                 * that keeps up would grow anyway. */
-               if (h && jd->heap.count < MALI_JM_HEAP_SLOTS_GROWN && mali_jm_ref_live(jd, h) &&
+               if (h && jd->heap.count < jd->heap.limit && mali_jm_ref_live(jd, h) &&
                    newer(req, h) == h && req != h) {
                   if (!heap_drained) {
                      mali_jm_drain_locked(dev);

@@ -119,7 +119,7 @@ mali_device_intern_key(struct mali_device *dev, const void *data, size_t size)
 /*
  * The structures this file and the rest of the code built once share with
  * the command-stream back half, as this build sees them: each build of
- * that back half (v10 and v11) checks its own view against these when the
+ * that back half (v10, v11 and v12) checks its own view against these when the
  * driver is linked (mali_layout_check.h, mali_cmd_buffer.c).
  */
 static void __attribute__((used))
@@ -243,6 +243,7 @@ queue_init(struct mali_device *dev, struct mali_queue *queue,
    queue->vk.driver_submit = arch == 7    ? mali_v7_queue_submit
                              : arch == 9  ? mali_v9_queue_submit
                              : arch == 10 ? mali_v10_queue_submit
+                             : arch == 12 ? mali_v12_queue_submit
                                           : mali_v11_queue_submit;
    return VK_SUCCESS;
 }
@@ -291,13 +292,65 @@ device_destroy(struct mali_device *dev, const VkAllocationCallbacks *alloc)
    vk_free2(&dev->vk.physical->instance->alloc, alloc, dev);
 }
 
-/* VK_TIME_DOMAIN_DEVICE for Mesa's calibrated-timestamp entry points: the
+/*
+ * VK_TIME_DOMAIN_DEVICE for Mesa's calibrated-timestamp entry points: the
  * GPU system timestamp, the counter timestamp queries write (ticks of
- * timestampPeriod). */
+ * timestampPeriod).
+ *
+ * On the Mali-G57 (job-manager kbase, Unisoc T820) and the Mali-G615 (CSF
+ * kbase, Dimensity 8300) that counter is the SoC's system counter, which
+ * the CPU reads as CNTVCT_EL0: every GET_CPU_GPU_TIMEINFO sample lies
+ * between two CNTVCT_EL0 reads taken around the ioctl, also right after
+ * the GPU powers up. The ioctl costs 31 us on the G57 and 1.5 us on the
+ * G615, and with the GPU idle it first powers the GPU up: 5 ms on the G57,
+ * 0.7 ms on the G615. Mesa's common code reports that whole time as the
+ * calibration's maximum deviation. Reading CNTVCT_EL0 costs nanoseconds
+ * and leaves the GPU asleep. timestamp_is_cntvct() checks the match once
+ * per device; where it fails, the ioctl stays.
+ */
+#if defined(__aarch64__)
+static inline uint64_t
+read_cntvct(void)
+{
+   uint64_t v;
+   __asm__ volatile("isb\n\tmrs %0, cntvct_el0" : "=r"(v)::"memory");
+   return v;
+}
+#endif
+
+static bool
+timestamp_is_cntvct(struct mali_kbase *kb)
+{
+#if defined(__aarch64__)
+   /* The first sample's window may include the GPU's power-up; the second
+    * one's is the bare ioctl. A counter that is not CNTVCT_EL0 but lands in
+    * that window anyway is off by less than the ioctl's own deviation. */
+   for (int i = 0; i < 2; i++) {
+      uint64_t mono_ns, ts;
+      const uint64_t before = read_cntvct();
+      if (mali_kbase_timeinfo(kb, &mono_ns, &ts) != MALI_KBASE_SUCCESS)
+         return false;
+      const uint64_t after = read_cntvct();
+      if (ts < before || ts > after)
+         return false;
+   }
+   return true;
+#else
+   (void)kb;
+   return false;
+#endif
+}
+
 static VkResult
 device_get_timestamp(struct vk_device *vk_dev, uint64_t *timestamp)
 {
    struct mali_device *dev = container_of(vk_dev, struct mali_device, vk);
+#if defined(__aarch64__)
+   if (dev->timestamp_is_cntvct) {
+      *timestamp = read_cntvct();
+      return VK_SUCCESS;
+   }
+#endif
    uint64_t mono_ns;
    return mali_kbase_timeinfo(dev->kbase, &mono_ns, timestamp) == MALI_KBASE_SUCCESS ?
              VK_SUCCESS :
@@ -318,6 +371,11 @@ mali_GetDeviceProcAddr(VkDevice _device, const char *pName)
       const struct mali_physical_device *pdev =
          container_of(device->physical, struct mali_physical_device, vk);
       return pdev->arch == 7 ? (PFN_vkVoidFunction)mali_v7_CmdSetDepthCullMALISX2 : NULL;
+   }
+   if (device && pName && !strcmp(pName, "vkCmdSetDepthCullBelowMALISX2")) {
+      const struct mali_physical_device *pdev =
+         container_of(device->physical, struct mali_physical_device, vk);
+      return pdev->arch == 7 ? (PFN_vkVoidFunction)mali_v7_CmdSetDepthCullBelowMALISX2 : NULL;
    }
    return vk_device_get_proc_addr(device, pName);
 }
@@ -341,7 +399,7 @@ mali_CreateDevice(VkPhysicalDevice physicalDevice,
 
    /*
     * Four layers, first match wins: the device's own arch (mali_v7_*,
-    * mali_v9_*, mali_v10_* or mali_v11_*, MALI_PER_ARCH in the per-arch and
+    * mali_v9_*, mali_v10_*, mali_v11_* or mali_v12_*, MALI_PER_ARCH in the per-arch and
     * command-stream files), then our arch-independent entry points, then
     * Mesa's common entry points (added by vk_device_init), then the waist
     * stubs. Only the first layer depends on pdev->arch; everything below
@@ -353,6 +411,7 @@ mali_CreateDevice(VkPhysicalDevice physicalDevice,
       pdev->arch == 7    ? &mali_v7_device_entrypoints
       : pdev->arch == 9  ? &mali_v9_device_entrypoints
       : pdev->arch == 10 ? &mali_v10_device_entrypoints
+      : pdev->arch == 12 ? &mali_v12_device_entrypoints
                          : &mali_v11_device_entrypoints,
       true);
    vk_device_dispatch_table_from_entrypoints(&dispatch, &mali_device_entrypoints, false);
@@ -440,6 +499,14 @@ mali_CreateDevice(VkPhysicalDevice physicalDevice,
       return result;
    }
    dev->vk.get_timestamp = device_get_timestamp;
+   if (dev->vk.enabled_extensions.KHR_calibrated_timestamps ||
+       dev->vk.enabled_extensions.EXT_calibrated_timestamps) {
+      dev->timestamp_is_cntvct = timestamp_is_cntvct(dev->kbase);
+      /* No "malisx2:" prefix: this is information, not a warning. */
+      if (!dev->timestamp_is_cntvct)
+         mesa_logi("malisx2 GPU timestamps are not the CPU's CNTVCT_EL0: calibrated "
+                   "timestamps read them through the kernel");
+   }
    if (dev->kbase->frontend == MALI_KBASE_FRONTEND_JM) {
       /* No "malisx2:" prefix: this is information, not a warning. */
       char layout[192];
@@ -471,7 +538,7 @@ mali_CreateDevice(VkPhysicalDevice physicalDevice,
       return result;
    }
    /* Command buffers and the queue's shared state: the frontend the
-    * physical device's arch has (CSF on v10 and v11, the job manager on v7
+    * physical device's arch has (CSF on v10, v11 and v12, the job manager on v7
     * and v9). */
    if (pdev->arch == 7) {
       dev->vk.command_buffer_ops = &mali_v7_cmd_buffer_ops;
@@ -482,9 +549,12 @@ mali_CreateDevice(VkPhysicalDevice physicalDevice,
    } else if (pdev->arch == 10) {
       dev->vk.command_buffer_ops = &mali_v10_cmd_buffer_ops;
       result = mali_v10_csf_device_init(dev);
-   } else {
+   } else if (pdev->arch == 11) {
       dev->vk.command_buffer_ops = &mali_v11_cmd_buffer_ops;
       result = mali_v11_csf_device_init(dev);
+   } else {
+      dev->vk.command_buffer_ops = &mali_v12_cmd_buffer_ops;
+      result = mali_v12_csf_device_init(dev);
    }
    if (result != VK_SUCCESS) {
       device_destroy(dev, pAllocator);

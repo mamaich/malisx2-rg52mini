@@ -30,7 +30,7 @@
  * device. The handful of operations that genuinely differ per frontend
  * (has a submit's work been reached, noticing a fault
  * before the next event, sync-file import/export) go through the
- * MALI_PER_ARCH() hooks declared in mali_queue.h (CSF, v10 and v11) and mali_jm.h
+ * MALI_PER_ARCH() hooks declared in mali_queue.h (CSF, v10, v11 and v12) and mali_jm.h
  * (job manager, v7 and v9). The file is built once per arch; on the job
  * manager a GPU signal's payload is a submission number and its tracker
  * atom instead of per-subqueue done values, and a sleeping host wait reads
@@ -473,6 +473,17 @@ static struct vk_sync_timeline_type timeline_type;
 static const struct vk_sync_type *sync_types[3];
 static util_once_flag sync_types_once = UTIL_ONCE_FLAG_INIT;
 
+/*
+ * The same three types without sync-file import and export, for kernels
+ * whose kbase was built without sync files (the RK3326's 4.4 BSP kbase:
+ * STREAM_CREATE answers ENOENT). Mesa's runtime then reports no SYNC_FD
+ * handle type for fences and semaphores, instead of offering an export that
+ * always fails.
+ */
+static struct vk_sync_type nosf_sync_type, nosf_point_sync_type;
+static struct vk_sync_timeline_type nosf_timeline_type;
+static const struct vk_sync_type *nosf_sync_types[3];
+
 static void
 sync_types_init(void)
 {
@@ -484,6 +495,16 @@ sync_types_init(void)
    sync_types[0] = &MALI_PER_ARCH(sync_type);
    sync_types[1] = &timeline_type.sync;
    sync_types[2] = NULL;
+
+   nosf_sync_type = MALI_PER_ARCH(sync_type);
+   nosf_sync_type.import_sync_file = NULL;
+   nosf_sync_type.export_sync_file = NULL;
+   nosf_point_sync_type = nosf_sync_type;
+   nosf_point_sync_type.features |= VK_SYNC_FEATURE_GPU_MULTI_WAIT;
+   nosf_timeline_type = vk_sync_timeline_get_type(&nosf_point_sync_type);
+   nosf_sync_types[0] = &nosf_sync_type;
+   nosf_sync_types[1] = &nosf_timeline_type.sync;
+   nosf_sync_types[2] = NULL;
 }
 
 const struct vk_sync_type *const *
@@ -493,9 +514,23 @@ MALI_PER_ARCH(sync_types)(void)
    return sync_types;
 }
 
+const struct vk_sync_type *const *
+MALI_PER_ARCH(sync_types_no_sync_file)(void)
+{
+   util_call_once(&sync_types_once, sync_types_init);
+   return nosf_sync_types;
+}
+
 bool
 MALI_PER_ARCH(sync_is_timeline_point)(const struct vk_sync *sync)
 {
    util_call_once(&sync_types_once, sync_types_init);
-   return sync->type == &point_sync_type;
+   return sync->type == &point_sync_type || sync->type == &nosf_point_sync_type;
+}
+
+bool
+MALI_PER_ARCH(sync_is_binary)(const struct vk_sync *sync)
+{
+   util_call_once(&sync_types_once, sync_types_init);
+   return sync->type == &MALI_PER_ARCH(sync_type) || sync->type == &nosf_sync_type;
 }

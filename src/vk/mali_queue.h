@@ -25,7 +25,7 @@
  * operations that genuinely differ per frontend (whether a submit's work
  * has been reached, noticing a fault before the next event, and sync-file
  * import/export, how a host wait sleeps) are declared below as
- * MALI_PER_ARCH() hooks. This header has the CSF (v10, v11) bodies, defined in
+ * MALI_PER_ARCH() hooks. This header has the CSF (v10, v11, v12) bodies, defined in
  * mali_queue.c, mali_sync_file.c and inline below; the v9 (JM) bodies are
  * in mali_jm.h, mali_jm_queue.c and mali_jm_sync_file.c.
  */
@@ -169,7 +169,7 @@ mali_queue_done_va(const struct mali_csf_queue *q, unsigned sq)
 
 /*
  * The CSF back half's device and queue setup and its submit, one copy per
- * command-stream arch (mali_v10_*, mali_v11_*; mali_arch.h). Per-arch code
+ * command-stream arch (mali_v10_*, mali_v11_*, mali_v12_*; mali_arch.h). Per-arch code
  * names them without the prefix; code built once picks one with
  * mali_csf_arch_dispatch.
  */
@@ -221,10 +221,14 @@ extern const struct vk_sync_type MALI_PER_ARCH(sync_type);
 /* The device's sync types, binary first and then the timeline semaphore
  * type wrapped around it (mali_sync.c): what vk_physical_device_init gets. */
 const struct vk_sync_type *const *MALI_PER_ARCH(sync_types)(void);
+/* The same without sync-file import/export, for kernels without sync files. */
+const struct vk_sync_type *const *MALI_PER_ARCH(sync_types_no_sync_file)(void);
 
 /* Whether sync is one value of a timeline semaphore (a point sync): the
  * queue does not consume those when it waits on them. */
 bool MALI_PER_ARCH(sync_is_timeline_point)(const struct vk_sync *sync);
+/* The binary type of either set (sync_types or sync_types_no_sync_file). */
+bool MALI_PER_ARCH(sync_is_binary)(const struct vk_sync *sync);
 
 /* Drop a sync's payload (close its sync file). With dev->lock held. */
 void MALI_PER_ARCH(sync_clear)(struct mali_sync *s);

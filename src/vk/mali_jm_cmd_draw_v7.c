@@ -519,6 +519,12 @@ emit_viewport(struct mali_cmd_buffer *cmd)
        * ULP or two past it (a 24-bit depth stores it as maxDepth). */
       if (cmd->jm.depth_cull & VK_DEPTH_CULL_ABOVE_BIT_MALISX2)
          cfg.maximum_z += 1e-5f;
+      /* vkCmdSetDepthCullBelowMALISX2: the near cull sits at its depth
+       * instead of minDepth. The Minimum Z is both what the tiler and the
+       * fragment near discard cull below and what depth is clamped to, so
+       * a depth between the two is kept as it is. */
+      if ((cmd->jm.depth_cull & VK_DEPTH_CULL_BELOW_BIT_MALISX2) && cmd->jm.depth_cull_below_set)
+         cfg.minimum_z = cmd->jm.depth_cull_below;
    }
    return p.gpu;
 }
@@ -546,11 +552,15 @@ emit_viewport_none(struct mali_cmd_buffer *cmd)
 /* ---------------------------------------------------------------------- */
 /* Per-draw descriptors                                                    */
 
+static uint64_t ref_mask(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di,
+                         bool restart, uint32_t min, uint32_t range);
+
 struct draw_data {
    uint32_t vertex_range;       /* vertices the vertex job shades */
    uint32_t padded_count;       /* padded_vertex_count(range) when instanced, else the range */
    int32_t raw_vertex_offset;   /* Draw offset_start: firstVertex, or min index + vertexOffset */
    uint64_t indices;            /* GPU address of the first index, 0 for a plain draw */
+   uint64_t vs_ref_mask;        /* referenced-vertex bitmask (v7_guard_vs_stores), 0 = all */
    /* Outputs of the builders. */
    uint64_t attribs, attrib_bufs;
    uint64_t vary_bufs, position, psiz;
@@ -1197,12 +1207,18 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
       d->fs_sets_dirty = 0;
    }
 
+   const bool vs_ref =
+      BITSET_TEST(p->vs->fau.used_sysvals,
+                  offsetof(struct mali_graphics_sysvals, vs_ref_mask) / MALI_FAU_WORD_SIZE);
+   if (vs_ref)
+      d->dirty |= MALI_GFX_DIRTY_VS_FAU;
    struct mali_graphics_sysvals sv;
    if (d->dirty & (MALI_GFX_DIRTY_VS_FAU | MALI_GFX_DIRTY_FS_FAU)) {
       mali_gfx_fill_sysvals(cmd, &sv);
       sv.vs.raw_vertex_offset = dd->raw_vertex_offset;
    }
    if (d->dirty & MALI_GFX_DIRTY_VS_FAU) {
+      sv.vs_ref_mask = dd->vs_ref_mask;
       /* The stage's set addresses and constant data (the v7_desc words
        * take the place of fs.blend_descs, which v7 shaders never read). */
       mali_v7_desc_sysvals(&t->vs_tab, p->vs, sv.v7_desc.sets);
@@ -1650,6 +1666,8 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
          min = last->min;
          max = last->max;
          empty = last->empty;
+         if (unlikely(mali_cpuprof_on))
+            mali_cpuprof_part(MALI_CPUPROF_IDXREUSE, os_time_get_nano());
       } else {
          const uint64_t t_scan = unlikely(mali_cpuprof_on) ? os_time_get_nano() : 0;
          ok = index_range(cmd, di, restart, &min, &max, &empty);
@@ -1675,6 +1693,10 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
             return;
          dd.vertex_range = max - min + 1;
          dd.raw_vertex_offset = (int32_t)min + di->vertex_offset;
+         if (BITSET_TEST(p->vs->fau.used_sysvals,
+                         offsetof(struct mali_graphics_sysvals, vs_ref_mask) /
+                            MALI_FAU_WORD_SIZE))
+            dd.vs_ref_mask = ref_mask(cmd, di, restart, min, dd.vertex_range);
       }
       dd.indices = d->ib.addr + (uint64_t)di->first_index * d->ib.index_size;
    }
@@ -2014,6 +2036,44 @@ MALI_PER_ARCH(CmdDrawIndexed)(VkCommandBuffer commandBuffer, uint32_t indexCount
    draw(cmd, &di);
 }
 
+/*
+ * The referenced-vertex bitmask of a direct indexed draw whose vertex
+ * shader writes memory (mali_shader.c v7_guard_vs_stores): bit i set when
+ * index min + i appears among the draw's indices. 0 (every vertex) when the
+ * indices cannot be read or the mask cannot be allocated.
+ */
+static uint64_t
+ref_mask(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, bool restart,
+         uint32_t min, uint32_t range)
+{
+   const struct mali_gfx_draw_state *d = &cmd->gfx.draw;
+   const struct mali_jm_draw_tmpl *t = &cmd->jm.draw;
+   const uint32_t size = d->ib.index_size;
+   const uint64_t first = (uint64_t)di->first_index * size;
+   if (!t->ib_cpu || !size || first >= d->ib.size)
+      return 0;
+   const uint32_t count = (uint32_t)MIN2(di->count, (d->ib.size - first) / size);
+   const uint32_t words = DIV_ROUND_UP(range, 32);
+   struct mali_ptr m = mali_cmd_alloc(cmd, (uint64_t)words * 4, 4);
+   if (!m.cpu)
+      return 0;
+   uint32_t *bits = m.cpu;
+   memset(bits, 0, (size_t)words * 4);
+   const uint8_t *base = t->ib_cpu + first;
+   const uint32_t rv = size == 1 ? 0xff : size == 2 ? 0xffff : 0xffffffffu;
+   for (uint32_t i = 0; i < count; i++) {
+      const uint32_t v = size == 1   ? base[i]
+                         : size == 2 ? ((const uint16_t *)base)[i]
+                                     : ((const uint32_t *)base)[i];
+      if (restart && v == rv)
+         continue;
+      const uint32_t o = v - min;
+      if (o < range)
+         bits[o >> 5] |= 1u << (o & 31);
+   }
+   return m.gpu;
+}
+
 /* ---------------------------------------------------------------------- */
 /* Indirect draws                                                          */
 
@@ -2064,9 +2124,11 @@ vs_reads_draw_sysvals(const struct mali_shader *vs)
    const unsigned fv = offsetof(struct mali_graphics_sysvals, vs.first_vertex);
    const unsigned bi = offsetof(struct mali_graphics_sysvals, vs.base_instance);
    const unsigned rvo = offsetof(struct mali_graphics_sysvals, vs.raw_vertex_offset);
+   const unsigned did = offsetof(struct mali_graphics_sysvals, draw_id);
    return BITSET_TEST(vs->fau.used_sysvals, fv / MALI_FAU_WORD_SIZE) ||
           BITSET_TEST(vs->fau.used_sysvals, bi / MALI_FAU_WORD_SIZE) ||
-          BITSET_TEST(vs->fau.used_sysvals, rvo / MALI_FAU_WORD_SIZE);
+          BITSET_TEST(vs->fau.used_sysvals, rvo / MALI_FAU_WORD_SIZE) ||
+          BITSET_TEST(vs->fau.used_sysvals, did / MALI_FAU_WORD_SIZE);
 }
 
 /* The address of a vertex shader system value in its FAU block at fau, 0
@@ -2101,7 +2163,8 @@ draw_indirect(struct mali_cmd_buffer *cmd, const struct idraw_call *call, uint32
    }
 
    /* Placeholders the patch job replaces: one vertex, one instance. */
-   const struct mali_draw_info di = {.count = 1, .instance_count = 1, .indexed = call->indexed};
+   const struct mali_draw_info di = {
+      .count = 1, .instance_count = 1, .indexed = call->indexed, .draw_id = i};
    struct draw_data dd;
    memset(&dd, 0, sizeof(dd));
    dd.vertex_range = 1;
@@ -2419,11 +2482,27 @@ MALI_PER_ARCH(CmdSetDepthCullMALISX2)(VkCommandBuffer commandBuffer, uint32_t fl
    const uint8_t cull = (flags & VK_DEPTH_CULL_OVERRIDE_BIT_MALISX2) ? (uint8_t)(flags & 7) : 0;
    /* The Viewport's Maximum Z carries the far-plane tolerance, the
     * fragment RSD the near and far discards. */
-   if ((cull ^ cmd->jm.depth_cull) & VK_DEPTH_CULL_ABOVE_BIT_MALISX2)
+   if (((cull ^ cmd->jm.depth_cull) & VK_DEPTH_CULL_ABOVE_BIT_MALISX2) ||
+       (((cull ^ cmd->jm.depth_cull) & VK_DEPTH_CULL_BELOW_BIT_MALISX2) && cmd->jm.depth_cull_below_set))
       cmd->gfx.draw.dirty |= MALI_GFX_DIRTY_VIEWPORT;
    if (cull != cmd->jm.depth_cull)
       cmd->gfx.draw.dirty |= MALI_GFX_DIRTY_ZSD;
    cmd->jm.depth_cull = cull;
+}
+
+/* vkCmdSetDepthCullBelowMALISX2 (malisx2's own, from vkGetDeviceProcAddr;
+ * mali_vk.h): the Viewport's Minimum Z carries the depth. */
+VKAPI_ATTR void VKAPI_CALL
+MALI_PER_ARCH(CmdSetDepthCullBelowMALISX2)(VkCommandBuffer commandBuffer, VkBool32 enable, float depth)
+{
+   VK_FROM_HANDLE(mali_cmd_buffer, cmd, commandBuffer);
+   const bool set = enable && depth == depth;
+   if (set != cmd->jm.depth_cull_below_set || (set && depth != cmd->jm.depth_cull_below)) {
+      if (cmd->jm.depth_cull & VK_DEPTH_CULL_BELOW_BIT_MALISX2)
+         cmd->gfx.draw.dirty |= MALI_GFX_DIRTY_VIEWPORT;
+      cmd->jm.depth_cull_below_set = set;
+      cmd->jm.depth_cull_below = depth;
+   }
 }
 
 /*

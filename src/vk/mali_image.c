@@ -239,7 +239,8 @@ log_images(void)
  * - DRM_FORMAT_MOD_LINEAR for DRM format modifier tiling, the only
  *   modifier offered (mali_formats.c; checked in mali_CreateImage);
  * - AFBC when can_use_afbc says so (v7_can_use_afbc on v7, sampled images
- *   too when v7_textures);
+ *   too when v7_textures) and the GPU takes it (mali_physical_device.afbc:
+ *   not the Mali-G31);
  * - linear when the application asks for linear tiling, for 1D images,
  *   and when the base level is a single texel wide or high (tiling cannot
  *   help then);
@@ -250,17 +251,18 @@ log_images(void)
  */
 static uint64_t
 choose_modifier(const struct mali_image *image, const enum pipe_format *formats, unsigned arch,
-                const VkImageCreateInfo *info, bool v7_textures, bool v7_depth, bool v7_levels,
-                unsigned v7_fmts)
+                bool afbc, const VkImageCreateInfo *info, bool v7_textures,
+                bool v7_depth, bool v7_levels, unsigned v7_fmts)
 {
    /* A scanout buffer (a VK_KHR_display swapchain image): the kernel and
     * the GPU have to agree on the layout, and only linear (or a DRM
     * modifier the display's plane lists) qualifies. */
    if (image->wsi_scanout || image->vk.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT)
       return DRM_FORMAT_MOD_LINEAR;
-   if (arch == 7 ? v7_can_use_afbc(image, formats, info, v7_textures, v7_depth, v7_levels,
-                                   v7_fmts)
-                 : can_use_afbc(image, formats, arch))
+   if (afbc &&
+       (arch == 7 ? v7_can_use_afbc(image, formats, info, v7_textures, v7_depth,
+                                    v7_levels, v7_fmts)
+                  : can_use_afbc(image, formats, arch)))
       return mali_afbc_can_ytr(formats[0]) ? MALI_MOD_AFBC_YTR : MALI_MOD_AFBC;
    if (image->vk.tiling == VK_IMAGE_TILING_LINEAR ||
        image->vk.image_type == VK_IMAGE_TYPE_1D ||
@@ -372,8 +374,9 @@ mali_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
    }
    const unsigned arch = mali_device_physical(dev)->arch;
    image->vk.drm_format_mod =
-      choose_modifier(image, formats, arch, pCreateInfo, dev->v7_afbc_textures,
-                      dev->v7_afbc_depth, dev->v7_afbc_levels, dev->v7_afbc_fmts);
+      choose_modifier(image, formats, arch, mali_device_physical(dev)->afbc,
+                      pCreateInfo, dev->v7_afbc_textures, dev->v7_afbc_depth,
+                      dev->v7_afbc_levels, dev->v7_afbc_fmts);
    /* MALISX2_LOG_IMAGES=1: every image and the layout it got. */
    if (log_images())
       mesa_logi("malisx2 image %s %ux%ux%u, %u levels, %u layers, %u samples, usage 0x%x, "
@@ -385,8 +388,8 @@ mali_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
                  image->vk.drm_format_mod == MALI_MOD_AFBC_YTR) ? "AFBC"
                 : image->vk.drm_format_mod == DRM_FORMAT_MOD_LINEAR ? "linear"
                                                                     : "u-interleaved");
-   /* CRC on the command-stream archs (v10 and v11). Not on v7 and v9 yet:
-    * the job manager cannot update the CRC state from the GPU, and the
+   /* CRC on the command-stream archs (v10, v11 and v12). Not on v7 and v9
+    * yet: the job manager cannot update the CRC state from the GPU, and the
     * CPU-side state it needs is not written yet. */
    const bool crc = mali_arch_is_csf(arch) &&
                     mali_image_wants_crc(pCreateInfo, image->vk.drm_format_mod);

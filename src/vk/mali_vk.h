@@ -69,6 +69,9 @@ struct mali_physical_device {
    char path[32];                      /* "/dev/mali0" */
    struct mali_kbase_gpu_props props;  /* decoded GET_GPUPROPS */
    uint32_t cs_work_registers;
+   /* Whether images may be AFBC (mali_image.c choose_modifier): not on the
+    * Mali-G31, whose AFBC render targets fault (seen on the Allwinner H700). */
+   bool afbc;
 
    /* props.arch_major, cached here so code outside the kbase layer picks
     * the per-arch device entry points (mali_CreateDevice) and internals
@@ -106,6 +109,9 @@ struct mali_physical_device {
     * first use; mali_wsi_linux.c). */
    int drm_fd;
    struct gbm_device *gbm;
+   /* VK_KHR_display on a framebuffer device when there is no DRM node, or
+    * NULL (mali_wsi_fbdev.c). */
+   struct mali_fbdev *fbdev;
 #endif
 };
 
@@ -125,6 +131,10 @@ void mali_wsi_finish(struct mali_physical_device *pdev);
 VkResult mali_wsi_alloc_scanout(struct mali_physical_device *pdev, VkFormat format,
                                 unsigned width, unsigned height, uint32_t *stride,
                                 uint64_t *size, int *fd);
+/* VK_KHR_display on /dev/fb0 when no DRM node was found (mali_wsi_fbdev.c),
+ * called by mali_wsi_init and mali_wsi_finish. */
+void mali_wsi_fbdev_init(struct mali_physical_device *pdev);
+void mali_wsi_fbdev_finish(struct mali_physical_device *pdev);
 #endif
 
 /* The deviceName for a GPU, or false if it is not a GPU this driver was
@@ -306,6 +316,11 @@ struct mali_device {
    /* This device's kbase context (a VkDevice owns one, as in the blob). */
    struct mali_kbase *kbase;
 
+   /* The GPU's system timestamp is the CPU's CNTVCT_EL0, checked at device
+    * creation when calibrated timestamps are enabled: VK_TIME_DOMAIN_DEVICE
+    * reads the CPU register instead of asking kbase (mali_device.c). */
+   bool timestamp_is_cntvct;
+
    struct mali_queue queues[MALI_QUEUE_COUNT];
    uint32_t queue_count;
 
@@ -450,7 +465,7 @@ void mali_event_pool_finish(struct mali_device *dev);
  * The job-manager back half (v7 and v9), as code built once (mali_device.c,
  * mali_physical_device.c) reaches it: device and queue setup
  * (mali_jm_queue.c), command buffers (mali_jm_cmd_buffer.c) and the sync
- * type (mali_sync.c built at v7 and v9). The command-stream (v10, v11)
+ * type (mali_sync.c built at v7 and v9). The command-stream (v10, v11, v12)
  * counterparts are in mali_queue.h and below.
  */
 struct vk_command_buffer_ops;
@@ -469,6 +484,7 @@ extern const struct vk_sync_type mali_v7_sync_type;
 extern const struct vk_sync_type mali_v9_sync_type;
 extern const struct vk_sync_type mali_v10_sync_type;
 extern const struct vk_sync_type mali_v11_sync_type;
+extern const struct vk_sync_type mali_v12_sync_type;
 
 /* Each arch's sync types, binary first and then the timeline semaphore type
  * wrapped around it (mali_sync.c); the physical device picks by arch. */
@@ -476,6 +492,13 @@ const struct vk_sync_type *const *mali_v7_sync_types(void);
 const struct vk_sync_type *const *mali_v9_sync_types(void);
 const struct vk_sync_type *const *mali_v10_sync_types(void);
 const struct vk_sync_type *const *mali_v11_sync_types(void);
+const struct vk_sync_type *const *mali_v12_sync_types(void);
+/* The same without sync-file import/export, for kernels without sync files. */
+const struct vk_sync_type *const *mali_v7_sync_types_no_sync_file(void);
+const struct vk_sync_type *const *mali_v9_sync_types_no_sync_file(void);
+const struct vk_sync_type *const *mali_v10_sync_types_no_sync_file(void);
+const struct vk_sync_type *const *mali_v11_sync_types_no_sync_file(void);
+const struct vk_sync_type *const *mali_v12_sync_types_no_sync_file(void);
 
 /* Log a failed sync-file import or export (mali_sync.c, every arch; the
  * per-arch headers declare each build's own). */
@@ -483,9 +506,10 @@ MALI_PER_ARCH_DECL(void, sync_file_log_error,
                    (struct mali_device *dev, const char *op, int fd, const char *why));
 
 /* The command-stream back half's command buffers (mali_cmd_buffer.c, built
- * at v10 and v11). */
+ * at v10, v11 and v12). */
 extern const struct vk_command_buffer_ops mali_v10_cmd_buffer_ops;
 extern const struct vk_command_buffer_ops mali_v11_cmd_buffer_ops;
+extern const struct vk_command_buffer_ops mali_v12_cmd_buffer_ops;
 
 /* Report device loss to the runtime and the log (once), then mark it and
  * wake every waiter. Takes dev->lock; call without it. Every back half
@@ -568,6 +592,27 @@ typedef void(VKAPI_PTR *PFN_vkCmdSetDepthCullMALISX2)(VkCommandBuffer commandBuf
                                                      uint32_t flags);
 VKAPI_ATTR void VKAPI_CALL mali_v7_CmdSetDepthCullMALISX2(VkCommandBuffer commandBuffer,
                                                          uint32_t flags);
+
+/*
+ * With vkCmdSetDepthCullMALISX2, also from vkGetDeviceProcAddr on v7: where
+ * VK_DEPTH_CULL_BELOW_BIT_MALISX2 culls. With enable set, the draws recorded
+ * after it in this command buffer have their fragments discarded below
+ * `depth` instead of below the viewport's minDepth, and a fragment whose
+ * depth lies between the two keeps that depth (it is not clamped to
+ * minDepth: a float depth attachment stores it, a normalised one stores its
+ * own limit). enable clear returns to minDepth. A command buffer starts
+ * there.
+ *
+ * For an emulator whose near plane is not at the bottom of the depth range:
+ * the Vita's GPU clips at z = -w, which a game that sets depth = z / w
+ * (scale 1, offset 0) puts at depth -1, and clamps what lies between -1 and
+ * 0. The tiler has one Minimum Z for both, so the near cull can sit at -1
+ * only if the clamp does too.
+ */
+typedef void(VKAPI_PTR *PFN_vkCmdSetDepthCullBelowMALISX2)(VkCommandBuffer commandBuffer,
+                                                          VkBool32 enable, float depth);
+VKAPI_ATTR void VKAPI_CALL mali_v7_CmdSetDepthCullBelowMALISX2(VkCommandBuffer commandBuffer,
+                                                              VkBool32 enable, float depth);
 
 /*
  * malisx2's own device extension on v7, in place of

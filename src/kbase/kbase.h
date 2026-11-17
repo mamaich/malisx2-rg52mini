@@ -234,11 +234,14 @@ enum mali_kbase_frontend {
 
 /*
  * The atom layout JOB_SUBMIT takes on a job-manager context (uapi_jm.h,
- * struct kb_jm_atom_frame_nr, says how the two differ).
+ * struct kb_jm_atom_frame_nr and KB_JM_UK_MIN_MINOR, say how they differ).
  */
 enum mali_kbase_jm_atom_layout {
-   MALI_KBASE_JM_ATOM_STOCK = 0,  /* base_jd_atom, stride 64 */
+   MALI_KBASE_JM_ATOM_STOCK = 0,  /* base_jd_atom, stride 64 (UK 11.22 on) */
    MALI_KBASE_JM_ATOM_FRAME_NR,   /* base_jd_atom + u32 frame_nr, stride 72 */
+   MALI_KBASE_JM_ATOM_V2,         /* base_jd_atom_v2, stride 56 (UK 11.19 to 11.21) */
+   MALI_KBASE_JM_ATOM_V2_48,      /* base_jd_atom_v2 without renderpass_id,
+                                     stride 48 (UK 11.7 to 11.18) */
 };
 
 typedef void (*mali_kbase_log_fn)(void *user, const char *msg);
@@ -264,7 +267,7 @@ struct mali_kbase {
    const struct mali_kbase_backend *backend;
    int fd;
    enum mali_kbase_frontend frontend;
-   uint16_t uk_major, uk_minor;  /* negotiated: 1.20 on CSF, 11.22 to 11.36 on JM */
+   uint16_t uk_major, uk_minor;  /* negotiated: 1.20 on CSF, 11.7 to 11.36 on JM */
    struct mali_kbase_gpu_props props;
    struct mali_kbase_glb_iface glb;          /* CSF only; zero on JM */
    /* The GPU's user register page, mapped read-only. CSF only; NULL on JM. */
@@ -287,6 +290,13 @@ struct mali_kbase {
     * 32-byte form, so imports skip the standard request. Set by the first
     * import that finds out; read and written with relaxed atomics. */
    bool jm_huawei_mem_import;
+   /* Command stream only. csf_mem_group_ok: an allocation in a nonzero
+    * memory group has succeeded. csf_mem_group_0_only: before any had, one
+    * failed with ENOMEM where group 0 did not (Google's Tensor kernels,
+    * whose memory group manager backs only some groups), so every
+    * allocation goes to group 0. Read and written with relaxed atomics. */
+   bool csf_mem_group_ok;
+   bool csf_mem_group_0_only;
    /* SET_FLAGS succeeded: the kernel context exists. */
    bool context_created;
    /* mali_kbase_abandon was called. */
@@ -305,7 +315,7 @@ struct mali_kbase {
  *      order: SET_FLAGS, GET_GPUPROPS, CS_GET_GLB_IFACE, map the user
  *      register page, MEM_EXEC_INIT, MEM_JIT_INIT (trim level 5).
  *   2. Otherwise, VERSION_CHECK (ioctl 0) proposing 11.36 on the same fd
- *      and accepting 11.22 to 11.36 back:
+ *      and accepting 11.7 to 11.36 back:
  *      each frontend's kernel answers the other's version-check ioctl
  *      with EPERM without touching setup state, so trying both on one fd
  *      is valid. On a matching answer the frontend is job-manager and the
@@ -313,11 +323,13 @@ struct mali_kbase {
  *      page (BASE_MEM_MAP_TRACKING_HANDLE, required before any
  *      allocation on this kernel), GET_GPUPROPS, MEM_EXEC_INIT,
  *      MEM_JIT_INIT (trim level 0; we do not use JIT memory, see
- *      mali_kbase_alloc). Then one JOB_SUBMIT of a dependency-only atom
- *      at stride 72 picks the atom layout: EINVAL means a stock kernel
- *      (64-byte base_jd_atom); acceptance means the MediaTek frame_nr
- *      layout, and the atom's completion event is read back before
- *      returning, so no event or atom number is left over for the
+ *      mali_kbase_alloc; the 16-byte variant below 11.20). Below 11.22
+ *      the minor alone picks the atom layout (base_jd_atom_v2, 56 bytes
+ *      from 11.19, 48 before). From 11.22 one JOB_SUBMIT of a
+ *      dependency-only atom at stride 72 picks it: EINVAL means a stock
+ *      kernel (64-byte base_jd_atom); acceptance means the MediaTek
+ *      frame_nr layout, and the atom's completion event is read back
+ *      before returning, so no event or atom number is left over for the
  *      caller. An ENOMEM answer to MEM_JIT_INIT, from a GPU VA too narrow
  *      for the zone, leaves the context without one (jm_no_jit).
  *   3. If neither answer matches, INCOMPATIBLE_KERNEL, logging both
@@ -349,9 +361,10 @@ void mali_kbase_abandon(struct mali_kbase *kb);
  * compares against). */
 uint32_t mali_kbase_latest_flush_id(const struct mali_kbase *kb);
 
-/* GET_CPU_GPU_TIMEINFO: CLOCK_MONOTONIC in ns and the GPU system timestamp
- * (the counter STORE_STATE{Timestamp} writes), sampled together. The
- * timestamp runs at the CPU's architected timer frequency (CNTFRQ_EL0). */
+/* GET_CPU_GPU_TIMEINFO: CLOCK_MONOTONIC_RAW in ns (ktime_get_raw_ts64 in
+ * r44p1) and the GPU system timestamp (the counter STORE_STATE{Timestamp}
+ * writes), sampled together. The timestamp runs at the CPU's architected
+ * timer frequency (CNTFRQ_EL0). */
 enum mali_kbase_result mali_kbase_timeinfo(struct mali_kbase *kb, uint64_t *mono_ns,
                                            uint64_t *gpu_ts);
 
@@ -578,7 +591,9 @@ const char *mali_kbase_jm_atom_layout_str(const struct mali_kbase *kb, char *buf
  * dependency graph is submitted with pre_dep already resolved by the
  * caller). n may be 0 (no-op). The atoms are always built as struct
  * kb_jm_atom; on a MALI_KBASE_JM_ATOM_FRAME_NR context each is copied into
- * the 72-byte layout (frame_nr 0) on the way in.
+ * the 72-byte layout (frame_nr 0) on the way in, and on the two
+ * base_jd_atom_v2 layouts the atom without seq_nr (and, at 48 bytes,
+ * without renderpass_id) is what goes in.
  */
 enum mali_kbase_result
 mali_kbase_jm_submit(struct mali_kbase *kb, const struct kb_jm_atom *atoms, unsigned n);

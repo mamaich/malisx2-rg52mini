@@ -68,7 +68,12 @@
 #include "pan_format.h"
 #endif
 
-#define META_FS_CACHE_SIZE 64
+/* The meta fragment shaders by key: a growing array (shaders stay alive
+ * until the device goes, command buffers may still use them). */
+struct mali_meta_fs_entry {
+   struct mali_meta_fs_key key;
+   struct mali_shader *shader;
+};
 
 struct mali_meta_gfx {
 #if PAN_ARCH < 9
@@ -81,11 +86,8 @@ struct mali_meta_gfx {
    struct mali_shader *copy[2][5];   /* [source is a texture][log2 block bytes] */
 #endif
    struct mali_shader *copy_quad[3]; /* [log2 block bytes] */
-   unsigned count;
-   struct {
-      struct mali_meta_fs_key key;
-      struct mali_shader *shader;
-   } e[META_FS_CACHE_SIZE];
+   unsigned count, cap;
+   struct mali_meta_fs_entry *e;
 };
 
 /* The push constants become the fragment shader's FAU words, which a
@@ -325,6 +327,7 @@ build_fs(struct mali_device *dev, const struct mali_meta_fs_key *key)
       need_area |= key->rt_op[i] == MALI_META_FS_CLEAR_IN_AREA ||
                    key->rt_op[i] == MALI_META_FS_BLIT ||
                    key->rt_op[i] == MALI_META_FS_COPY ||
+                   key->rt_op[i] == MALI_META_FS_COPY_OUT ||
                    key->rt_op[i] == MALI_META_FS_STORE;
    need_area |= key->z_op == MALI_META_FS_CLEAR_IN_AREA ||
                 key->s_op == MALI_META_FS_CLEAR_IN_AREA;
@@ -446,6 +449,31 @@ build_fs(struct mali_device *dev, const struct mali_meta_fs_key *key)
          tex += key->copy_src_tex ? 2 : 1;
          break;
       }
+#if PAN_ARCH < 9
+      case MALI_META_FS_COPY_OUT: {
+         /* The source block as COPY reads it, as the target's uint colour.
+          * An if, not a select: a raw load outside the area could read
+          * anything. */
+         nir_def *delta = push_load(b, 2, 32, offsetof(struct mali_meta_fs_push, copy_delta));
+         nir_def *sxy = nir_iadd(b, xy, delta);
+         nir_push_if(b, inside);
+         nir_def *in;
+         if (key->copy_src_fmt) {
+            nir_def *t = fetch(b, tex, sxy, layer, nir_type_float32);
+            in = raw_to_uvec4(
+               b, nir_format_pack_rgba(b, mali_meta_copy_fmt_pipe(key->copy_src_fmt), t));
+         } else {
+            in = key->copy_src_tex ? fetch(b, tex, sxy, layer, nir_type_uint32)
+                                   : copy_raw_load(b, key, sxy, layer);
+         }
+         nir_push_else(b, NULL);
+         nir_def *zero = nir_imm_zero(b, 4, 32);
+         nir_pop_if(b, NULL);
+         v = nir_if_phi(b, in, zero);
+         tex += key->copy_src_tex ? 1 : 0;
+         break;
+      }
+#endif
       default:
          UNREACHABLE("meta fs op");
       }
@@ -508,7 +536,15 @@ MALI_PER_ARCH(meta_fs_get)(struct mali_cmd_buffer *cmd, const struct mali_meta_f
          }
       }
    }
-   if (mg && !s && mg->count < META_FS_CACHE_SIZE) {
+   if (mg && !s && mg->count == mg->cap) {
+      const unsigned cap = mg->cap ? mg->cap * 2 : 64;
+      struct mali_meta_fs_entry *e = realloc(mg->e, cap * sizeof(*e));
+      if (e) {
+         mg->e = e;
+         mg->cap = cap;
+      }
+   }
+   if (mg && !s && mg->count < mg->cap) {
       nir_shader *nir = build_fs(dev, key);
       MALI_PER_ARCH(shader_preprocess)(dev, nir);
 
@@ -559,6 +595,7 @@ MALI_PER_ARCH(meta_gfx_finish)(struct mali_device *dev)
       MALI_PER_ARCH(shader_unref)(dev, mg->copy_quad[i]);
    for (unsigned i = 0; i < mg->count; i++)
       MALI_PER_ARCH(shader_unref)(dev, mg->e[i].shader);
+   free(mg->e);
 #if PAN_ARCH < 9
    for (unsigned i = 0; i < ARRAY_SIZE(mg->copy_tex_fmt); i++)
       MALI_PER_ARCH(shader_unref)(dev, mg->copy_tex_fmt[i]);
@@ -917,12 +954,22 @@ MALI_PER_ARCH(meta_fs_dcd)(struct mali_cmd_buffer *cmd, const struct mali_shader
       cfg.blend = blend;
       cfg.blend_count = blend_count;
       cfg.depth_stencil = zsd.gpu;
+#if PAN_ARCH >= 12
+      /* The fragment stage's own fields (panvk v12 cmd_draw_rects); the
+       * depth range left the descriptor with the Viewport. */
+      cfg.fragment_resources = table.gpu | 4;
+      cfg.fragment_shader = fs->spd[MALI_SPD_MAIN];
+      cfg.thread_storage = r->tsd;
+      cfg.fragment_fau.pointer = fau & BITFIELD64_MASK(56);
+      cfg.fragment_fau.count = fs->fau.total_count;
+#else
       cfg.maximum_z = 1.0f;
       cfg.shader.resources = table.gpu | 4;
       cfg.shader.shader = fs->spd[MALI_SPD_MAIN];
       cfg.shader.thread_storage = r->tsd;
       cfg.shader.fau = fau & BITFIELD64_MASK(56);
       cfg.shader.fau_count = fs->fau.total_count;
+#endif
    }
    return true;
 #endif /* PAN_ARCH >= 9 */

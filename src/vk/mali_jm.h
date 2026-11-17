@@ -522,6 +522,10 @@ struct mali_jm_cmd {
    /* vkCmdSetDepthCullMALISX2: its flags, 0 for the pipeline's depth
     * clip and clamp (mali_jm_cmd_draw_v7.c). */
    uint8_t depth_cull;
+   /* vkCmdSetDepthCullBelowMALISX2: whether it moved the depth below
+    * which VK_DEPTH_CULL_BELOW_BIT_MALISX2 culls, and where to. */
+   bool depth_cull_below_set;
+   float depth_cull_below;
    /* vkCmdSetIndexRangeMALISX2: the smallest and largest index of the
     * next indexed draw, if it is the one named (index buffer, first index,
     * count); its index scan is then skipped (mali_jm_cmd_draw_v7.c). */
@@ -1241,6 +1245,10 @@ struct mali_jm_heap {
    simple_mtx_t lock;
    uint32_t next;           /* the slot the next batch takes */
    uint32_t count;          /* slots in the ring now; written under lock */
+   /* The most slots the ring may grow to: MALI_JM_HEAP_SLOTS_GROWN, or
+    * fewer once a slot's region could not be allocated
+    * (mali_jm_heap_take). Written under lock, never raised. */
+   uint32_t limit;
    /* The current window of submissions (the submit path only, under
     * dev->lock): how many there were, how many wrapped the ring, and the
     * most tiled batches one of those had. */
@@ -1518,10 +1526,14 @@ extern const struct vk_sync_type MALI_PER_ARCH(sync_type);
 /* The device's sync types, binary first and then the timeline semaphore
  * type wrapped around it (mali_sync.c): what vk_physical_device_init gets. */
 const struct vk_sync_type *const *MALI_PER_ARCH(sync_types)(void);
+/* The same without sync-file import/export, for kernels without sync files. */
+const struct vk_sync_type *const *MALI_PER_ARCH(sync_types_no_sync_file)(void);
 
 /* Whether sync is one value of a timeline semaphore (a point sync): the
  * queue does not consume those when it waits on them. */
 bool MALI_PER_ARCH(sync_is_timeline_point)(const struct vk_sync *sync);
+/* The binary type of either set (sync_types or sync_types_no_sync_file). */
+bool MALI_PER_ARCH(sync_is_binary)(const struct vk_sync *sync);
 
 void MALI_PER_ARCH(sync_clear)(struct mali_sync *s);
 
