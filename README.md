@@ -84,7 +84,7 @@ ARMSX2: с dArkOS 1.4 он идёт на malisx2. Выбор есть у
 
 ## Сборка
 
-Нужны исходники Mesa в каталоге `mesa/`: ветка `rg52mini-20261107` форка
+Нужны исходники Mesa в каталоге `mesa/`: ветка `rg52mini-20261117` форка
 [mamaich/armsx2-turnip-rg52mini](https://github.com/mamaich/armsx2-turnip-rg52mini)
 (ветка `malisx2` [bmdhacks/armsx2-turnip](https://github.com/bmdhacks/armsx2-turnip)
 и наши правки компилятора) на коммите, который закреплён в `meson.build`
